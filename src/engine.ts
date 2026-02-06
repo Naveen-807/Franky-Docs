@@ -956,6 +956,7 @@ export class Engine {
         const w = repo.getCircleWallet(docId);
         if (!w) throw new Error("Missing Circle Arc wallet. Run DW /setup first.");
         const out = await circle.payout({
+          walletId: w.wallet_id,
           walletAddress: w.wallet_address as `0x${string}`,
           destinationAddress: command.to,
           amountUsdc: command.amountUsdc
@@ -981,6 +982,7 @@ export class Engine {
         for (const r of command.recipients) {
           const amt = (command.amountUsdc * r.pct) / 100;
           const out = await circle.payout({
+            walletId: w.wallet_id,
             walletAddress: w.wallet_address as `0x${string}`,
             destinationAddress: r.to,
             amountUsdc: amt
@@ -1022,6 +1024,7 @@ export class Engine {
       }
 
       const result = await circle.bridgeUsdc({
+        walletId: w.wallet_id,
         walletAddress: w.wallet_address as `0x${string}`,
         destinationAddress,
         amountUsdc: command.amountUsdc,
@@ -1034,6 +1037,102 @@ export class Engine {
         arcTxHash: result.txHash as any,
         resultText: `BRIDGE ${command.amountUsdc} USDC ${command.fromChain}->${command.toChain} CircleTx=${result.circleTxId} ${txText}`
       };
+    }
+
+    // --- Yellow State Channel Commands ---
+
+    if (command.type === "SESSION_CLOSE") {
+      if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1)");
+      const session = repo.getYellowSession(docId);
+      if (!session) throw new Error("No Yellow session found. Create one with DW SESSION_CREATE.");
+      const signers = repo.listSigners(docId);
+      const keyRows = signers.map((s) => ({ signer: s, key: repo.getYellowSessionKey({ docId, signerAddress: s.address }) }));
+      const signerPrivateKeysHex = keyRows
+        .filter((r) => r.key)
+        .map((r) => {
+          const plain = decryptWithMasterKey({ masterKey: config.DOCWALLET_MASTER_KEY, blob: r.key!.encrypted_session_key_private });
+          const parsed = JSON.parse(plain.toString("utf8")) as { privateKeyHex: `0x${string}` };
+          return parsed.privateKeyHex;
+        });
+
+      const result = await yellow.closeAppSession({
+        signerPrivateKeysHex,
+        appSessionId: session.app_session_id,
+        version: session.version,
+        sessionData: `DocWallet:${docId}:close`
+      });
+      repo.setYellowSessionVersion({ docId, version: result.version, status: "CLOSED" });
+      return { resultText: `YELLOW_SESSION_CLOSED v${result.version}` };
+    }
+
+    if (command.type === "SESSION_STATUS") {
+      if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1)");
+      const session = repo.getYellowSession(docId);
+      if (!session) return { resultText: "YELLOW_SESSION=NONE" };
+      const status = await yellow.getSessionStatus({ appSessionId: session.app_session_id });
+      const connInfo = yellow.getConnectionInfo();
+      return {
+        resultText: `YELLOW_SESSION=${session.app_session_id} v${status.version} STATUS=${status.status} PROTOCOL=${connInfo.protocol} PARTICIPANTS=${status.participants.length}`
+      };
+    }
+
+    // --- DeepBook Deposit/Withdraw/Market Orders (Sui-native) ---
+
+    if (command.type === "DEPOSIT") {
+      if (!deepbook) throw new Error("DeepBook disabled (set DEEPBOOK_ENABLED=1)");
+      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+      const cfg = readConfig(tables.config.table);
+      const poolKey = cfg["DEEPBOOK_POOL"]?.value?.trim() || "SUI_DBUSDC";
+      const managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
+      if (!managerId) throw new Error("No DeepBook manager. Place an order first or run DW /setup.");
+      const res = await deepbook.deposit({ wallet: secrets.sui, poolKey, managerId, coinType: command.coinType, amount: command.amount });
+      return { suiTxDigest: res.txDigest, resultText: `DEPOSITED ${command.amount} ${command.coinType} SuiTx=${res.txDigest}` };
+    }
+
+    if (command.type === "WITHDRAW") {
+      if (!deepbook) throw new Error("DeepBook disabled (set DEEPBOOK_ENABLED=1)");
+      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+      const cfg = readConfig(tables.config.table);
+      const poolKey = cfg["DEEPBOOK_POOL"]?.value?.trim() || "SUI_DBUSDC";
+      const managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
+      if (!managerId) throw new Error("No DeepBook manager. Place an order first or run DW /setup.");
+      const res = await deepbook.withdraw({ wallet: secrets.sui, poolKey, managerId, coinType: command.coinType, amount: command.amount });
+      return { suiTxDigest: res.txDigest, resultText: `WITHDRAWN ${command.amount} ${command.coinType} SuiTx=${res.txDigest}` };
+    }
+
+    if (command.type === "MARKET_BUY" || command.type === "MARKET_SELL") {
+      if (!deepbook) throw new Error("DeepBook disabled (set DEEPBOOK_ENABLED=1)");
+      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+      const cfg = readConfig(tables.config.table);
+      const poolKey = cfg["DEEPBOOK_POOL"]?.value?.trim() || "SUI_DBUSDC";
+      const managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
+      if (!managerId) throw new Error("No DeepBook manager. Place an order first or run DW /setup.");
+
+      // Pre-flight gas check
+      const gasCheck = await deepbook.checkGas({ address: secrets.sui.address });
+      if (!gasCheck.ok) throw new Error(`Insufficient SUI gas: ${gasCheck.suiBalance} SUI < ${gasCheck.minRequired} SUI minimum`);
+
+      const side = command.type === "MARKET_BUY" ? "buy" as const : "sell" as const;
+      const res = await deepbook.placeMarketOrder({ wallet: secrets.sui, poolKey, managerId, side, qty: command.qty });
+      const explorer = `https://suiscan.xyz/testnet/tx/${res.txDigest}`;
+      return {
+        suiTxDigest: res.txDigest,
+        resultText: `MARKET_${side.toUpperCase()} ${command.qty} SUI SuiTx=${res.txDigest} Explorer=${explorer}`
+      };
+    }
+
+    // --- Agent Configuration Commands (Arc autonomous agent) ---
+
+    if (command.type === "ALERT_THRESHOLD") {
+      repo.setDocConfig(docId, `alert_threshold_${command.coinType.toLowerCase()}`, String(command.below));
+      repo.insertAgentActivity(docId, "CONFIG", `Alert threshold set: ${command.coinType} < ${command.below}`);
+      return { resultText: `ALERT_THRESHOLD ${command.coinType} < ${command.below}` };
+    }
+
+    if (command.type === "AUTO_REBALANCE") {
+      repo.setDocConfig(docId, "auto_rebalance", command.enabled ? "1" : "0");
+      repo.insertAgentActivity(docId, "CONFIG", `Auto-rebalance ${command.enabled ? "enabled" : "disabled"}`);
+      return { resultText: `AUTO_REBALANCE=${command.enabled ? "ON" : "OFF"}` };
     }
 
     if (!deepbook) throw new Error("DeepBook disabled (set DEEPBOOK_ENABLED=1)");
@@ -1135,6 +1234,115 @@ export class Engine {
     const tables = await loadDocWalletTables({ docs, docId });
     await updateCommandsRowCells({ docs, docId, commandsTable: tables.commands.table, rowIndex, updates });
   }
+
+  // --- Autonomous Agent Decision Engine (Arc track) ---
+
+  private agentDecisionRunning = false;
+
+  async agentDecisionTick() {
+    if (this.agentDecisionRunning) return;
+    this.agentDecisionRunning = true;
+    try {
+      const { repo, config, arc, deepbook, circle } = this.ctx;
+      const docs = repo.listDocs();
+
+      for (const doc of docs) {
+        const docId = doc.doc_id;
+        const decisions: string[] = [];
+
+        // 1. Stale command alerting — flag commands pending > 1 hour
+        const staleCommands = repo.listStaleCommands(3600_000);
+        const docStale = staleCommands.filter((c) => c.doc_id === docId);
+        if (docStale.length > 0) {
+          const staleIds = docStale.map((c) => c.cmd_id).join(", ");
+          decisions.push(`⚠️ ${docStale.length} stale command(s): ${staleIds}`);
+          repo.insertAgentActivity(docId, "ALERT_STALE", `${docStale.length} stale commands older than 1h`);
+        }
+
+        // 2. Gas monitoring (Sui)
+        if (deepbook && doc.sui_address) {
+          const gasCheck = await deepbook.checkGas({ address: doc.sui_address, minSui: 0.05 });
+          if (!gasCheck.ok) {
+            decisions.push(`🔴 Low SUI gas: ${gasCheck.suiBalance.toFixed(4)} SUI (min: ${gasCheck.minRequired} SUI)`);
+            repo.insertAgentActivity(docId, "ALERT_GAS", `Low SUI gas: ${gasCheck.suiBalance.toFixed(4)} SUI`);
+          }
+        }
+
+        // 3. Balance threshold alerts
+        const allThresholds = repo.listDocConfig(docId).filter((c) => c.key.startsWith("alert_threshold_"));
+        for (const threshold of allThresholds) {
+          const coinType = threshold.key.replace("alert_threshold_", "").toUpperCase();
+          const belowValue = Number(threshold.value);
+          if (!Number.isFinite(belowValue)) continue;
+
+          if (coinType === "SUI" && deepbook && doc.sui_address) {
+            const gasCheck = await deepbook.checkGas({ address: doc.sui_address });
+            if (gasCheck.suiBalance < belowValue) {
+              decisions.push(`⚠️ ${coinType} balance ${gasCheck.suiBalance.toFixed(4)} below threshold ${belowValue}`);
+              repo.insertAgentActivity(docId, "ALERT_BALANCE", `${coinType} ${gasCheck.suiBalance.toFixed(4)} < ${belowValue}`);
+            }
+          }
+          if (coinType === "USDC" && arc && doc.evm_address) {
+            try {
+              const balances = await arc.getBalances(doc.evm_address as `0x${string}`);
+              const balNum = Number(balances.usdcBalance) / 1e6;
+              if (balNum < belowValue) {
+                decisions.push(`⚠️ ${coinType} balance ${balNum.toFixed(2)} below threshold ${belowValue}`);
+                repo.insertAgentActivity(docId, "ALERT_BALANCE", `${coinType} ${balNum.toFixed(2)} < ${belowValue}`);
+              }
+            } catch { /* arc balance check failed, skip */ }
+          }
+        }
+
+        // 4. Idle capital detection (Arc)
+        if (arc && circle && doc.evm_address) {
+          const circleW = repo.getCircleWallet(docId);
+          if (circleW) {
+            try {
+              const balance = await circle.getWalletBalance(circleW.wallet_id);
+              const usdcIdle = Number(balance?.usdcBalance ?? 0);
+              if (usdcIdle > 100) {
+                decisions.push(`💰 Idle capital detected: ${usdcIdle.toFixed(2)} USDC in Circle wallet`);
+                repo.insertAgentActivity(docId, "IDLE_CAPITAL", `${usdcIdle.toFixed(2)} USDC idle in Circle wallet`);
+              }
+            } catch { /* ignore balance check failure */ }
+          }
+        }
+
+        // 5. Auto-rebalance check
+        const autoRebalance = repo.getDocConfig(docId, "auto_rebalance");
+        if (autoRebalance === "1" && deepbook && doc.sui_address) {
+          const gasCheck = await deepbook.checkGas({ address: doc.sui_address, minSui: 0.02 });
+          if (!gasCheck.ok) {
+            decisions.push(`🔄 Auto-rebalance needed: SUI gas critically low (${gasCheck.suiBalance.toFixed(4)} SUI)`);
+            repo.insertAgentActivity(docId, "REBALANCE_NEEDED", `SUI gas at ${gasCheck.suiBalance.toFixed(4)}`);
+          }
+        }
+
+        // Log decision summary
+        if (decisions.length > 0) {
+          const summary = decisions.join(" | ");
+          console.log(`[agent] ${docId.slice(0, 8)}…: ${summary}`);
+
+          // Write agent decisions to Google Doc activity
+          try {
+            await appendRecentActivityRow({
+              docs: this.ctx.docs,
+              docId,
+              timestampIso: new Date().toISOString(),
+              type: "AGENT_DECISION",
+              details: summary.slice(0, 200),
+              tx: ""
+            });
+          } catch { /* ignore doc write failure */ }
+        }
+      }
+    } catch (err) {
+      console.error("agentDecisionTick error:", err);
+    } finally {
+      this.agentDecisionRunning = false;
+    }
+  }
 }
 
 function generateCmdId(docId: string, raw: string): string {
@@ -1165,6 +1373,10 @@ function detectTransactionalIntent(input: string): boolean {
     /^buy\s+[\d.]+\s*sui\s+(?:at|@)\s*[\d.]+$/i,
     /^sell\s+[\d.]+\s*sui\s+(?:at|@)\s*[\d.]+$/i,
     /^bridge\s+[\d.]+\s*usdc\s+from\s+\w+\s+to\s+\w+$/i,
+    /^deposit\s+[\d.]+\s*\w+$/i,
+    /^withdraw\s+[\d.]+\s*\w+$/i,
+    /^market\s+buy\s+[\d.]+\s*sui$/i,
+    /^market\s+sell\s+[\d.]+\s*sui$/i,
     /^settle$/i,
     /^setup$/i,
     /^\/setup$/i,
@@ -1182,10 +1394,16 @@ function reconstructDwCommand(cmd: ParsedCommand): string | null {
     case "STATUS": return "DW STATUS";
     case "SETTLE": return "DW SETTLE";
     case "SESSION_CREATE": return "DW SESSION_CREATE";
+    case "SESSION_CLOSE": return "DW SESSION_CLOSE";
+    case "SESSION_STATUS": return "DW SESSION_STATUS";
     case "CONNECT": return `DW CONNECT ${cmd.wcUri}`;
     case "LIMIT_BUY": return `DW LIMIT_BUY ${cmd.base} ${cmd.qty} ${cmd.quote} @ ${cmd.price}`;
     case "LIMIT_SELL": return `DW LIMIT_SELL ${cmd.base} ${cmd.qty} ${cmd.quote} @ ${cmd.price}`;
+    case "MARKET_BUY": return `DW MARKET_BUY ${cmd.base} ${cmd.qty}`;
+    case "MARKET_SELL": return `DW MARKET_SELL ${cmd.base} ${cmd.qty}`;
     case "CANCEL": return `DW CANCEL ${cmd.orderId}`;
+    case "DEPOSIT": return `DW DEPOSIT ${cmd.coinType} ${cmd.amount}`;
+    case "WITHDRAW": return `DW WITHDRAW ${cmd.coinType} ${cmd.amount}`;
     case "PAYOUT": return `DW PAYOUT ${cmd.amountUsdc} USDC TO ${cmd.to}`;
     case "BRIDGE": return `DW BRIDGE ${cmd.amountUsdc} USDC FROM ${cmd.fromChain} TO ${cmd.toChain}`;
     case "CANCEL_SCHEDULE": return `DW CANCEL_SCHEDULE ${cmd.scheduleId}`;
@@ -1193,6 +1411,8 @@ function reconstructDwCommand(cmd: ParsedCommand): string | null {
     case "SIGNER_ADD": return `DW SIGNER_ADD ${cmd.address} WEIGHT ${cmd.weight}`;
     case "POLICY_ENS": return `DW POLICY ENS ${cmd.ensName}`;
     case "SCHEDULE": return `DW SCHEDULE EVERY ${cmd.intervalHours}h: ${cmd.innerCommand.replace(/^DW\s+/i, "")}`;
+    case "ALERT_THRESHOLD": return `DW ALERT_THRESHOLD ${cmd.coinType} ${cmd.below}`;
+    case "AUTO_REBALANCE": return `DW AUTO_REBALANCE ${cmd.enabled ? "ON" : "OFF"}`;
     default: return null;
   }
 }
@@ -1336,17 +1556,26 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
       "• DW STATUS — Show status",
       "• DW LIMIT_BUY SUI <qty> USDC @ <price>",
       "• DW LIMIT_SELL SUI <qty> USDC @ <price>",
+      "• DW MARKET_BUY SUI <qty> — Market buy",
+      "• DW MARKET_SELL SUI <qty> — Market sell",
+      "• DW DEPOSIT <coin> <amount> — Deposit to DeepBook",
+      "• DW WITHDRAW <coin> <amount> — Withdraw from DeepBook",
       "• DW CANCEL <orderId>",
       "• DW SETTLE — Withdraw filled orders",
       "• DW PAYOUT <amt> USDC TO <addr>",
       "• DW BRIDGE <amt> USDC FROM <chain> TO <chain>",
       "• DW SCHEDULE EVERY <N>h: <command>",
       "• DW CANCEL_SCHEDULE <schedId>",
+      "• DW SESSION_CREATE — Yellow state channel",
+      "• DW SESSION_CLOSE — Close Yellow session",
+      "• DW SESSION_STATUS — Yellow session info",
+      "• DW ALERT_THRESHOLD <coin> <amount>",
+      "• DW AUTO_REBALANCE ON|OFF",
       "• DW POLICY ENS <name.eth>",
       "• DW CONNECT <wc:uri>",
       "Prefix with !execute to auto-submit."
     ].join("\n");
   }
 
-  return "I can help! Try: 'buy 10 SUI at 1.5', 'send 50 USDC to 0x...', 'bridge 100 USDC from arc to sui', 'schedule DCA buy 10 SUI every 6h', or type 'help'.";
+  return "I can help! Try: 'buy 10 SUI at 1.5', 'send 50 USDC to 0x...', 'bridge 100 USDC from arc to sui', 'deposit 10 SUI', 'market buy 5 SUI', 'schedule DCA buy 10 SUI every 6h', or type 'help'.";
 }

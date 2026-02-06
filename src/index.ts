@@ -90,6 +90,9 @@ async function main() {
   setInterval(() => engine.balancesTick().catch((e) => console.error("balancesTick", e)), config.BALANCE_POLL_INTERVAL_MS);
   setInterval(() => engine.schedulerTick().catch((e) => console.error("schedulerTick", e)), config.SCHEDULER_INTERVAL_MS);
 
+  // Autonomous agent decision engine — monitors balances, gas, stale commands, thresholds
+  setInterval(() => engine.agentDecisionTick().catch((e) => console.error("agentDecisionTick", e)), 60_000);
+
   process.on("SIGINT", () => {
     repo.close();
     process.exit(0);

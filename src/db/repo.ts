@@ -122,6 +122,22 @@ export type ScheduleRow = {
   updated_at: number;
 };
 
+export type DocConfigRow = {
+  doc_id: string;
+  key: string;
+  value: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type AgentActivityRow = {
+  id: number;
+  doc_id: string;
+  type: string;
+  details: string;
+  created_at: number;
+};
+
 export class Repo {
   private db: Database.Database;
 
@@ -628,5 +644,59 @@ export class Repo {
     return this.db
       .prepare(`SELECT * FROM walletconnect_requests WHERE doc_id=? AND status='PENDING' ORDER BY created_at ASC`)
       .all(docId) as WalletConnectRequestRow[];
+  }
+
+  // --- Doc Config (agent configuration) ---
+
+  setDocConfig(docId: string, key: string, value: string) {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO doc_config(doc_id, key, value, created_at, updated_at)
+         VALUES(?,?,?,?,?)
+         ON CONFLICT(doc_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`
+      )
+      .run(docId, key, value, now, now);
+  }
+
+  getDocConfig(docId: string, key: string): string | undefined {
+    const row = this.db.prepare(`SELECT value FROM doc_config WHERE doc_id=? AND key=?`).get(docId, key) as
+      | { value: string }
+      | undefined;
+    return row?.value;
+  }
+
+  listDocConfig(docId: string): DocConfigRow[] {
+    return this.db.prepare(`SELECT * FROM doc_config WHERE doc_id=? ORDER BY key`).all(docId) as DocConfigRow[];
+  }
+
+  // --- Pending commands for agent decision engine ---
+
+  listPendingCommands(docId: string): CommandRow[] {
+    return this.db
+      .prepare(`SELECT * FROM commands WHERE doc_id=? AND status IN ('PENDING','APPROVED') ORDER BY created_at ASC`)
+      .all(docId) as CommandRow[];
+  }
+
+  listStaleCommands(maxAgeMs: number = 3600_000): CommandRow[] {
+    const cutoff = Date.now() - maxAgeMs;
+    return this.db
+      .prepare(`SELECT * FROM commands WHERE status IN ('PENDING','APPROVED') AND created_at < ? ORDER BY created_at ASC`)
+      .all(cutoff) as CommandRow[];
+  }
+
+  // --- Agent activity log ---
+
+  insertAgentActivity(docId: string, type: string, details: string) {
+    const now = Date.now();
+    this.db
+      .prepare(`INSERT INTO agent_activity(doc_id, type, details, created_at) VALUES(?,?,?,?)`)
+      .run(docId, type, details, now);
+  }
+
+  listAgentActivity(docId: string, limit = 50): AgentActivityRow[] {
+    return this.db
+      .prepare(`SELECT * FROM agent_activity WHERE doc_id=? ORDER BY created_at DESC LIMIT ?`)
+      .all(docId, limit) as AgentActivityRow[];
   }
 }

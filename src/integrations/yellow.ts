@@ -97,6 +97,87 @@ export class NitroRpcYellowClient {
     });
   }
 
+  // --- Gasless Approval Layer (Yellow as core approval pipeline) ---
+
+  /**
+   * Submit a gasless approval for a command through the Yellow state channel.
+   * This records an approval intent on-channel without any on-chain gas cost.
+   */
+  async submitGaslessApproval(params: {
+    signerPrivateKeysHex: Array<`0x${string}`>;
+    appSessionId: string;
+    version: number;
+    cmdId: string;
+    command: string;
+    approver: string;
+    sessionData?: string;
+  }): Promise<{ version: number; intentId: string }> {
+    const intent = `APPROVE:${params.cmdId}:${params.command}:${params.approver}:${Date.now()}`;
+    const stateHash = keccak256(new TextEncoder().encode(intent));
+    const res = await this.submitAppState({
+      signerPrivateKeysHex: params.signerPrivateKeysHex,
+      appSessionId: params.appSessionId,
+      version: params.version,
+      intent,
+      sessionData: params.sessionData ?? `approval:${params.cmdId}`,
+      allocations: []
+    });
+    return { version: res.version, intentId: stateHash };
+  }
+
+  /**
+   * Close a Yellow state channel session. Settles all off-chain state.
+   */
+  async closeAppSession(params: {
+    signerPrivateKeysHex: Array<`0x${string}`>;
+    appSessionId: string;
+    version: number;
+    sessionData?: string;
+  }): Promise<{ version: number }> {
+    const res = await this.callSigned({
+      method: "close_app_session",
+      params: {
+        app_session_id: params.appSessionId,
+        version: params.version,
+        session_data: params.sessionData ?? ""
+      },
+      signerPrivateKeysHex: params.signerPrivateKeysHex
+    });
+    return { version: Number(res?.version ?? params.version) };
+  }
+
+  /**
+   * Query channel status — returns current version and open/closed state.
+   */
+  async getSessionStatus(params: {
+    appSessionId: string;
+  }): Promise<{ version: number; status: string; participants: string[] }> {
+    try {
+      const res = await this.callUnsigned({
+        method: "get_app_session",
+        params: { app_session_id: params.appSessionId }
+      });
+      return {
+        version: Number(res?.version ?? 0),
+        status: String(res?.status ?? "UNKNOWN"),
+        participants: Array.isArray(res?.definition?.participants) ? res.definition.participants : []
+      };
+    } catch {
+      return { version: 0, status: "UNKNOWN", participants: [] };
+    }
+  }
+
+  /**
+   * Returns a summary of the Yellow integration for status displays.
+   */
+  getConnectionInfo(): { url: string; protocol: string; application: string } {
+    return {
+      url: this.rpcUrl,
+      protocol: "NitroRPC/0.4",
+      application: this.opts?.defaultApplication ?? "FrankyDocs"
+    };
+  }
+
   private async callUnsigned(params: { method: string; params?: unknown }) {
     const req = this.makeReq(params.method, params.params ?? {});
     return this.callRaw({ req, sig: [] });

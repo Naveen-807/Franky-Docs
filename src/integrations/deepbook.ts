@@ -41,6 +41,52 @@ export interface DeepBookClient {
   getWalletBalances(params: {
     address: string;
   }): Promise<DeepBookBalances>;
+
+  /** Deposit coins into the DeepBook balance manager using PTB coin merging. */
+  deposit(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+    coinType: string;
+    amount: number;
+  }): Promise<{ txDigest: string }>;
+
+  /** Withdraw coins from the DeepBook balance manager back to owner. */
+  withdraw(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+    coinType: string;
+    amount: number;
+  }): Promise<{ txDigest: string }>;
+
+  /** Place a market order (IOC at extreme price). */
+  placeMarketOrder(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+    side: "buy" | "sell";
+    qty: number;
+  }): Promise<DeepBookExecuteResult>;
+
+  /** Get all coin balances for an address (SUI-native object model). */
+  getAllBalances(params: { address: string }): Promise<Array<{ coinType: string; balance: string }>>;
+
+  /** Check if address has enough gas for transactions. */
+  checkGas(params: { address: string; minSui?: number }): Promise<{ ok: boolean; suiBalance: number; minRequired: number }>;
+
+  /** Get full status including balances, orders, gas. */
+  getFullStatus(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId?: string;
+  }): Promise<{
+    balances: DeepBookBalances;
+    openOrders: DeepBookOpenOrder[];
+    gasOk: boolean;
+    suiBalance: number;
+    allCoins: Array<{ coinType: string; balance: string }>;
+  }>;
 }
 
 type Network = "testnet";
@@ -228,6 +274,170 @@ export class DeepBookV3Client implements DeepBookClient {
     } catch {
       return { suiBalance: "0", dbUsdcBalance: "0" };
     }
+  }
+
+  // --- New Sui-specific capabilities ---
+
+  async deposit(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+    coinType: string;
+    amount: number;
+  }): Promise<{ txDigest: string }> {
+    const signer = loadSuiKeypair(params.wallet.suiPrivateKey);
+    const ownerAddress = params.wallet.address;
+    const deepbook = this.makeDeepBookClient({ ownerAddress, managerId: params.managerId });
+    const managerKey = "DOCWALLET_MANAGER";
+
+    const [baseKey, quoteKey] = splitPoolKey(params.poolKey);
+    const coinKey = params.coinType.toUpperCase() === "SUI" ? baseKey : quoteKey;
+
+    const tx = new Transaction();
+    deepbook.balanceManager.depositIntoManager(managerKey, coinKey, params.amount)(tx);
+
+    const result = await this.sui.signAndExecuteTransaction({
+      signer,
+      transaction: tx,
+      options: { showEffects: true }
+    });
+    const txDigest = String(result.digest ?? result.effects?.transactionDigest ?? "");
+    if (!txDigest) throw new Error("Deposit tx missing digest");
+    return { txDigest };
+  }
+
+  async withdraw(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+    coinType: string;
+    amount: number;
+  }): Promise<{ txDigest: string }> {
+    const signer = loadSuiKeypair(params.wallet.suiPrivateKey);
+    const ownerAddress = params.wallet.address;
+    const deepbook = this.makeDeepBookClient({ ownerAddress, managerId: params.managerId });
+    const managerKey = "DOCWALLET_MANAGER";
+
+    const [baseKey, quoteKey] = splitPoolKey(params.poolKey);
+    const coinKey = params.coinType.toUpperCase() === "SUI" ? baseKey : quoteKey;
+
+    const tx = new Transaction();
+    deepbook.balanceManager.withdrawFromManager(managerKey, coinKey, params.amount, ownerAddress)(tx);
+
+    const result = await this.sui.signAndExecuteTransaction({
+      signer,
+      transaction: tx,
+      options: { showEffects: true }
+    });
+    const txDigest = String(result.digest ?? result.effects?.transactionDigest ?? "");
+    if (!txDigest) throw new Error("Withdraw tx missing digest");
+    return { txDigest };
+  }
+
+  async placeMarketOrder(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+    side: "buy" | "sell";
+    qty: number;
+  }): Promise<DeepBookExecuteResult> {
+    const signer = loadSuiKeypair(params.wallet.suiPrivateKey);
+    const ownerAddress = params.wallet.address;
+    const deepbook = this.makeDeepBookClient({ ownerAddress, managerId: params.managerId });
+    const managerKey = "DOCWALLET_MANAGER";
+    const isBid = params.side === "buy";
+
+    const [baseKey, quoteKey] = splitPoolKey(params.poolKey);
+
+    // Market order = IOC limit order at extreme price
+    const extremePrice = isBid ? 999999 : 0.000001;
+    const clientOrderId = `market_${Date.now()}`;
+
+    const tx = new Transaction();
+    if (isBid) {
+      const notionalUsdc = Math.max(0, params.qty * extremePrice);
+      deepbook.balanceManager.depositIntoManager(managerKey, quoteKey, notionalUsdc)(tx);
+    } else {
+      deepbook.balanceManager.depositIntoManager(managerKey, baseKey, params.qty)(tx);
+    }
+
+    deepbook.deepBook.placeLimitOrder({
+      poolKey: params.poolKey,
+      balanceManagerKey: managerKey,
+      clientOrderId,
+      price: extremePrice,
+      quantity: params.qty,
+      isBid,
+      payWithDeep: true,
+      // IOC = immediate-or-cancel for market order behavior
+      orderType: "immediate_or_cancel"
+    })(tx);
+
+    const result = await this.sui.signAndExecuteTransaction({
+      signer,
+      transaction: tx,
+      options: { showEffects: true, showObjectChanges: true }
+    });
+    const txDigest = String(result.digest ?? result.effects?.transactionDigest ?? "");
+    if (!txDigest) throw new Error("Market order tx missing digest");
+
+    return { kind: "order", txDigest, orderId: clientOrderId, managerId: params.managerId };
+  }
+
+  async getAllBalances(params: { address: string }): Promise<Array<{ coinType: string; balance: string }>> {
+    try {
+      const allCoins = await this.sui.getAllBalances({ owner: params.address });
+      return allCoins.map((c) => ({
+        coinType: c.coinType,
+        balance: c.totalBalance
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async checkGas(params: { address: string; minSui?: number }): Promise<{ ok: boolean; suiBalance: number; minRequired: number }> {
+    const minRequired = params.minSui ?? 0.01;
+    try {
+      const bal = await this.sui.getBalance({ owner: params.address });
+      const suiBalance = Number(bal.totalBalance) / 1e9;
+      return { ok: suiBalance >= minRequired, suiBalance, minRequired };
+    } catch {
+      return { ok: false, suiBalance: 0, minRequired };
+    }
+  }
+
+  async getFullStatus(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId?: string;
+  }): Promise<{
+    balances: DeepBookBalances;
+    openOrders: DeepBookOpenOrder[];
+    gasOk: boolean;
+    suiBalance: number;
+    allCoins: Array<{ coinType: string; balance: string }>;
+  }> {
+    const balances = await this.getWalletBalances({ address: params.wallet.address });
+    const gasCheck = await this.checkGas({ address: params.wallet.address });
+    const allCoins = await this.getAllBalances({ address: params.wallet.address });
+
+    let openOrders: DeepBookOpenOrder[] = [];
+    if (params.managerId) {
+      openOrders = await this.getOpenOrders({
+        wallet: params.wallet,
+        poolKey: params.poolKey,
+        managerId: params.managerId
+      });
+    }
+
+    return {
+      balances,
+      openOrders,
+      gasOk: gasCheck.ok,
+      suiBalance: gasCheck.suiBalance,
+      allCoins
+    };
   }
 }
 

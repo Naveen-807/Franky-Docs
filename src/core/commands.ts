@@ -30,7 +30,15 @@ export type ParsedCommand =
   | { type: "POLICY_ENS"; ensName: string }
   | { type: "SCHEDULE"; intervalHours: number; innerCommand: string }
   | { type: "CANCEL_SCHEDULE"; scheduleId: string }
-  | { type: "BRIDGE"; amountUsdc: number; fromChain: string; toChain: string };
+  | { type: "BRIDGE"; amountUsdc: number; fromChain: string; toChain: string }
+  | { type: "SESSION_CLOSE" }
+  | { type: "SESSION_STATUS" }
+  | { type: "DEPOSIT"; coinType: string; amount: number }
+  | { type: "WITHDRAW"; coinType: string; amount: number }
+  | { type: "MARKET_BUY"; base: "SUI"; quote: "USDC"; qty: number }
+  | { type: "MARKET_SELL"; base: "SUI"; quote: "USDC"; qty: number }
+  | { type: "ALERT_THRESHOLD"; coinType: string; below: number }
+  | { type: "AUTO_REBALANCE"; enabled: boolean };
 
 const HexString = z
   .string()
@@ -113,6 +121,39 @@ export const ParsedCommandSchema: z.ZodType<ParsedCommand, z.ZodTypeDef, unknown
     amountUsdc: z.number().positive(),
     fromChain: z.string().min(1),
     toChain: z.string().min(1)
+  }),
+  z.object({ type: z.literal("SESSION_CLOSE") }),
+  z.object({ type: z.literal("SESSION_STATUS") }),
+  z.object({
+    type: z.literal("DEPOSIT"),
+    coinType: z.string().min(1),
+    amount: z.number().positive()
+  }),
+  z.object({
+    type: z.literal("WITHDRAW"),
+    coinType: z.string().min(1),
+    amount: z.number().positive()
+  }),
+  z.object({
+    type: z.literal("MARKET_BUY"),
+    base: z.literal("SUI"),
+    quote: z.literal("USDC"),
+    qty: z.number().positive()
+  }),
+  z.object({
+    type: z.literal("MARKET_SELL"),
+    base: z.literal("SUI"),
+    quote: z.literal("USDC"),
+    qty: z.number().positive()
+  }),
+  z.object({
+    type: z.literal("ALERT_THRESHOLD"),
+    coinType: z.string().min(1),
+    below: z.number().nonnegative()
+  }),
+  z.object({
+    type: z.literal("AUTO_REBALANCE"),
+    enabled: z.boolean()
   })
 ]);
 
@@ -163,6 +204,28 @@ export function tryAutoDetect(raw: string): ParseResult | null {
   const bridgeMatch = trimmed.match(/^bridge\s+([\d.]+)\s*USDC\s+from\s+(\w+)\s+to\s+(\w+)$/i);
   if (bridgeMatch) {
     return parseCommand(`DW BRIDGE ${bridgeMatch[1]} USDC FROM ${bridgeMatch[2]} TO ${bridgeMatch[3]}`);
+  }
+
+  // "deposit 10 SUI" / "deposit 50 USDC"
+  const depositMatch = trimmed.match(/^deposit\s+([\d.]+)\s*(\w+)$/i);
+  if (depositMatch) {
+    return parseCommand(`DW DEPOSIT ${depositMatch[2]} ${depositMatch[1]}`);
+  }
+
+  // "withdraw 10 SUI"
+  const withdrawMatch = trimmed.match(/^withdraw\s+([\d.]+)\s*(\w+)$/i);
+  if (withdrawMatch) {
+    return parseCommand(`DW WITHDRAW ${withdrawMatch[2]} ${withdrawMatch[1]}`);
+  }
+
+  // "market buy 10 SUI" / "market sell 5 SUI"
+  const marketBuyMatch = trimmed.match(/^market\s+buy\s+([\d.]+)\s*SUI$/i);
+  if (marketBuyMatch) {
+    return parseCommand(`DW MARKET_BUY SUI ${marketBuyMatch[1]}`);
+  }
+  const marketSellMatch = trimmed.match(/^market\s+sell\s+([\d.]+)\s*SUI$/i);
+  if (marketSellMatch) {
+    return parseCommand(`DW MARKET_SELL SUI ${marketSellMatch[1]}`);
   }
 
   // "setup" or "/setup"
@@ -385,6 +448,66 @@ export function parseCommand(raw: string): ParseResult {
     if (!validChains.includes(toChain)) return { ok: false, error: `Invalid destination chain: ${toChain}` };
     if (fromChain === toChain) return { ok: false, error: "Source and destination chains must differ" };
     return { ok: true, value: { type: "BRIDGE", amountUsdc, fromChain, toChain } };
+  }
+
+  if (op === "SESSION_CLOSE") return { ok: true, value: { type: "SESSION_CLOSE" } };
+  if (op === "SESSION_STATUS") return { ok: true, value: { type: "SESSION_STATUS" } };
+
+  if (op === "DEPOSIT") {
+    // DW DEPOSIT SUI 10  or  DW DEPOSIT USDC 50
+    const coinType = (parts[2] ?? "").toUpperCase();
+    const amountStr = parts[3] ?? "";
+    if (!coinType) return { ok: false, error: "DEPOSIT expects <coinType> <amount>" };
+    const amount = parseNumber(amountStr);
+    if (amount === null || amount <= 0) return { ok: false, error: "Invalid deposit amount" };
+    return { ok: true, value: { type: "DEPOSIT", coinType, amount } };
+  }
+
+  if (op === "WITHDRAW") {
+    // DW WITHDRAW SUI 10  or  DW WITHDRAW USDC 50
+    const coinType = (parts[2] ?? "").toUpperCase();
+    const amountStr = parts[3] ?? "";
+    if (!coinType) return { ok: false, error: "WITHDRAW expects <coinType> <amount>" };
+    const amount = parseNumber(amountStr);
+    if (amount === null || amount <= 0) return { ok: false, error: "Invalid withdraw amount" };
+    return { ok: true, value: { type: "WITHDRAW", coinType, amount } };
+  }
+
+  if (op === "MARKET_BUY") {
+    // DW MARKET_BUY SUI 10  (buy 10 SUI at market price)
+    const base = (parts[2] ?? "").toUpperCase();
+    const qtyStr = parts[3] ?? "";
+    if (base !== "SUI") return { ok: false, error: "Only SUI/USDC supported for MARKET_BUY" };
+    const qty = parseNumber(qtyStr);
+    if (qty === null || qty <= 0) return { ok: false, error: "Invalid qty" };
+    return { ok: true, value: { type: "MARKET_BUY", base: "SUI", quote: "USDC", qty } };
+  }
+
+  if (op === "MARKET_SELL") {
+    // DW MARKET_SELL SUI 10  (sell 10 SUI at market price)
+    const base = (parts[2] ?? "").toUpperCase();
+    const qtyStr = parts[3] ?? "";
+    if (base !== "SUI") return { ok: false, error: "Only SUI/USDC supported for MARKET_SELL" };
+    const qty = parseNumber(qtyStr);
+    if (qty === null || qty <= 0) return { ok: false, error: "Invalid qty" };
+    return { ok: true, value: { type: "MARKET_SELL", base: "SUI", quote: "USDC", qty } };
+  }
+
+  if (op === "ALERT_THRESHOLD") {
+    // DW ALERT_THRESHOLD SUI 0.5  (alert when SUI balance drops below 0.5)
+    const coinType = (parts[2] ?? "").toUpperCase();
+    const belowStr = parts[3] ?? "";
+    if (!coinType) return { ok: false, error: "ALERT_THRESHOLD expects <coinType> <below>" };
+    const below = parseNumber(belowStr);
+    if (below === null || below < 0) return { ok: false, error: "Invalid threshold amount" };
+    return { ok: true, value: { type: "ALERT_THRESHOLD", coinType, below } };
+  }
+
+  if (op === "AUTO_REBALANCE") {
+    // DW AUTO_REBALANCE ON  or  DW AUTO_REBALANCE OFF
+    const toggle = (parts[2] ?? "").toUpperCase();
+    if (toggle !== "ON" && toggle !== "OFF") return { ok: false, error: "AUTO_REBALANCE expects ON or OFF" };
+    return { ok: true, value: { type: "AUTO_REBALANCE", enabled: toggle === "ON" } };
   }
 
   return { ok: false, error: `Unknown command: ${op}` };

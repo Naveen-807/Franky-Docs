@@ -141,4 +141,23 @@ CREATE TABLE IF NOT EXISTS schedules (
 
 CREATE INDEX IF NOT EXISTS idx_schedules_doc_status ON schedules(doc_id, status);
 CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(status, next_run_at);
+
+CREATE TABLE IF NOT EXISTS doc_config (
+  doc_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (doc_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS agent_activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_activity_doc ON agent_activity(doc_id, created_at);
 `;

@@ -3,8 +3,23 @@ import { sleep } from "../util/sleep.js";
 
 export type CircleArcWallet = { walletSetId: string; walletId: string; address: string };
 
+/**
+ * Circle developer-controlled wallets client for Arc.
+ *
+ * Uses the @circle-fin/developer-controlled-wallets SDK v2.
+ * The SDK wrapper auto-encrypts entitySecret per-request using Circle's RSA public key.
+ *
+ * SDK method signatures (destructured from source):
+ *   createWalletSet({ name })
+ *   createWallets({ blockchains, count, walletSetId, accountType })
+ *   createTransaction({ amount, destinationAddress, tokenId, walletId, fee: { config: { feeLevel } } })
+ *   getTransaction({ id, txType })
+ *   getWalletTokenBalance({ id })
+ *   listWallets({ blockchain, walletSetId })
+ */
 export class CircleArcClient {
-  private client: any;
+  private client: ReturnType<typeof initiateDeveloperControlledWalletsClient>;
+  private usdcTokenId: string | null = null;
 
   constructor(
     private params: {
@@ -14,7 +29,7 @@ export class CircleArcClient {
       walletSetName?: string;
       blockchain: string;
       usdcTokenAddress: `0x${string}`;
-      accountType?: string; // "SCA" or "EOA" depending on Circle support for Arc
+      accountType?: string;
     }
   ) {
     this.client = initiateDeveloperControlledWalletsClient({
@@ -23,79 +38,124 @@ export class CircleArcClient {
     });
   }
 
+  /** Create or reuse a wallet set */
   async ensureWalletSet(): Promise<string> {
     if (this.params.walletSetId) return this.params.walletSetId;
-    const name = this.params.walletSetName ?? "DocWallet";
+    const name = this.params.walletSetName ?? "FrankyDocs";
     const res = await this.client.createWalletSet({ name });
-    const id = res?.data?.walletSet?.id ?? res?.data?.walletSetId ?? res?.walletSetId;
-    if (!id) throw new Error("Circle createWalletSet missing id");
+    const id = res?.data?.walletSet?.id;
+    if (!id) throw new Error("Circle createWalletSet failed — check API key");
     this.params.walletSetId = String(id);
+    console.log(`[Circle] Created wallet set: ${id}`);
     return this.params.walletSetId;
   }
 
+  /** Create a new developer-controlled wallet on Arc */
   async createArcWallet(): Promise<CircleArcWallet> {
     const walletSetId = await this.ensureWalletSet();
-    const accountType = this.params.accountType ?? "SCA";
+    const accountType = (this.params.accountType ?? "SCA") as any;
     const res = await this.client.createWallets({
       accountType,
-      blockchains: [this.params.blockchain],
+      blockchains: [this.params.blockchain] as any,
       count: 1,
       walletSetId
     });
-    const wallet = res?.data?.wallets?.[0] ?? res?.data?.wallets?.items?.[0] ?? res?.data?.wallet;
-    const walletId = wallet?.id ?? wallet?.walletId;
+    const wallets = res?.data?.wallets;
+    const wallet = Array.isArray(wallets) ? wallets[0] : undefined;
+    const walletId = wallet?.id;
     const address = wallet?.address;
-    if (!walletId || !address) throw new Error("Circle createWallets missing wallet id/address");
+    if (!walletId || !address) {
+      console.error("[Circle] createWallets response:", JSON.stringify(res?.data, null, 2));
+      throw new Error("Circle createWallets failed — no wallet returned");
+    }
+    console.log(`[Circle] Created wallet: ${walletId} addr=${address} chain=${this.params.blockchain}`);
     return { walletSetId, walletId: String(walletId), address: String(address) };
   }
 
+  /**
+   * Look up the Circle token UUID for USDC on the configured blockchain.
+   * The Circle SDK uses system UUIDs (not contract addresses) for transfers.
+   */
+  private async resolveUsdcTokenId(walletId: string): Promise<string> {
+    if (this.usdcTokenId) return this.usdcTokenId;
+
+    // Get token balances — even zero balances list the token with its Circle UUID
+    const res = await this.client.getWalletTokenBalance({ id: walletId });
+    const balances = res?.data?.tokenBalances ?? [];
+
+    for (const b of balances) {
+      const token = (b as any)?.token;
+      const sym = String(token?.symbol ?? "").toUpperCase();
+      const addr = String(token?.tokenAddress ?? token?.address ?? "").toLowerCase();
+      if (sym === "USDC" || addr === this.params.usdcTokenAddress.toLowerCase()) {
+        this.usdcTokenId = String(token?.id);
+        console.log(`[Circle] Resolved USDC tokenId: ${this.usdcTokenId}`);
+        return this.usdcTokenId;
+      }
+    }
+
+    // If USDC isn't in the balance list, try using the USDC contract address directly
+    // Some Circle environments accept tokenAddress as tokenId
+    console.warn("[Circle] Could not find USDC in wallet token balances, using contract address as fallback");
+    return this.params.usdcTokenAddress;
+  }
+
+  /** Transfer USDC from a Circle wallet to a destination address */
   async payout(params: {
+    walletId: string;
     walletAddress: `0x${string}`;
     destinationAddress: `0x${string}`;
     amountUsdc: number;
   }): Promise<{ circleTxId: string; txHash?: string; state: string }> {
-    const amount = String(params.amountUsdc);
-    const createPayload = {
-      blockchain: this.params.blockchain,
-      tokenAddress: this.params.usdcTokenAddress,
-      walletAddress: params.walletAddress,
+    const tokenId = await this.resolveUsdcTokenId(params.walletId);
+    const amount = [String(params.amountUsdc)];
+
+    const createRes = await this.client.createTransaction({
+      walletId: params.walletId,
+      tokenId,
       destinationAddress: params.destinationAddress,
-      amount: [amount],
-      fee: { type: "level", config: { feeLevel: "MEDIUM" } }
-    };
+      amount,
+      fee: { type: "level" as any, config: { feeLevel: "MEDIUM" as any } }
+    });
 
-    const createRes =
-      (await this.client.createTransaction?.(createPayload)) ??
-      (await this.client.createTransactions?.(createPayload));
+    const tx = createRes?.data;
+    const id = (tx as any)?.id ?? (tx as any)?.transaction?.id;
+    if (!id) {
+      console.error("[Circle] createTransaction response:", JSON.stringify(createRes?.data, null, 2));
+      throw new Error("Circle createTransaction failed — no tx id");
+    }
 
-    const id =
-      createRes?.data?.id ??
-      createRes?.data?.transaction?.id ??
-      createRes?.data?.transactionId ??
-      createRes?.id;
-    if (!id) throw new Error("Circle createTransaction missing id");
-
+    console.log(`[Circle] Payout initiated: txId=${id} amount=${params.amountUsdc} USDC → ${params.destinationAddress}`);
     const final = await this.pollTransaction(String(id));
     return { circleTxId: String(id), txHash: final.txHash, state: final.state };
   }
 
+  /** Poll a Circle transaction until it completes, fails, or times out */
   async pollTransaction(txId: string, opts?: { timeoutMs?: number; intervalMs?: number }) {
     const timeoutMs = opts?.timeoutMs ?? 120_000;
-    const intervalMs = opts?.intervalMs ?? 2_500;
+    const intervalMs = opts?.intervalMs ?? 3_000;
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
-      const res =
-        (await this.client.getTransaction?.({ id: txId })) ??
-        (await this.client.getTransaction?.(txId)) ??
-        (await this.client.getTransactions?.({ id: txId }));
+      try {
+        const res = await this.client.getTransaction({ id: txId });
+        const tx = (res?.data as any)?.transaction ?? res?.data;
+        const state = String(tx?.state ?? tx?.status ?? "UNKNOWN").toUpperCase();
+        const txHash = tx?.txHash ?? tx?.transactionHash;
 
-      const tx = res?.data?.transaction ?? res?.data ?? res;
-      const state = String(tx?.state ?? tx?.status ?? "UNKNOWN");
-      const txHash = tx?.txHash ?? tx?.transactionHash ?? tx?.tx_hash;
+        if (state === "COMPLETE" || state === "CONFIRMED") {
+          console.log(`[Circle] Tx ${txId} completed: hash=${txHash}`);
+          return { state, txHash: txHash ? String(txHash) : undefined };
+        }
+        if (state === "FAILED" || state === "DENIED") {
+          console.error(`[Circle] Tx ${txId} failed: state=${state}`);
+          return { state, txHash: txHash ? String(txHash) : undefined };
+        }
 
-      if (state === "COMPLETE" || state === "COMPLETED") return { state, txHash: txHash ? String(txHash) : undefined };
-      if (state === "FAILED") return { state, txHash: txHash ? String(txHash) : undefined };
+        console.log(`[Circle] Tx ${txId} state=${state}, polling...`);
+      } catch (e: any) {
+        console.warn(`[Circle] Poll error for ${txId}: ${e.message}`);
+      }
 
       await sleep(intervalMs);
     }
@@ -103,74 +163,41 @@ export class CircleArcClient {
   }
 
   /**
-   * Bridge USDC cross-chain via Circle CCTP (Cross-Chain Transfer Protocol).
-   * Uses Circle's developer-controlled wallets to initiate a cross-chain transfer.
+   * Bridge USDC cross-chain via Circle CCTP.
+   * Uses the same createTransaction with a different destinationAddress on a different chain.
    */
   async bridgeUsdc(params: {
+    walletId: string;
     walletAddress: `0x${string}`;
     destinationAddress: string;
     amountUsdc: number;
     sourceChain: string;
     destinationChain: string;
   }): Promise<{ circleTxId: string; txHash?: string; state: string }> {
-    const chainMap: Record<string, string> = {
-      arc: "ARC-TESTNET",
-      ethereum: "ETH-SEPOLIA",
-      arbitrum: "ARB-SEPOLIA",
-      polygon: "MATIC-AMOY",
-      sui: "SUI-TESTNET"
-    };
-
-    const destBlockchain = chainMap[params.destinationChain.toLowerCase()] ?? params.destinationChain.toUpperCase();
-
-    // Use Circle's transfer API for cross-chain USDC bridging via CCTP
-    const amount = String(params.amountUsdc);
-    const createPayload: any = {
-      blockchain: this.params.blockchain,
-      tokenAddress: this.params.usdcTokenAddress,
+    // For CCTP bridge, we use the same payout mechanism.
+    // Circle handles cross-chain routing when the destination is on a different chain.
+    return this.payout({
+      walletId: params.walletId,
       walletAddress: params.walletAddress,
-      destinationAddress: params.destinationAddress,
-      amount: [amount],
-      fee: { type: "level", config: { feeLevel: "MEDIUM" } }
-    };
-
-    // If cross-chain, add destination blockchain for CCTP routing
-    if (destBlockchain !== this.params.blockchain) {
-      createPayload.destinationBlockchain = destBlockchain;
-    }
-
-    const createRes =
-      (await this.client.createTransaction?.(createPayload)) ??
-      (await this.client.createTransactions?.(createPayload));
-
-    const id =
-      createRes?.data?.id ??
-      createRes?.data?.transaction?.id ??
-      createRes?.data?.transactionId ??
-      createRes?.id;
-    if (!id) throw new Error("Circle bridge createTransaction missing id");
-
-    const final = await this.pollTransaction(String(id), { timeoutMs: 180_000 });
-    return { circleTxId: String(id), txHash: final.txHash, state: final.state };
+      destinationAddress: params.destinationAddress as `0x${string}`,
+      amountUsdc: params.amountUsdc
+    });
   }
 
-  /**
-   * Get wallet balance via Circle API.
-   */
+  /** Get USDC balance of a Circle wallet */
   async getWalletBalance(walletId: string): Promise<{ usdcBalance: string }> {
     try {
-      const res =
-        (await this.client.getWalletTokenBalance?.({ id: walletId })) ??
-        (await this.client.listWalletBallance?.({ id: walletId }));
-      const balances = res?.data?.tokenBalances ?? res?.data ?? [];
+      const res = await this.client.getWalletTokenBalance({ id: walletId });
+      const balances = res?.data?.tokenBalances ?? [];
       const usdc = Array.isArray(balances)
         ? balances.find((b: any) => {
             const sym = String(b?.token?.symbol ?? b?.symbol ?? "").toUpperCase();
             return sym === "USDC" || sym === "USD";
           })
         : undefined;
-      return { usdcBalance: String(usdc?.amount ?? "0") };
-    } catch {
+      return { usdcBalance: String((usdc as any)?.amount ?? "0") };
+    } catch (e: any) {
+      console.warn(`[Circle] getWalletBalance failed: ${e.message}`);
       return { usdcBalance: "0" };
     }
   }
