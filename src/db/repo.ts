@@ -85,6 +85,43 @@ export type CircleWalletRow = {
   updated_at: number;
 };
 
+export type WalletConnectSessionRow = {
+  topic: string;
+  doc_id: string;
+  peer_name: string | null;
+  peer_url: string | null;
+  peer_icons: string | null;
+  chains: string | null;
+  status: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type WalletConnectRequestRow = {
+  topic: string;
+  request_id: number;
+  doc_id: string;
+  cmd_id: string;
+  method: string;
+  params_json: string;
+  status: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ScheduleRow = {
+  schedule_id: string;
+  doc_id: string;
+  interval_hours: number;
+  inner_command: string;
+  next_run_at: number;
+  status: string;
+  total_runs: number;
+  last_run_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
 export class Repo {
   private db: Database.Database;
 
@@ -298,6 +335,105 @@ export class Repo {
     return this.db.prepare(`SELECT * FROM circle_wallets WHERE doc_id=?`).get(docId) as CircleWalletRow | undefined;
   }
 
+  upsertWalletConnectSession(params: {
+    docId: string;
+    topic: string;
+    peerName?: string | null;
+    peerUrl?: string | null;
+    peerIcons?: string | null;
+    chains?: string | null;
+    status: string;
+  }) {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO walletconnect_sessions(
+          topic,doc_id,peer_name,peer_url,peer_icons,chains,status,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(topic) DO UPDATE SET
+          doc_id=excluded.doc_id,
+          peer_name=excluded.peer_name,
+          peer_url=excluded.peer_url,
+          peer_icons=excluded.peer_icons,
+          chains=excluded.chains,
+          status=excluded.status,
+          updated_at=excluded.updated_at`
+      )
+      .run(
+        params.topic,
+        params.docId,
+        params.peerName ?? null,
+        params.peerUrl ?? null,
+        params.peerIcons ?? null,
+        params.chains ?? null,
+        params.status,
+        now,
+        now
+      );
+  }
+
+  setWalletConnectSessionStatus(topic: string, status: string) {
+    const now = Date.now();
+    this.db.prepare(`UPDATE walletconnect_sessions SET status=?, updated_at=? WHERE topic=?`).run(status, now, topic);
+  }
+
+  getWalletConnectSession(topic: string): WalletConnectSessionRow | undefined {
+    return this.db.prepare(`SELECT * FROM walletconnect_sessions WHERE topic=?`).get(topic) as
+      | WalletConnectSessionRow
+      | undefined;
+  }
+
+  listWalletConnectSessions(docId: string): WalletConnectSessionRow[] {
+    return this.db
+      .prepare(`SELECT * FROM walletconnect_sessions WHERE doc_id=? ORDER BY updated_at DESC`)
+      .all(docId) as WalletConnectSessionRow[];
+  }
+
+  upsertWalletConnectRequest(params: {
+    docId: string;
+    cmdId: string;
+    topic: string;
+    requestId: number;
+    method: string;
+    paramsJson: string;
+    status: string;
+  }) {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO walletconnect_requests(
+          topic,request_id,doc_id,cmd_id,method,params_json,status,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(topic,request_id) DO UPDATE SET
+          doc_id=excluded.doc_id,
+          cmd_id=excluded.cmd_id,
+          method=excluded.method,
+          params_json=excluded.params_json,
+          status=excluded.status,
+          updated_at=excluded.updated_at`
+      )
+      .run(params.topic, params.requestId, params.docId, params.cmdId, params.method, params.paramsJson, params.status, now, now);
+  }
+
+  setWalletConnectRequestStatus(params: { topic: string; requestId: number; status: string }) {
+    const now = Date.now();
+    this.db
+      .prepare(`UPDATE walletconnect_requests SET status=?, updated_at=? WHERE topic=? AND request_id=?`)
+      .run(params.status, now, params.topic, params.requestId);
+  }
+
+  getWalletConnectRequestByCmdId(cmdId: string): WalletConnectRequestRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM walletconnect_requests WHERE cmd_id=?`)
+      .get(cmdId) as WalletConnectRequestRow | undefined;
+  }
+
+  getWalletConnectRequest(topic: string, requestId: number): WalletConnectRequestRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM walletconnect_requests WHERE topic=? AND request_id=?`)
+      .get(topic, requestId) as WalletConnectRequestRow | undefined;
+  }
+
   upsertSecrets(docId: string, encryptedBlob: string) {
     const now = Date.now();
     this.db
@@ -385,6 +521,12 @@ export class Repo {
       .get() as CommandRow | undefined;
   }
 
+  listRecentCommands(docId: string, limit = 20): CommandRow[] {
+    return this.db
+      .prepare(`SELECT * FROM commands WHERE doc_id=? ORDER BY updated_at DESC LIMIT ?`)
+      .all(docId, limit) as CommandRow[];
+  }
+
   setCommandStatus(cmdId: string, status: string, extra?: { resultText?: string | null; errorText?: string | null }) {
     const now = Date.now();
     this.db
@@ -404,5 +546,87 @@ export class Repo {
         WHERE cmd_id=?`
       )
       .run(params.yellowIntentId ?? null, params.suiTxDigest ?? null, params.arcTxHash ?? null, now, cmdId);
+  }
+
+  // --- Schedule CRUD ---
+
+  insertSchedule(params: {
+    scheduleId: string;
+    docId: string;
+    intervalHours: number;
+    innerCommand: string;
+    nextRunAt: number;
+  }) {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO schedules(schedule_id,doc_id,interval_hours,inner_command,next_run_at,status,total_runs,last_run_at,created_at,updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`
+      )
+      .run(params.scheduleId, params.docId, params.intervalHours, params.innerCommand, params.nextRunAt, "ACTIVE", 0, null, now, now);
+  }
+
+  getSchedule(scheduleId: string): ScheduleRow | undefined {
+    return this.db.prepare(`SELECT * FROM schedules WHERE schedule_id=?`).get(scheduleId) as ScheduleRow | undefined;
+  }
+
+  listSchedules(docId: string): ScheduleRow[] {
+    return this.db.prepare(`SELECT * FROM schedules WHERE doc_id=? ORDER BY created_at DESC`).all(docId) as ScheduleRow[];
+  }
+
+  listDueSchedules(): ScheduleRow[] {
+    const now = Date.now();
+    return this.db
+      .prepare(`SELECT * FROM schedules WHERE status='ACTIVE' AND next_run_at <= ? ORDER BY next_run_at ASC`)
+      .all(now) as ScheduleRow[];
+  }
+
+  advanceSchedule(scheduleId: string) {
+    const now = Date.now();
+    const schedule = this.getSchedule(scheduleId);
+    if (!schedule) return;
+    const nextRunAt = now + schedule.interval_hours * 3600_000;
+    this.db
+      .prepare(
+        `UPDATE schedules SET next_run_at=?, total_runs=total_runs+1, last_run_at=?, updated_at=? WHERE schedule_id=?`
+      )
+      .run(nextRunAt, now, now, scheduleId);
+  }
+
+  cancelSchedule(scheduleId: string) {
+    const now = Date.now();
+    this.db.prepare(`UPDATE schedules SET status='CANCELLED', updated_at=? WHERE schedule_id=?`).run(now, scheduleId);
+  }
+
+  // --- Daily spend query ---
+
+  getDailySpendUsdc(docId: string): number {
+    const since = Date.now() - 86400_000;
+    const result = this.db
+      .prepare(
+        `SELECT SUM(
+           CASE
+             WHEN parsed_json IS NOT NULL AND (
+               json_extract(parsed_json, '$.type') = 'PAYOUT' OR
+               json_extract(parsed_json, '$.type') = 'PAYOUT_SPLIT' OR
+               json_extract(parsed_json, '$.type') = 'BRIDGE'
+             )
+             THEN COALESCE(json_extract(parsed_json, '$.amountUsdc'), 0)
+             ELSE 0
+           END
+         ) as total
+         FROM commands
+         WHERE doc_id=? AND status='EXECUTED' AND updated_at >= ?`
+      )
+      .get(docId, since) as { total: number | null } | undefined;
+    return result?.total ?? 0;
+  }
+
+  // --- Pending WC requests ---
+
+  listPendingWalletConnectRequests(docId: string): WalletConnectRequestRow[] {
+    return this.db
+      .prepare(`SELECT * FROM walletconnect_requests WHERE doc_id=? AND status='PENDING' ORDER BY created_at ASC`)
+      .all(docId) as WalletConnectRequestRow[];
   }
 }

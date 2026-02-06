@@ -3,17 +3,21 @@ import { batchUpdateDoc, findAnchor, findNextTable, getDoc, buildWriteCellReques
 
 export const DOCWALLET_CONFIG_ANCHOR = "DOCWALLET_CONFIG_ANCHOR";
 export const DOCWALLET_COMMANDS_ANCHOR = "DOCWALLET_COMMANDS_ANCHOR";
+export const DOCWALLET_CHAT_ANCHOR = "DOCWALLET_CHAT_ANCHOR";
 export const DOCWALLET_BALANCES_ANCHOR = "DOCWALLET_BALANCES_ANCHOR";
 export const DOCWALLET_OPEN_ORDERS_ANCHOR = "DOCWALLET_OPEN_ORDERS_ANCHOR";
 export const DOCWALLET_RECENT_ACTIVITY_ANCHOR = "DOCWALLET_RECENT_ACTIVITY_ANCHOR";
+export const DOCWALLET_SESSIONS_ANCHOR = "DOCWALLET_SESSIONS_ANCHOR";
 export const DOCWALLET_AUDIT_ANCHOR = "DOCWALLET_AUDIT_ANCHOR";
 
 export type DocWalletTemplate = {
   config: { anchor: typeof DOCWALLET_CONFIG_ANCHOR; table: docs_v1.Schema$Table };
   commands: { anchor: typeof DOCWALLET_COMMANDS_ANCHOR; table: docs_v1.Schema$Table };
+  chat: { anchor: typeof DOCWALLET_CHAT_ANCHOR; table: docs_v1.Schema$Table };
   balances: { anchor: typeof DOCWALLET_BALANCES_ANCHOR; table: docs_v1.Schema$Table };
   openOrders: { anchor: typeof DOCWALLET_OPEN_ORDERS_ANCHOR; table: docs_v1.Schema$Table };
   recentActivity: { anchor: typeof DOCWALLET_RECENT_ACTIVITY_ANCHOR; table: docs_v1.Schema$Table };
+  sessions: { anchor: typeof DOCWALLET_SESSIONS_ANCHOR; table: docs_v1.Schema$Table };
   audit: { anchor: typeof DOCWALLET_AUDIT_ANCHOR; table: docs_v1.Schema$Table };
 };
 
@@ -74,9 +78,11 @@ export async function ensureDocWalletTemplate(params: {
   const requiredAnchors = [
     DOCWALLET_CONFIG_ANCHOR,
     DOCWALLET_COMMANDS_ANCHOR,
+    DOCWALLET_CHAT_ANCHOR,
     DOCWALLET_BALANCES_ANCHOR,
     DOCWALLET_OPEN_ORDERS_ANCHOR,
     DOCWALLET_RECENT_ACTIVITY_ANCHOR,
+    DOCWALLET_SESSIONS_ANCHOR,
     DOCWALLET_AUDIT_ANCHOR
   ];
 
@@ -98,9 +104,11 @@ export async function ensureDocWalletTemplate(params: {
               "\n\nDocWallet\n\n" +
               `Config\n${DOCWALLET_CONFIG_ANCHOR}\n\n` +
               `Commands\n${DOCWALLET_COMMANDS_ANCHOR}\n\n` +
+              `Chat\n${DOCWALLET_CHAT_ANCHOR}\n\n` +
               `Dashboard — Balances\n${DOCWALLET_BALANCES_ANCHOR}\n\n` +
               `Dashboard — Open Orders\n${DOCWALLET_OPEN_ORDERS_ANCHOR}\n\n` +
               `Dashboard — Recent Activity\n${DOCWALLET_RECENT_ACTIVITY_ANCHOR}\n\n` +
+              `WalletConnect Sessions\n${DOCWALLET_SESSIONS_ANCHOR}\n\n` +
               `Audit Log\n${DOCWALLET_AUDIT_ANCHOR}\n\n`
           }
         }
@@ -110,9 +118,11 @@ export async function ensureDocWalletTemplate(params: {
     const doc2 = await getDoc(docs, docId);
     const configAnchor = findAnchor(doc2, DOCWALLET_CONFIG_ANCHOR)!;
     const commandsAnchor = findAnchor(doc2, DOCWALLET_COMMANDS_ANCHOR)!;
+    const chatAnchor = findAnchor(doc2, DOCWALLET_CHAT_ANCHOR)!;
     const balancesAnchor = findAnchor(doc2, DOCWALLET_BALANCES_ANCHOR)!;
     const openOrdersAnchor = findAnchor(doc2, DOCWALLET_OPEN_ORDERS_ANCHOR)!;
     const recentAnchor = findAnchor(doc2, DOCWALLET_RECENT_ACTIVITY_ANCHOR)!;
+    const sessionsAnchor = findAnchor(doc2, DOCWALLET_SESSIONS_ANCHOR)!;
     const auditAnchor = findAnchor(doc2, DOCWALLET_AUDIT_ANCHOR)!;
 
     await batchUpdateDoc({
@@ -136,6 +146,13 @@ export async function ensureDocWalletTemplate(params: {
         },
         {
           insertTable: {
+            rows: 8,
+            columns: 5,
+            location: { index: sessionsAnchor.endIndex }
+          }
+        },
+        {
+          insertTable: {
             rows: 12,
             columns: 7,
             location: { index: openOrdersAnchor.endIndex }
@@ -146,6 +163,13 @@ export async function ensureDocWalletTemplate(params: {
             rows: 8,
             columns: 3,
             location: { index: balancesAnchor.endIndex }
+          }
+        },
+        {
+          insertTable: {
+            rows: 8,
+            columns: 2,
+            location: { index: chatAnchor.endIndex }
           }
         },
         {
@@ -173,13 +197,18 @@ export async function ensureDocWalletTemplate(params: {
       .filter((a) => a !== DOCWALLET_CONFIG_ANCHOR && a !== DOCWALLET_COMMANDS_ANCHOR && a !== DOCWALLET_AUDIT_ANCHOR)
       .map((a) => {
         const heading =
+          a === DOCWALLET_CHAT_ANCHOR
+            ? "Chat"
+            : a === DOCWALLET_SESSIONS_ANCHOR
+              ? "WalletConnect Sessions"
+              :
           a === DOCWALLET_BALANCES_ANCHOR
             ? "Dashboard — Balances"
             : a === DOCWALLET_OPEN_ORDERS_ANCHOR
               ? "Dashboard — Open Orders"
-              : a === DOCWALLET_RECENT_ACTIVITY_ANCHOR
-                ? "Dashboard — Recent Activity"
-                : "Dashboard";
+            : a === DOCWALLET_RECENT_ACTIVITY_ANCHOR
+              ? "Dashboard — Recent Activity"
+              : "Dashboard";
         return `${heading}\n${a}\n\n`;
       })
       .join("");
@@ -207,8 +236,26 @@ export async function ensureDocWalletTemplate(params: {
         anchorsWithTables.push({
           anchor: a,
           endIndex: loc.endIndex,
-          rows: a === DOCWALLET_BALANCES_ANCHOR ? 8 : a === DOCWALLET_OPEN_ORDERS_ANCHOR ? 12 : 10,
-          cols: a === DOCWALLET_BALANCES_ANCHOR ? 3 : a === DOCWALLET_OPEN_ORDERS_ANCHOR ? 7 : 4
+          rows:
+            a === DOCWALLET_BALANCES_ANCHOR
+              ? 8
+              : a === DOCWALLET_OPEN_ORDERS_ANCHOR
+                ? 12
+                : a === DOCWALLET_CHAT_ANCHOR
+                  ? 8
+                  : a === DOCWALLET_SESSIONS_ANCHOR
+                    ? 8
+                    : 10,
+          cols:
+            a === DOCWALLET_BALANCES_ANCHOR
+              ? 3
+              : a === DOCWALLET_OPEN_ORDERS_ANCHOR
+                ? 7
+                : a === DOCWALLET_CHAT_ANCHOR
+                  ? 2
+                  : a === DOCWALLET_SESSIONS_ANCHOR
+                    ? 5
+                    : 4
         });
       }
 
@@ -231,9 +278,11 @@ export async function ensureDocWalletTemplate(params: {
   // (If we insert rows, we re-run populate in "onlyFillEmpty" mode.)
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CONFIG_ANCHOR, minRows: 20 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_COMMANDS_ANCHOR, minRows: Math.max(2, minCommandRows) });
+  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CHAT_ANCHOR, minRows: 8 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_BALANCES_ANCHOR, minRows: 8 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_OPEN_ORDERS_ANCHOR, minRows: 12 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_RECENT_ACTIVITY_ANCHOR, minRows: 10 });
+  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_SESSIONS_ANCHOR, minRows: 8 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_AUDIT_ANCHOR, minRows: 2 });
 
   await populateTemplateTables({ docs, docId, onlyFillEmpty: true });
@@ -243,9 +292,11 @@ export async function ensureDocWalletTemplate(params: {
   return {
     config: { anchor: DOCWALLET_CONFIG_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_CONFIG_ANCHOR) },
     commands: { anchor: DOCWALLET_COMMANDS_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_COMMANDS_ANCHOR) },
+    chat: { anchor: DOCWALLET_CHAT_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_CHAT_ANCHOR) },
     balances: { anchor: DOCWALLET_BALANCES_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_BALANCES_ANCHOR) },
     openOrders: { anchor: DOCWALLET_OPEN_ORDERS_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_OPEN_ORDERS_ANCHOR) },
     recentActivity: { anchor: DOCWALLET_RECENT_ACTIVITY_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_RECENT_ACTIVITY_ANCHOR) },
+    sessions: { anchor: DOCWALLET_SESSIONS_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_SESSIONS_ANCHOR) },
     audit: { anchor: DOCWALLET_AUDIT_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_AUDIT_ANCHOR) }
   };
 }
@@ -260,9 +311,11 @@ async function populateTemplateTables(params: {
 
   const configTable = mustGetTable(doc, DOCWALLET_CONFIG_ANCHOR);
   const commandsTable = mustGetTable(doc, DOCWALLET_COMMANDS_ANCHOR);
+  const chatTable = mustGetTable(doc, DOCWALLET_CHAT_ANCHOR);
   const balancesTable = mustGetTable(doc, DOCWALLET_BALANCES_ANCHOR);
   const openOrdersTable = mustGetTable(doc, DOCWALLET_OPEN_ORDERS_ANCHOR);
   const recentActivityTable = mustGetTable(doc, DOCWALLET_RECENT_ACTIVITY_ANCHOR);
+  const sessionsTable = mustGetTable(doc, DOCWALLET_SESSIONS_ANCHOR);
   const auditTable = mustGetTable(doc, DOCWALLET_AUDIT_ANCHOR);
 
   const groups: Array<{ sortIndex: number; requests: docs_v1.Schema$Request[] }> = [];
@@ -316,6 +369,13 @@ async function populateTemplateTables(params: {
     setIf(cmdRows[0]?.tableCells?.[c], cmdHeader[c]);
   }
 
+  // Chat header
+  const chatRows = chatTable.tableRows ?? [];
+  const chatHeader = ["USER", "AGENT"];
+  for (let c = 0; c < chatHeader.length; c++) {
+    setIf(chatRows[0]?.tableCells?.[c], chatHeader[c]);
+  }
+
   // Balances header
   const balRows = balancesTable.tableRows ?? [];
   const balHeader = ["LOCATION", "ASSET", "BALANCE"];
@@ -330,6 +390,11 @@ async function populateTemplateTables(params: {
   const raRows = recentActivityTable.tableRows ?? [];
   const raHeader = ["TIME", "TYPE", "DETAILS", "TX"];
   for (let c = 0; c < raHeader.length; c++) setIf(raRows[0]?.tableCells?.[c], raHeader[c]);
+
+  // Sessions header
+  const sesRows = sessionsTable.tableRows ?? [];
+  const sesHeader = ["SESSION_ID", "PEER_NAME", "CHAINS", "CREATED_AT", "STATUS"];
+  for (let c = 0; c < sesHeader.length; c++) setIf(sesRows[0]?.tableCells?.[c], sesHeader[c]);
 
   // Audit header
   const auditRows = auditTable.tableRows ?? [];

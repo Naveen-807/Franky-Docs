@@ -1,6 +1,53 @@
 node_modules
 dist
-.env
-data
-*.log
 
+# env/secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+*.crt
+*.cert
+# common credential files
+*service-account*.json
+*serviceaccount*.json
+*credentials*.json
+*gcp*.json
+*google*.json
+*firebase*.json
+
+# local data/db
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# logs/coverage
+*.log
+coverage
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# build artifacts
+*.tsbuildinfo
+*.map
+
+# package manager
+package-lock.json
+
+# misc
+.cache
+tmp/
+*.tmp

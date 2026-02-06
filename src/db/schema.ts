@@ -95,4 +95,50 @@ CREATE TABLE IF NOT EXISTS circle_wallets (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS walletconnect_sessions (
+  topic TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  peer_name TEXT,
+  peer_url TEXT,
+  peer_icons TEXT,
+  chains TEXT,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wc_sessions_doc_updated ON walletconnect_sessions(doc_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS walletconnect_requests (
+  topic TEXT NOT NULL,
+  request_id INTEGER NOT NULL,
+  doc_id TEXT NOT NULL,
+  cmd_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  params_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (topic, request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wc_requests_doc_status ON walletconnect_requests(doc_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_wc_requests_cmd ON walletconnect_requests(cmd_id);
+
+CREATE TABLE IF NOT EXISTS schedules (
+  schedule_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  interval_hours REAL NOT NULL,
+  inner_command TEXT NOT NULL,
+  next_run_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
+  total_runs INTEGER NOT NULL DEFAULT 0,
+  last_run_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedules_doc_status ON schedules(doc_id, status);
+CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(status, next_run_at);
 `;

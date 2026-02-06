@@ -9,6 +9,7 @@ import { EnsPolicyClient } from "./integrations/ens.js";
 import { NitroRpcYellowClient } from "./integrations/yellow.js";
 import { DeepBookV3Client } from "./integrations/deepbook.js";
 import { startServer } from "./server.js";
+import { WalletConnectService } from "./integrations/walletconnect.js";
 
 async function main() {
   const config = loadConfig();
@@ -46,7 +47,24 @@ async function main() {
 
   const ens = config.ENS_RPC_URL ? new EnsPolicyClient(config.ENS_RPC_URL) : undefined;
 
-  const engine = new Engine({ config, docs, drive, repo, yellow, deepbook, arc, circle, ens });
+  let engine: Engine;
+  const walletconnect = config.WALLETCONNECT_ENABLED
+    ? new WalletConnectService({
+        projectId: config.WALLETCONNECT_PROJECT_ID!,
+        relayUrl: config.WALLETCONNECT_RELAY_URL,
+        metadata: {
+          name: "DocWallet",
+          description: "DocWallet approvals",
+          url: config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`,
+          icons: []
+        },
+        repo,
+        onRequest: async (req) => engine.handleWalletConnectRequest(req),
+        onSessionUpdate: async (session) => engine.handleWalletConnectSessionUpdate(session)
+      })
+    : undefined;
+
+  engine = new Engine({ config, docs, drive, repo, yellow, deepbook, arc, circle, ens, walletconnect });
 
   const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
   startServer({
@@ -56,8 +74,11 @@ async function main() {
     port: config.HTTP_PORT,
     publicBaseUrl,
     yellow,
-    yellowApplicationName: config.YELLOW_APP_NAME ?? "DocWallet"
+    yellowApplicationName: config.YELLOW_APP_NAME ?? "DocWallet",
+    walletconnect
   });
+
+  if (walletconnect) await walletconnect.init();
 
   await engine.discoveryTick();
   await engine.pollTick();
@@ -65,6 +86,9 @@ async function main() {
   setInterval(() => engine.discoveryTick().catch((e) => console.error("discoveryTick", e)), config.DISCOVERY_INTERVAL_MS);
   setInterval(() => engine.pollTick().catch((e) => console.error("pollTick", e)), config.POLL_INTERVAL_MS);
   setInterval(() => engine.executorTick().catch((e) => console.error("executorTick", e)), 1500);
+  setInterval(() => engine.chatTick().catch((e) => console.error("chatTick", e)), Math.max(5000, config.POLL_INTERVAL_MS));
+  setInterval(() => engine.balancesTick().catch((e) => console.error("balancesTick", e)), config.BALANCE_POLL_INTERVAL_MS);
+  setInterval(() => engine.schedulerTick().catch((e) => console.error("schedulerTick", e)), config.SCHEDULER_INTERVAL_MS);
 
   process.on("SIGINT", () => {
     repo.close();

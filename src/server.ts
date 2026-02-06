@@ -7,6 +7,7 @@ import { loadDocWalletTables, readCommandsTable, readConfig, updateCommandsRowCe
 import { decryptWithMasterKey, encryptWithMasterKey } from "./wallet/crypto.js";
 import { generateEvmWallet } from "./wallet/evm.js";
 import { NitroRpcYellowClient } from "./integrations/yellow.js";
+import type { WalletConnectService } from "./integrations/walletconnect.js";
 
 type ServerDeps = {
   docs: docs_v1.Docs;
@@ -16,6 +17,7 @@ type ServerDeps = {
   publicBaseUrl: string;
   yellow?: NitroRpcYellowClient;
   yellowApplicationName?: string;
+  walletconnect?: WalletConnectService;
 };
 
 type Session = { docId: string; signerAddress: `0x${string}`; createdAt: number };
@@ -47,8 +49,10 @@ export function startServer(deps: ServerDeps) {
           .map((d) => {
             const joinUrl = `${deps.publicBaseUrl}/join/${encodeURIComponent(d.doc_id)}`;
             const signersUrl = `${deps.publicBaseUrl}/signers/${encodeURIComponent(d.doc_id)}`;
+            const activityUrl = `${deps.publicBaseUrl}/activity/${encodeURIComponent(d.doc_id)}`;
+            const sessionsUrl = `${deps.publicBaseUrl}/sessions/${encodeURIComponent(d.doc_id)}`;
             return `<li><code>${escapeHtml(d.name ?? d.doc_id)}</code><br/>` +
-              `<a href="${joinUrl}">Join</a> · <a href="${signersUrl}">Signers</a></li>`;
+              `<a href="${joinUrl}">Join</a> · <a href="${signersUrl}">Signers</a> · <a href="${activityUrl}">Activity</a> · <a href="${sessionsUrl}">Sessions</a></li>`;
           })
           .join("\n");
 
@@ -57,6 +61,44 @@ export function startServer(deps: ServerDeps) {
           "DocWallet",
           `<h1>DocWallet</h1><p>Docs discovered: ${docs.length}</p><ul>${rows}</ul>`
         );
+      }
+
+      const activityPageMatch = matchPath(url.pathname, ["activity", ":docId"]);
+      if (req.method === "GET" && activityPageMatch) {
+        const docId = decodeURIComponent(activityPageMatch.docId);
+        return sendHtml(res, "Activity", activityPageHtml({ docId }));
+      }
+
+      const apiActivityMatch = matchPath(url.pathname, ["api", "activity", ":docId"]);
+      if (req.method === "GET" && apiActivityMatch) {
+        const docId = decodeURIComponent(apiActivityMatch.docId);
+        const cmds = deps.repo.listRecentCommands(docId, 50).map((c) => ({
+          cmdId: c.cmd_id,
+          raw: c.raw_command,
+          status: c.status,
+          result: c.result_text,
+          error: c.error_text,
+          updatedAt: c.updated_at
+        }));
+        return sendJson(res, 200, { ok: true, commands: cmds });
+      }
+
+      const apiCmdMatch = matchPath(url.pathname, ["api", "cmd", ":docId", ":cmdId"]);
+      if (req.method === "GET" && apiCmdMatch) {
+        const docId = decodeURIComponent(apiCmdMatch.docId);
+        const cmdId = decodeURIComponent(apiCmdMatch.cmdId);
+        const cmd = deps.repo.getCommand(cmdId);
+        if (!cmd || cmd.doc_id !== docId) return sendJson(res, 404, { ok: false, error: "Not found" });
+        return sendJson(res, 200, {
+          ok: true,
+          cmd: {
+            cmdId: cmd.cmd_id,
+            raw: cmd.raw_command,
+            status: cmd.status,
+            result: cmd.result_text,
+            error: cmd.error_text
+          }
+        });
       }
 
       const joinMatch = matchPath(url.pathname, ["join", ":docId"]);
@@ -257,6 +299,13 @@ export function startServer(deps: ServerDeps) {
           deps.repo.setCommandStatus(cmdId, "REJECTED", { errorText: null });
           await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "REJECTED", error: "" } });
           await bestEffortAudit(deps.docs, docId, `${cmdId} REJECTED by ${session.signerAddress}`);
+          const wcReq = deps.repo.getWalletConnectRequestByCmdId(cmdId);
+          if (wcReq) {
+            deps.repo.setWalletConnectRequestStatus({ topic: wcReq.topic, requestId: wcReq.request_id, status: "REJECTED" });
+            if (deps.walletconnect) {
+              await deps.walletconnect.respondError(wcReq.topic, wcReq.request_id, "Rejected by quorum");
+            }
+          }
           deps.repo.clearCommandApprovals({ docId, cmdId });
           return sendJson(res, 200, { ok: true, status: "REJECTED" });
         }
@@ -327,6 +376,79 @@ export function startServer(deps: ServerDeps) {
         }
 
         return sendJson(res, 200, { ok: true, status: "PENDING_APPROVAL", approvedWeight, quorum });
+      }
+
+      // --- WalletConnect Session Management ---
+
+      const sessionsPageMatch = matchPath(url.pathname, ["sessions", ":docId"]);
+      if (req.method === "GET" && sessionsPageMatch) {
+        const docId = decodeURIComponent(sessionsPageMatch.docId);
+        return sendHtml(res, "WC Sessions", walletConnectSessionsPageHtml({ docId, publicBaseUrl: deps.publicBaseUrl }));
+      }
+
+      const apiSessionsMatch = matchPath(url.pathname, ["api", "sessions", ":docId"]);
+      if (req.method === "GET" && apiSessionsMatch) {
+        const docId = decodeURIComponent(apiSessionsMatch.docId);
+        const wcSessions = deps.repo.listWalletConnectSessions(docId);
+        const pendingRequests = deps.repo.listPendingWalletConnectRequests(docId);
+        const schedules = deps.repo.listSchedules(docId);
+        return sendJson(res, 200, {
+          ok: true,
+          sessions: wcSessions.map((s) => ({
+            topic: s.topic,
+            peerName: s.peer_name,
+            peerUrl: s.peer_url,
+            chains: s.chains,
+            status: s.status,
+            createdAt: s.created_at,
+            updatedAt: s.updated_at
+          })),
+          pendingRequests: pendingRequests.map((r) => ({
+            topic: r.topic,
+            requestId: r.request_id,
+            method: r.method,
+            cmdId: r.cmd_id,
+            status: r.status,
+            createdAt: r.created_at
+          })),
+          schedules: schedules.map((s) => ({
+            scheduleId: s.schedule_id,
+            intervalHours: s.interval_hours,
+            innerCommand: s.inner_command,
+            nextRunAt: s.next_run_at,
+            status: s.status,
+            totalRuns: s.total_runs,
+            lastRunAt: s.last_run_at
+          }))
+        });
+      }
+
+      const apiDisconnectMatch = matchPath(url.pathname, ["api", "sessions", ":docId", "disconnect"]);
+      if (req.method === "POST" && apiDisconnectMatch) {
+        const docId = decodeURIComponent(apiDisconnectMatch.docId);
+        const body = await readJsonBody(req);
+        const topic = String(body.topic ?? "");
+        if (!topic) return sendJson(res, 400, { ok: false, error: "Missing topic" });
+
+        const session = deps.repo.getWalletConnectSession(topic);
+        if (!session || session.doc_id !== docId) return sendJson(res, 404, { ok: false, error: "Session not found" });
+
+        deps.repo.setWalletConnectSessionStatus(topic, "DISCONNECTED");
+
+        if (deps.walletconnect) {
+          try {
+            // Reject any pending requests for this session
+            const pending = deps.repo.listPendingWalletConnectRequests(docId);
+            for (const r of pending) {
+              if (r.topic === topic) {
+                await deps.walletconnect.respondError(r.topic, r.request_id, "Session disconnected by user");
+                deps.repo.setWalletConnectRequestStatus({ topic: r.topic, requestId: r.request_id, status: "REJECTED" });
+              }
+            }
+          } catch { /* ignore */ }
+        }
+
+        return sendJson(res, 200, { ok: true, status: "DISCONNECTED" });
       }
 
       res.statusCode = 404;
@@ -452,14 +574,42 @@ function sendHtml(res: http.ServerResponse, title: string, body: string) {
   res.end(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>${escapeHtml(title)}</title>
 <style>
-body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell;max-width:960px;margin:32px auto;padding:0 16px;line-height:1.4}
-code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
-button{padding:10px 14px;border-radius:10px;border:1px solid #ddd;background:#111;color:#fff;cursor:pointer}
-button.secondary{background:#fff;color:#111}
-input{padding:10px 12px;border-radius:10px;border:1px solid #ddd}
-small{color:#666}
+:root{
+  --blue:#1a73e8;
+  --blue-weak:#e8f0fe;
+  --gray-900:#202124;
+  --gray-700:#5f6368;
+  --gray-200:#e0e0e0;
+  --bg:#f8f9fa;
+  --card:#fff;
+  --radius:14px;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--gray-900);
+  font-family: "Google Sans", "Product Sans", "Segoe UI", Roboto, Arial, sans-serif;
+}
+.container{max-width:980px;margin:24px auto;padding:0 16px}
+.card{background:var(--card); border:1px solid var(--gray-200); border-radius:var(--radius); padding:18px; box-shadow:0 1px 2px rgba(0,0,0,0.04)}
+.row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+.btn{
+  padding:10px 14px;border-radius:10px;border:1px solid var(--blue); background:var(--blue); color:#fff;
+  cursor:pointer; font-weight:600
+}
+.btn.secondary{background:#fff;color:var(--blue)}
+.btn.ghost{border-color:var(--gray-200);background:#fff;color:var(--gray-900)}
+.input{
+  padding:10px 12px;border-radius:10px;border:1px solid var(--gray-200); min-width:160px
+}
+.muted{color:var(--gray-700); font-size:0.9rem}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:var(--blue-weak);color:var(--blue);font-size:0.8rem}
+code{background:#f1f3f4;padding:2px 6px;border-radius:6px}
+pre{background:#f1f3f4;padding:12px;border-radius:12px;white-space:pre-wrap}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid var(--gray-200);padding:8px;text-align:left;font-size:0.95rem}
+thead th{background:#f1f3f4}
 </style>
-</head><body>${body}</body></html>`);
+</head><body><div class="container">${body}</div></body></html>`);
 }
 
 function escapeHtml(s: string): string {
@@ -469,12 +619,28 @@ function escapeHtml(s: string): string {
 function joinPageHtml(params: { docId: string }): string {
   const { docId } = params;
   return `
-<h1>Join DocWallet</h1>
-<p>Doc: <code>${escapeHtml(docId)}</code></p>
-<p><button id="connect">Connect wallet</button> <small>(MetaMask / injected EVM wallet)</small></p>
-<p>Weight: <input id="weight" type="number" min="1" value="1" style="width:120px"/></p>
-<p><button id="join">Register signer</button></p>
-<pre id="out" style="background:#f7f7f7;padding:12px;border-radius:12px;white-space:pre-wrap"></pre>
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <h1 style="margin:0">Join DocWallet</h1>
+      <div class="muted">Doc: <code>${escapeHtml(docId)}</code></div>
+    </div>
+    <span class="badge">Signer Onboarding</span>
+  </div>
+  <div style="height:16px"></div>
+  <div class="row">
+    <button class="btn" id="connect">Connect wallet</button>
+    <span class="muted">(MetaMask / injected EVM wallet)</span>
+  </div>
+  <div style="height:12px"></div>
+  <div class="row">
+    <label>Weight</label>
+    <input class="input" id="weight" type="number" min="1" value="1"/>
+    <button class="btn secondary" id="join">Register signer</button>
+  </div>
+  <div style="height:12px"></div>
+  <pre id="out"></pre>
+</div>
 <script>
 let address = null;
 const out = document.getElementById('out');
@@ -518,18 +684,30 @@ document.getElementById('join').onclick = async () => {
 function cmdPageHtml(params: { docId: string; cmdId: string; signerAddress: string; raw: string; status: string }): string {
   const { docId, cmdId, signerAddress, raw, status } = params;
   return `
-<h1>Approve Command</h1>
-<p>Doc: <code>${escapeHtml(docId)}</code></p>
-<p>Signer: <code>${escapeHtml(signerAddress)}</code></p>
-<p>Command ID: <code>${escapeHtml(cmdId)}</code></p>
-<p>Status: <code>${escapeHtml(status)}</code></p>
-<p>Command:</p>
-<pre style="background:#f7f7f7;padding:12px;border-radius:12px;white-space:pre-wrap">${escapeHtml(raw)}</pre>
-<p>
-  <button id="approve">Approve</button>
-  <button class="secondary" id="reject">Reject</button>
-</p>
-<pre id="out" style="background:#f7f7f7;padding:12px;border-radius:12px;white-space:pre-wrap"></pre>
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <h1 style="margin:0">Approve Command</h1>
+      <div class="muted">Doc: <code>${escapeHtml(docId)}</code></div>
+    </div>
+    <span class="badge" id="statusBadge">${escapeHtml(status)}</span>
+  </div>
+  <div style="height:10px"></div>
+  <div class="row">
+    <div>Signer: <code>${escapeHtml(signerAddress)}</code></div>
+    <div>Command ID: <code id="cmdId">${escapeHtml(cmdId)}</code></div>
+    <button class="btn ghost" id="copyLink">Copy link</button>
+  </div>
+  <div style="height:12px"></div>
+  <div class="muted">Command</div>
+  <pre>${escapeHtml(raw)}</pre>
+  <div class="row">
+    <button class="btn" id="approve">Approve</button>
+    <button class="btn secondary" id="reject">Reject</button>
+  </div>
+  <div style="height:12px"></div>
+  <pre id="out"></pre>
+</div>
 <script>
 const out = document.getElementById('out');
 function log(x){ out.textContent = String(x); }
@@ -542,6 +720,135 @@ async function decide(decision){
 }
 document.getElementById('approve').onclick = () => decide('APPROVE');
 document.getElementById('reject').onclick = () => decide('REJECT');
+document.getElementById('copyLink').onclick = async () => {
+  try{
+    await navigator.clipboard.writeText(window.location.href);
+    log('Copied link to clipboard');
+  }catch(e){
+    log('Copy failed');
+  }
+};
+async function poll(){
+  const res = await fetch('/api/cmd/${escapeJs(docId)}/${escapeJs(cmdId)}');
+  const data = await res.json();
+  if(!data.ok) return;
+  const badge = document.getElementById('statusBadge');
+  badge.textContent = data.cmd.status;
+}
+setInterval(poll, 3000);
+</script>
+`;
+}
+
+function activityPageHtml(params: { docId: string }): string {
+  const { docId } = params;
+  return `
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <h1 style="margin:0">Activity Feed</h1>
+      <div class="muted">Doc: <code>${escapeHtml(docId)}</code></div>
+    </div>
+    <span class="badge">Live</span>
+  </div>
+  <div style="height:12px"></div>
+  <table>
+    <thead>
+      <tr><th>Command</th><th>Status</th><th>Result</th><th>Error</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<script>
+const rows = document.getElementById('rows');
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+async function load(){
+  const res = await fetch('/api/activity/${escapeJs(docId)}');
+  const data = await res.json();
+  if(!data.ok) return;
+  rows.innerHTML = data.commands.map(c =>
+    '<tr><td><code>'+esc(c.cmdId)+'</code><div class="muted">'+esc(c.raw)+'</div></td>' +
+    '<td>'+esc(c.status)+'</td><td>'+esc(c.result||'')+'</td><td>'+esc(c.error||'')+'</td></tr>'
+  ).join('');
+}
+load();
+setInterval(load, 3000);
+</script>
+`;
+}
+
+function walletConnectSessionsPageHtml(params: { docId: string; publicBaseUrl: string }): string {
+  const { docId, publicBaseUrl } = params;
+  return `
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <h1 style="margin:0">Sessions & Schedules</h1>
+      <div class="muted">Doc: <code>${escapeHtml(docId)}</code></div>
+    </div>
+    <span class="badge">Live</span>
+  </div>
+  <div style="height:12px"></div>
+  <h2>WalletConnect Sessions</h2>
+  <table>
+    <thead>
+      <tr><th>Peer</th><th>Chains</th><th>Status</th><th>Connected</th><th>Action</th></tr>
+    </thead>
+    <tbody id="wc-sessions"></tbody>
+  </table>
+  <div style="height:12px"></div>
+  <h2>Pending WC Requests</h2>
+  <table>
+    <thead>
+      <tr><th>Method</th><th>Command ID</th><th>Status</th><th>Time</th></tr>
+    </thead>
+    <tbody id="wc-requests"></tbody>
+  </table>
+  <div style="height:12px"></div>
+  <h2>Active Schedules (DCA)</h2>
+  <table>
+    <thead>
+      <tr><th>Schedule ID</th><th>Interval</th><th>Command</th><th>Runs</th><th>Next Run</th><th>Status</th></tr>
+    </thead>
+    <tbody id="schedules"></tbody>
+  </table>
+</div>
+<script>
+const wcSessions = document.getElementById('wc-sessions');
+const wcRequests = document.getElementById('wc-requests');
+const schedulesEl = document.getElementById('schedules');
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+async function load(){
+  const res = await fetch('/api/sessions/${escapeJs(docId)}');
+  const data = await res.json();
+  if(!data.ok) return;
+  wcSessions.innerHTML = data.sessions.map(s =>
+    '<tr><td>'+esc(s.peerName||'Unknown')+'</td><td>'+esc(s.chains||'')+'</td><td><span class="badge'+(s.status==='ACTIVE'?' badge-ok':'')+'">'+esc(s.status)+'</span></td>' +
+    '<td>'+new Date(s.createdAt).toLocaleString()+'</td>' +
+    '<td>'+(s.status==='ACTIVE'?'<button onclick="disconnect(\\''+esc(s.topic)+'\\')">Disconnect</button>':'—')+'</td></tr>'
+  ).join('') || '<tr><td colspan="5" class="muted">No sessions</td></tr>';
+
+  wcRequests.innerHTML = data.pendingRequests.map(r =>
+    '<tr><td>'+esc(r.method)+'</td><td><code>'+esc(r.cmdId)+'</code></td><td>'+esc(r.status)+'</td>' +
+    '<td>'+new Date(r.createdAt).toLocaleString()+'</td></tr>'
+  ).join('') || '<tr><td colspan="4" class="muted">No pending requests</td></tr>';
+
+  schedulesEl.innerHTML = data.schedules.map(s =>
+    '<tr><td><code>'+esc(s.scheduleId)+'</code></td><td>Every '+s.intervalHours+'h</td>' +
+    '<td><code>'+esc(s.innerCommand)+'</code></td><td>'+s.totalRuns+'</td>' +
+    '<td>'+new Date(s.nextRunAt).toLocaleString()+'</td>' +
+    '<td><span class="badge'+(s.status==='ACTIVE'?' badge-ok':'')+'">'+esc(s.status)+'</span></td></tr>'
+  ).join('') || '<tr><td colspan="6" class="muted">No active schedules</td></tr>';
+}
+async function disconnect(topic){
+  if(!confirm('Disconnect this session?')) return;
+  const res = await fetch('/api/sessions/${escapeJs(docId)}/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({topic})});
+  const data = await res.json();
+  if(data.ok) load();
+  else alert('Error: '+(data.error||'unknown'));
+}
+load();
+setInterval(load, 5000);
 </script>
 `;
 }

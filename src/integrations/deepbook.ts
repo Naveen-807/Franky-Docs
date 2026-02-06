@@ -10,6 +10,19 @@ export type DeepBookExecuteResult =
   | { kind: "order"; txDigest: string; orderId: string; managerId: string }
   | { kind: "tx"; txDigest: string; managerId: string };
 
+export type DeepBookOpenOrder = {
+  orderId: string;
+  side: string;
+  price: string;
+  qty: string;
+  status: string;
+};
+
+export type DeepBookBalances = {
+  suiBalance: string;
+  dbUsdcBalance: string;
+};
+
 export interface DeepBookClient {
   execute(params: {
     docId: string;
@@ -18,6 +31,16 @@ export interface DeepBookClient {
     poolKey: string;
     managerId?: string;
   }): Promise<DeepBookExecuteResult | null>;
+
+  getOpenOrders(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+  }): Promise<DeepBookOpenOrder[]>;
+
+  getWalletBalances(params: {
+    address: string;
+  }): Promise<DeepBookBalances>;
 }
 
 type Network = "testnet";
@@ -159,6 +182,52 @@ export class DeepBookV3Client implements DeepBookClient {
     const managerId = manager?.objectId ?? manager?.object_id;
     if (!managerId) throw new Error("Failed to detect BalanceManager objectId from transaction");
     return String(managerId);
+  }
+
+  async getOpenOrders(params: {
+    wallet: SuiWalletMaterial;
+    poolKey: string;
+    managerId: string;
+  }): Promise<DeepBookOpenOrder[]> {
+    try {
+      const deepbook = this.makeDeepBookClient({ ownerAddress: params.wallet.address, managerId: params.managerId });
+      const managerKey = "DOCWALLET_MANAGER";
+      const orders = await deepbook.accountOpenOrders(params.poolKey, managerKey);
+      if (!Array.isArray(orders)) return [];
+      return orders.map((o: any) => ({
+        orderId: String(o.orderId ?? o.order_id ?? o),
+        side: String(o.isBid ?? o.side ?? "?"),
+        price: String(o.price ?? "?"),
+        qty: String(o.quantity ?? o.qty ?? "?"),
+        status: String(o.status ?? "OPEN")
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async getWalletBalances(params: { address: string }): Promise<DeepBookBalances> {
+    try {
+      const suiBal = await this.sui.getBalance({ owner: params.address });
+      const suiBalance = (Number(suiBal.totalBalance) / 1e9).toFixed(4);
+
+      // Try to get DBUSDC balance (DeepBook testnet USDC)
+      let dbUsdcBalance = "0";
+      try {
+        const allCoins = await this.sui.getAllBalances({ owner: params.address });
+        for (const coin of allCoins) {
+          const coinType = coin.coinType?.toLowerCase() ?? "";
+          if (coinType.includes("dbusdc") || coinType.includes("usdc")) {
+            dbUsdcBalance = (Number(coin.totalBalance) / 1e6).toFixed(2);
+            break;
+          }
+        }
+      } catch { /* ignore */ }
+
+      return { suiBalance, dbUsdcBalance };
+    } catch {
+      return { suiBalance: "0", dbUsdcBalance: "0" };
+    }
   }
 }
 

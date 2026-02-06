@@ -101,4 +101,77 @@ export class CircleArcClient {
     }
     return { state: "TIMEOUT" as const, txHash: undefined };
   }
+
+  /**
+   * Bridge USDC cross-chain via Circle CCTP (Cross-Chain Transfer Protocol).
+   * Uses Circle's developer-controlled wallets to initiate a cross-chain transfer.
+   */
+  async bridgeUsdc(params: {
+    walletAddress: `0x${string}`;
+    destinationAddress: string;
+    amountUsdc: number;
+    sourceChain: string;
+    destinationChain: string;
+  }): Promise<{ circleTxId: string; txHash?: string; state: string }> {
+    const chainMap: Record<string, string> = {
+      arc: "ARC-TESTNET",
+      ethereum: "ETH-SEPOLIA",
+      arbitrum: "ARB-SEPOLIA",
+      polygon: "MATIC-AMOY",
+      sui: "SUI-TESTNET"
+    };
+
+    const destBlockchain = chainMap[params.destinationChain.toLowerCase()] ?? params.destinationChain.toUpperCase();
+
+    // Use Circle's transfer API for cross-chain USDC bridging via CCTP
+    const amount = String(params.amountUsdc);
+    const createPayload: any = {
+      blockchain: this.params.blockchain,
+      tokenAddress: this.params.usdcTokenAddress,
+      walletAddress: params.walletAddress,
+      destinationAddress: params.destinationAddress,
+      amount: [amount],
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } }
+    };
+
+    // If cross-chain, add destination blockchain for CCTP routing
+    if (destBlockchain !== this.params.blockchain) {
+      createPayload.destinationBlockchain = destBlockchain;
+    }
+
+    const createRes =
+      (await this.client.createTransaction?.(createPayload)) ??
+      (await this.client.createTransactions?.(createPayload));
+
+    const id =
+      createRes?.data?.id ??
+      createRes?.data?.transaction?.id ??
+      createRes?.data?.transactionId ??
+      createRes?.id;
+    if (!id) throw new Error("Circle bridge createTransaction missing id");
+
+    const final = await this.pollTransaction(String(id), { timeoutMs: 180_000 });
+    return { circleTxId: String(id), txHash: final.txHash, state: final.state };
+  }
+
+  /**
+   * Get wallet balance via Circle API.
+   */
+  async getWalletBalance(walletId: string): Promise<{ usdcBalance: string }> {
+    try {
+      const res =
+        (await this.client.getWalletTokenBalance?.({ id: walletId })) ??
+        (await this.client.listWalletBallance?.({ id: walletId }));
+      const balances = res?.data?.tokenBalances ?? res?.data ?? [];
+      const usdc = Array.isArray(balances)
+        ? balances.find((b: any) => {
+            const sym = String(b?.token?.symbol ?? b?.symbol ?? "").toUpperCase();
+            return sym === "USDC" || sym === "USD";
+          })
+        : undefined;
+      return { usdcBalance: String(usdc?.amount ?? "0") };
+    } catch {
+      return { usdcBalance: "0" };
+    }
+  }
 }

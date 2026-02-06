@@ -47,6 +47,11 @@ const EnvSchema = z.object({
   YELLOW_RPC_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   YELLOW_WS_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   YELLOW_APP_NAME: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
+  WALLETCONNECT_ENABLED: z.string().optional().default("0").pipe(BoolString),
+  WALLETCONNECT_PROJECT_ID: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
+  WALLETCONNECT_RELAY_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
+  BALANCE_POLL_INTERVAL_MS: z.string().optional().default("60000").pipe(NumberString),
+  SCHEDULER_INTERVAL_MS: z.string().optional().default("30000").pipe(NumberString)
 }).superRefine((env, ctx) => {
   if (env.YELLOW_ENABLED && !env.YELLOW_RPC_URL) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["YELLOW_RPC_URL"], message: "Required when YELLOW_ENABLED=1" });
@@ -57,6 +62,13 @@ const EnvSchema = z.object({
   if (env.CIRCLE_ENABLED && (!env.CIRCLE_API_KEY || !env.CIRCLE_ENTITY_SECRET)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["CIRCLE_API_KEY"], message: "CIRCLE_API_KEY required when CIRCLE_ENABLED=1" });
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["CIRCLE_ENTITY_SECRET"], message: "CIRCLE_ENTITY_SECRET required when CIRCLE_ENABLED=1" });
+  }
+  if (env.WALLETCONNECT_ENABLED && !env.WALLETCONNECT_PROJECT_ID) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["WALLETCONNECT_PROJECT_ID"],
+      message: "Required when WALLETCONNECT_ENABLED=1"
+    });
   }
 });
 

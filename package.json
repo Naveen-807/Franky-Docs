@@ -10,6 +10,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
+    "doctor": "tsx src/tools/doctor.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -17,6 +18,9 @@
     "@circle-fin/developer-controlled-wallets": "^2.0.0",
     "@mysten/deepbook-v3": "^0.16.1",
     "@mysten/sui": "^1.28.0",
+    "@walletconnect/core": "^2.13.3",
+    "@walletconnect/utils": "^2.13.3",
+    "@walletconnect/web3wallet": "^1.10.4",
     "better-sqlite3": "^11.5.0",
     "dotenv": "^16.4.5",
     "googleapis": "^140.0.0",
