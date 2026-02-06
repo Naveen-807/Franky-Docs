@@ -69,6 +69,10 @@ export async function ensureDocWalletTemplate(params: {
 }): Promise<DocWalletTemplate> {
   const { docs, docId, minCommandRows = 12 } = params;
 
+  /* ------------------------------------------------------------------
+   * Phase 1 — Ensure all 8 anchor paragraphs exist in the document.
+   *           (Text only — tables are inserted in Phase 2.)
+   * ---------------------------------------------------------------- */
   const doc = await getDoc(docs, docId);
   const hasBaseAnchors =
     Boolean(findAnchor(doc, DOCWALLET_CONFIG_ANCHOR)) &&
@@ -89,6 +93,7 @@ export async function ensureDocWalletTemplate(params: {
   const missingAnchors = requiredAnchors.filter((a) => !findAnchor(doc, a));
 
   if (!hasBaseAnchors) {
+    // Fresh doc — insert all headings + anchor text.
     const endIndex = doc.body?.content?.at(-1)?.endIndex;
     if (typeof endIndex !== "number") throw new Error("Cannot determine document endIndex");
     const insertAt = Math.max(1, endIndex - 1);
@@ -115,101 +120,19 @@ export async function ensureDocWalletTemplate(params: {
         }
       ]
     });
-
-    const doc2 = await getDoc(docs, docId);
-    const configAnchor = findAnchor(doc2, DOCWALLET_CONFIG_ANCHOR)!;
-    const commandsAnchor = findAnchor(doc2, DOCWALLET_COMMANDS_ANCHOR)!;
-    const chatAnchor = findAnchor(doc2, DOCWALLET_CHAT_ANCHOR)!;
-    const balancesAnchor = findAnchor(doc2, DOCWALLET_BALANCES_ANCHOR)!;
-    const openOrdersAnchor = findAnchor(doc2, DOCWALLET_OPEN_ORDERS_ANCHOR)!;
-    const recentAnchor = findAnchor(doc2, DOCWALLET_RECENT_ACTIVITY_ANCHOR)!;
-    const sessionsAnchor = findAnchor(doc2, DOCWALLET_SESSIONS_ANCHOR)!;
-    const auditAnchor = findAnchor(doc2, DOCWALLET_AUDIT_ANCHOR)!;
-
-    await batchUpdateDoc({
-      docs,
-      docId,
-      requests: [
-        // Insert tables from bottom-to-top so earlier insertions don't shift later anchor indices.
-        {
-          insertTable: {
-            rows: 2,
-            columns: 2,
-            location: { index: auditAnchor.endIndex }
-          }
-        },
-        {
-          insertTable: {
-            rows: 10,
-            columns: 4,
-            location: { index: recentAnchor.endIndex }
-          }
-        },
-        {
-          insertTable: {
-            rows: 8,
-            columns: 5,
-            location: { index: sessionsAnchor.endIndex }
-          }
-        },
-        {
-          insertTable: {
-            rows: 12,
-            columns: 7,
-            location: { index: openOrdersAnchor.endIndex }
-          }
-        },
-        {
-          insertTable: {
-            rows: 8,
-            columns: 3,
-            location: { index: balancesAnchor.endIndex }
-          }
-        },
-        {
-          insertTable: {
-            rows: 8,
-            columns: 2,
-            location: { index: chatAnchor.endIndex }
-          }
-        },
-        {
-          insertTable: {
-            rows: Math.max(2, minCommandRows),
-            columns: 6,
-            location: { index: commandsAnchor.endIndex }
-          }
-        },
-        {
-          insertTable: {
-            rows: 28,
-            columns: 2,
-            location: { index: configAnchor.endIndex }
-          }
-        }
-      ]
-    });
-
-    await populateTemplateTables({ docs, docId });
   } else if (missingAnchors.length > 0) {
-    // v1 template: insert missing dashboard anchors just above the audit log so they appear in a sensible order.
+    // v1 template — insert missing dashboard anchors just above the audit log.
     const auditAnchor = findAnchor(doc, DOCWALLET_AUDIT_ANCHOR)!;
     const insertText = missingAnchors
       .filter((a) => a !== DOCWALLET_CONFIG_ANCHOR && a !== DOCWALLET_COMMANDS_ANCHOR && a !== DOCWALLET_AUDIT_ANCHOR)
       .map((a) => {
         const heading =
-          a === DOCWALLET_CHAT_ANCHOR
-            ? "💬 Chat"
-            : a === DOCWALLET_SESSIONS_ANCHOR
-              ? "🔗 WalletConnect Sessions"
-              :
-          a === DOCWALLET_BALANCES_ANCHOR
-            ? "💰 Balances"
-            : a === DOCWALLET_OPEN_ORDERS_ANCHOR
-              ? "📊 Open Orders"
-            : a === DOCWALLET_RECENT_ACTIVITY_ANCHOR
-              ? "🕐 Recent Activity"
-              : "Dashboard";
+          a === DOCWALLET_CHAT_ANCHOR ? "💬 Chat"
+          : a === DOCWALLET_SESSIONS_ANCHOR ? "🔗 WalletConnect Sessions"
+          : a === DOCWALLET_BALANCES_ANCHOR ? "💰 Balances"
+          : a === DOCWALLET_OPEN_ORDERS_ANCHOR ? "📊 Open Orders"
+          : a === DOCWALLET_RECENT_ACTIVITY_ANCHOR ? "🕐 Recent Activity"
+          : "Dashboard";
         return `${heading}\n${a}\n\n`;
       })
       .join("");
@@ -218,65 +141,22 @@ export async function ensureDocWalletTemplate(params: {
       await batchUpdateDoc({
         docs,
         docId,
-        requests: [
-          {
-            insertText: {
-              location: { index: auditAnchor.startIndex },
-              text: `\n${insertText}`
-            }
-          }
-        ]
+        requests: [{ insertText: { location: { index: auditAnchor.startIndex }, text: `\n${insertText}` } }]
       });
-
-      const doc2 = await getDoc(docs, docId);
-      const anchorsWithTables: Array<{ anchor: string; rows: number; cols: number; endIndex: number }> = [];
-      for (const a of missingAnchors) {
-        if (a === DOCWALLET_CONFIG_ANCHOR || a === DOCWALLET_COMMANDS_ANCHOR || a === DOCWALLET_AUDIT_ANCHOR) continue;
-        const loc = findAnchor(doc2, a);
-        if (!loc) continue;
-        anchorsWithTables.push({
-          anchor: a,
-          endIndex: loc.endIndex,
-          rows:
-            a === DOCWALLET_BALANCES_ANCHOR
-              ? 8
-              : a === DOCWALLET_OPEN_ORDERS_ANCHOR
-                ? 12
-                : a === DOCWALLET_CHAT_ANCHOR
-                  ? 8
-                  : a === DOCWALLET_SESSIONS_ANCHOR
-                    ? 8
-                    : 10,
-          cols:
-            a === DOCWALLET_BALANCES_ANCHOR
-              ? 3
-              : a === DOCWALLET_OPEN_ORDERS_ANCHOR
-                ? 7
-                : a === DOCWALLET_CHAT_ANCHOR
-                  ? 2
-                  : a === DOCWALLET_SESSIONS_ANCHOR
-                    ? 5
-                    : 4
-        });
-      }
-
-      // Insert missing tables from bottom-to-top.
-      const requests = anchorsWithTables
-        .sort((a, b) => b.endIndex - a.endIndex)
-        .map((t) => ({
-          insertTable: { rows: t.rows, columns: t.cols, location: { index: t.endIndex } }
-        })) as docs_v1.Schema$Request[];
-      if (requests.length > 0) await batchUpdateDoc({ docs, docId, requests });
     }
-
-    await populateTemplateTables({ docs, docId, onlyFillEmpty: true });
-  } else {
-    // Ensure headers/keys exist (best effort; don't overwrite user values)
-    await populateTemplateTables({ docs, docId, onlyFillEmpty: true });
   }
+  // else: all anchors already present — nothing to insert.
 
-  // Make sure we have enough rows to hold keys/headers even on older templates.
-  // (If we insert rows, we re-run populate in "onlyFillEmpty" mode.)
+  /* ------------------------------------------------------------------
+   * Phase 2 — Ensure every anchor has a table directly after it.
+   *           (Handles first-run, partial failures, and recovery.)
+   * ---------------------------------------------------------------- */
+  await ensureTablesAfterAnchors({ docs, docId, minCommandRows });
+
+  /* ------------------------------------------------------------------
+   * Phase 3 — Ensure minimum row counts, populate headers/keys,
+   *           hide anchor text, migrate v1 schema, apply styles.
+   * ---------------------------------------------------------------- */
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CONFIG_ANCHOR, minRows: 28 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_COMMANDS_ANCHOR, minRows: Math.max(2, minCommandRows) });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CHAT_ANCHOR, minRows: 8 });
@@ -302,6 +182,95 @@ export async function ensureDocWalletTemplate(params: {
     sessions: { anchor: DOCWALLET_SESSIONS_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_SESSIONS_ANCHOR) },
     audit: { anchor: DOCWALLET_AUDIT_ANCHOR, table: mustGetTable(finalDoc, DOCWALLET_AUDIT_ANCHOR) }
   };
+}
+
+/* ---------- Table spec for each anchor section ---------- */
+const TABLE_SPEC: Record<string, { rows: number; cols: number }> = {
+  [DOCWALLET_CONFIG_ANCHOR]:           { rows: 28, cols: 2 },
+  [DOCWALLET_COMMANDS_ANCHOR]:         { rows: 12, cols: 6 },
+  [DOCWALLET_CHAT_ANCHOR]:             { rows:  8, cols: 2 },
+  [DOCWALLET_BALANCES_ANCHOR]:         { rows:  8, cols: 3 },
+  [DOCWALLET_OPEN_ORDERS_ANCHOR]:      { rows: 12, cols: 7 },
+  [DOCWALLET_RECENT_ACTIVITY_ANCHOR]:  { rows: 10, cols: 4 },
+  [DOCWALLET_SESSIONS_ANCHOR]:         { rows:  8, cols: 5 },
+  [DOCWALLET_AUDIT_ANCHOR]:            { rows:  2, cols: 2 },
+};
+
+/**
+ * For every anchor that does NOT already have a table immediately after it,
+ * insert one.  Handles fresh creation, partial failures, and recovery.
+ *
+ * Tables are inserted from bottom-to-top (highest doc index first) so that
+ * earlier insertions never shift later anchor positions.
+ */
+async function ensureTablesAfterAnchors(params: {
+  docs: docs_v1.Docs;
+  docId: string;
+  minCommandRows?: number;
+}) {
+  const { docs, docId, minCommandRows = 12 } = params;
+  const doc = await getDoc(docs, docId);
+
+  // Ordered top-to-bottom as they appear in the document.
+  const orderedAnchors = [
+    DOCWALLET_CONFIG_ANCHOR,
+    DOCWALLET_COMMANDS_ANCHOR,
+    DOCWALLET_CHAT_ANCHOR,
+    DOCWALLET_BALANCES_ANCHOR,
+    DOCWALLET_OPEN_ORDERS_ANCHOR,
+    DOCWALLET_RECENT_ACTIVITY_ANCHOR,
+    DOCWALLET_SESSIONS_ANCHOR,
+    DOCWALLET_AUDIT_ANCHOR
+  ];
+
+  // Resolve each anchor's location (first occurrence only).
+  const anchorLocs = new Map<string, ReturnType<typeof findAnchor>>();
+  for (const a of orderedAnchors) {
+    anchorLocs.set(a, findAnchor(doc, a));
+  }
+
+  const missing: Array<{ anchorText: string; endIndex: number }> = [];
+
+  for (let i = 0; i < orderedAnchors.length; i++) {
+    const anchorText = orderedAnchors[i];
+    const loc = anchorLocs.get(anchorText);
+    if (!loc) continue; // anchor paragraph missing — can't insert a table for it
+
+    const tableInfo = findNextTable(doc, loc.elementIndex);
+
+    if (tableInfo) {
+      // Verify the table sits between THIS anchor and the NEXT anchor
+      // (otherwise it belongs to a later section, meaning ours is missing).
+      const nextAnchorText = orderedAnchors[i + 1];
+      if (nextAnchorText) {
+        const nextLoc = anchorLocs.get(nextAnchorText);
+        if (nextLoc && tableInfo.elementIndex > nextLoc.elementIndex) {
+          // Table is past the next section → this anchor has no table.
+          missing.push({ anchorText, endIndex: loc.endIndex });
+          continue;
+        }
+      }
+      // Table exists in the correct range — nothing to do.
+      continue;
+    }
+
+    // No table found at all after this anchor.
+    missing.push({ anchorText, endIndex: loc.endIndex });
+  }
+
+  if (missing.length === 0) return;
+
+  // Insert from bottom-to-top so indices remain stable.
+  const sorted = missing.sort((a, b) => b.endIndex - a.endIndex);
+  const requests: docs_v1.Schema$Request[] = sorted.map((m) => {
+    const spec = TABLE_SPEC[m.anchorText]!;
+    const rows = m.anchorText === DOCWALLET_COMMANDS_ANCHOR
+      ? Math.max(spec.rows, minCommandRows)
+      : spec.rows;
+    return { insertTable: { rows, columns: spec.cols, location: { index: m.endIndex } } };
+  });
+
+  await batchUpdateDoc({ docs, docId, requests });
 }
 
 async function populateTemplateTables(params: {
