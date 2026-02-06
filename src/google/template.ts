@@ -62,12 +62,128 @@ async function ensureMinTableRows(params: {
   await batchUpdateDoc({ docs, docId, requests });
 }
 
+/**
+ * If the doc has multiple copies of the template text (from previous failed runs),
+ * delete everything after the first complete block to clean up the mess.
+ */
+async function removeDuplicateTemplateBlocks(params: { docs: docs_v1.Docs; docId: string }) {
+  const { docs, docId } = params;
+  const doc = await getDoc(docs, docId);
+  const content = doc.body?.content ?? [];
+
+  // Find ALL paragraphs matching the first anchor in the template.
+  const configOccurrences: Array<{ elementIndex: number; startIndex: number }> = [];
+  for (let i = 0; i < content.length; i++) {
+    const el = content[i];
+    if (!el.paragraph || typeof el.startIndex !== "number") continue;
+    if (paragraphPlainText(el.paragraph).trim() === DOCWALLET_CONFIG_ANCHOR) {
+      configOccurrences.push({ elementIndex: i, startIndex: el.startIndex });
+    }
+  }
+  if (configOccurrences.length <= 1) return; // No duplicates
+
+  // Find the first AUDIT_ANCHOR (end of the first good template block).
+  const firstAudit = findAnchor(doc, DOCWALLET_AUDIT_ANCHOR);
+  const lowerBound = firstAudit ? firstAudit.elementIndex : configOccurrences[0].elementIndex;
+
+  // Walk backwards from the second CONFIG_ANCHOR to capture the full header
+  // of the duplicate block (blank lines, title, subtitle, heading).
+  let deleteFrom = configOccurrences[1].startIndex;
+  for (let i = configOccurrences[1].elementIndex - 1; i > lowerBound; i--) {
+    const el = content[i];
+    if (!el.paragraph || typeof el.startIndex !== "number") break;
+    const text = paragraphPlainText(el.paragraph).trim();
+    if (!text ||
+        text.includes("FrankyDocs") ||
+        text === "Config" || text === "⚙️ Configuration" ||
+        text.startsWith("Autonomous") || text.startsWith("Multi-sig")) {
+      deleteFrom = el.startIndex;
+    } else {
+      break;
+    }
+  }
+
+  const docEnd = content.at(-1)?.endIndex;
+  if (typeof docEnd !== "number" || deleteFrom >= docEnd - 1) return;
+
+  await batchUpdateDoc({
+    docs, docId,
+    requests: [{ deleteContentRange: { range: { startIndex: deleteFrom, endIndex: docEnd - 1 } } }]
+  });
+}
+
+/**
+ * Replace old-style plain headings with emoji-prefixed ones.
+ * Idempotent — if headings already have emojis, nothing happens.
+ */
+async function upgradeOldHeadings(params: { docs: docs_v1.Docs; docId: string }) {
+  const { docs, docId } = params;
+  const doc = await getDoc(docs, docId);
+  const content = doc.body?.content ?? [];
+
+  const renames: Record<string, string> = {
+    "Config": "⚙️ Configuration",
+    "Commands": "📋 Commands",
+    "Chat": "💬 Chat",
+    "Dashboard — Balances": "💰 Balances",
+    "Dashboard — Open Orders": "📊 Open Orders",
+    "Dashboard — Recent Activity": "🕐 Recent Activity",
+    "WalletConnect Sessions": "🔗 WalletConnect Sessions",
+    "Audit Log": "📝 Audit Log",
+  };
+
+  // Also upgrade bare "FrankyDocs" title to "🟢 FrankyDocs"
+  const titleRename = { old: "FrankyDocs", new: "🟢 FrankyDocs" };
+
+  // Process from bottom-to-top so insertions don't shift earlier indices.
+  const ops: Array<{ startIndex: number; endIndex: number; newText: string }> = [];
+
+  for (const el of content) {
+    if (!el.paragraph) continue;
+    const text = paragraphPlainText(el.paragraph).trim();
+    if (typeof el.startIndex !== "number" || typeof el.endIndex !== "number") continue;
+
+    // Check section headings
+    const newHeading = renames[text];
+    if (newHeading) {
+      // The paragraph text includes a trailing newline — replace just the text portion.
+      const textEnd = el.endIndex - 1; // exclude trailing \n
+      ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: newHeading });
+      continue;
+    }
+
+    // Check title (exact match only — not already prefixed)
+    if (text === titleRename.old) {
+      const textEnd = el.endIndex - 1;
+      ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: titleRename.new });
+    }
+  }
+
+  if (ops.length === 0) return;
+
+  // Sort bottom-to-top
+  ops.sort((a, b) => b.startIndex - a.startIndex);
+
+  const requests: docs_v1.Schema$Request[] = [];
+  for (const op of ops) {
+    requests.push({ deleteContentRange: { range: { startIndex: op.startIndex, endIndex: op.endIndex } } });
+    requests.push({ insertText: { location: { index: op.startIndex }, text: op.newText } });
+  }
+  await batchUpdateDoc({ docs, docId, requests });
+}
+
 export async function ensureDocWalletTemplate(params: {
   docs: docs_v1.Docs;
   docId: string;
   minCommandRows?: number;
 }): Promise<DocWalletTemplate> {
   const { docs, docId, minCommandRows = 12 } = params;
+
+  /* ------------------------------------------------------------------
+   * Phase 0 — Remove duplicate template blocks from previous failed runs.
+   * ---------------------------------------------------------------- */
+  await removeDuplicateTemplateBlocks({ docs, docId });
+  await upgradeOldHeadings({ docs, docId });
 
   /* ------------------------------------------------------------------
    * Phase 1 — Ensure all 8 anchor paragraphs exist in the document.
