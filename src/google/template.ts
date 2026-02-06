@@ -1,5 +1,5 @@
 import type { docs_v1 } from "googleapis";
-import { batchUpdateDoc, findAnchor, findNextTable, getDoc, buildWriteCellRequests, tableCellStartIndex } from "./docs.js";
+import { batchUpdateDoc, findAnchor, findNextTable, getDoc, buildWriteCellRequests, tableCellStartIndex, paragraphPlainText, tableCellRange } from "./docs.js";
 
 export const DOCWALLET_CONFIG_ANCHOR = "DOCWALLET_CONFIG_ANCHOR";
 export const DOCWALLET_COMMANDS_ANCHOR = "DOCWALLET_COMMANDS_ANCHOR";
@@ -101,15 +101,16 @@ export async function ensureDocWalletTemplate(params: {
           insertText: {
             location: { index: insertAt },
             text:
-              "\n\nDocWallet\n\n" +
-              `Config\n${DOCWALLET_CONFIG_ANCHOR}\n\n` +
-              `Commands\n${DOCWALLET_COMMANDS_ANCHOR}\n\n` +
-              `Chat\n${DOCWALLET_CHAT_ANCHOR}\n\n` +
-              `Dashboard — Balances\n${DOCWALLET_BALANCES_ANCHOR}\n\n` +
-              `Dashboard — Open Orders\n${DOCWALLET_OPEN_ORDERS_ANCHOR}\n\n` +
-              `Dashboard — Recent Activity\n${DOCWALLET_RECENT_ACTIVITY_ANCHOR}\n\n` +
-              `WalletConnect Sessions\n${DOCWALLET_SESSIONS_ANCHOR}\n\n` +
-              `Audit Log\n${DOCWALLET_AUDIT_ANCHOR}\n\n`
+              "\n\n🟢 FrankyDocs\n" +
+              "Autonomous multi-sig treasury agent powered by Google Docs\n\n" +
+              `⚙️ Configuration\n${DOCWALLET_CONFIG_ANCHOR}\n\n` +
+              `📋 Commands\n${DOCWALLET_COMMANDS_ANCHOR}\n\n` +
+              `💬 Chat\n${DOCWALLET_CHAT_ANCHOR}\n\n` +
+              `💰 Balances\n${DOCWALLET_BALANCES_ANCHOR}\n\n` +
+              `📊 Open Orders\n${DOCWALLET_OPEN_ORDERS_ANCHOR}\n\n` +
+              `🕐 Recent Activity\n${DOCWALLET_RECENT_ACTIVITY_ANCHOR}\n\n` +
+              `🔗 WalletConnect Sessions\n${DOCWALLET_SESSIONS_ANCHOR}\n\n` +
+              `📝 Audit Log\n${DOCWALLET_AUDIT_ANCHOR}\n\n`
           }
         }
       ]
@@ -181,7 +182,7 @@ export async function ensureDocWalletTemplate(params: {
         },
         {
           insertTable: {
-            rows: 20,
+            rows: 28,
             columns: 2,
             location: { index: configAnchor.endIndex }
           }
@@ -198,16 +199,16 @@ export async function ensureDocWalletTemplate(params: {
       .map((a) => {
         const heading =
           a === DOCWALLET_CHAT_ANCHOR
-            ? "Chat"
+            ? "💬 Chat"
             : a === DOCWALLET_SESSIONS_ANCHOR
-              ? "WalletConnect Sessions"
+              ? "🔗 WalletConnect Sessions"
               :
           a === DOCWALLET_BALANCES_ANCHOR
-            ? "Dashboard — Balances"
+            ? "💰 Balances"
             : a === DOCWALLET_OPEN_ORDERS_ANCHOR
-              ? "Dashboard — Open Orders"
+              ? "📊 Open Orders"
             : a === DOCWALLET_RECENT_ACTIVITY_ANCHOR
-              ? "Dashboard — Recent Activity"
+              ? "🕐 Recent Activity"
               : "Dashboard";
         return `${heading}\n${a}\n\n`;
       })
@@ -276,7 +277,7 @@ export async function ensureDocWalletTemplate(params: {
 
   // Make sure we have enough rows to hold keys/headers even on older templates.
   // (If we insert rows, we re-run populate in "onlyFillEmpty" mode.)
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CONFIG_ANCHOR, minRows: 20 });
+  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CONFIG_ANCHOR, minRows: 28 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_COMMANDS_ANCHOR, minRows: Math.max(2, minCommandRows) });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CHAT_ANCHOR, minRows: 8 });
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_BALANCES_ANCHOR, minRows: 8 });
@@ -286,7 +287,9 @@ export async function ensureDocWalletTemplate(params: {
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_AUDIT_ANCHOR, minRows: 2 });
 
   await populateTemplateTables({ docs, docId, onlyFillEmpty: true });
+  await hideAnchorText({ docs, docId });
   await maybeMigrateCommandsTableV1({ docs, docId });
+  await styleDocTemplate({ docs, docId });
 
   const finalDoc = await getDoc(docs, docId);
   return {
@@ -353,7 +356,14 @@ async function populateTemplateTables(params: {
     ["ARC_WALLET_ADDRESS", ""],
     ["ARC_WALLET_ID", ""],
     ["POLICY_SOURCE", "NONE"],
-    ["ENS_NAME", ""]
+    ["ENS_NAME", ""],
+    ["APPROVALS_TOTAL", "0"],
+    ["EST_APPROVAL_TX_AVOIDED", "0"],
+    ["SIGNER_APPROVAL_GAS_PAID", "0.003"],
+    ["DOC_CELL_APPROVALS", "0"],
+    ["AGENT_AUTOPROPOSE", "1"],
+    ["LAST_PROPOSAL", ""],
+    ["LAST_APPROVAL", ""]
   ];
 
   for (let i = 0; i < cfgKeys.length; i++) {
@@ -405,6 +415,39 @@ async function populateTemplateTables(params: {
   await batchUpdateDoc({ docs, docId, requests: ordered });
 }
 
+async function hideAnchorText(params: { docs: docs_v1.Docs; docId: string }) {
+  const { docs, docId } = params;
+  const doc = await getDoc(docs, docId);
+  const anchors = [
+    DOCWALLET_CONFIG_ANCHOR,
+    DOCWALLET_COMMANDS_ANCHOR,
+    DOCWALLET_CHAT_ANCHOR,
+    DOCWALLET_BALANCES_ANCHOR,
+    DOCWALLET_OPEN_ORDERS_ANCHOR,
+    DOCWALLET_RECENT_ACTIVITY_ANCHOR,
+    DOCWALLET_SESSIONS_ANCHOR,
+    DOCWALLET_AUDIT_ANCHOR
+  ];
+  const requests: docs_v1.Schema$Request[] = [];
+  for (const anchorText of anchors) {
+    const anchor = findAnchor(doc, anchorText);
+    if (!anchor) continue;
+    const endIndex = Math.max(anchor.startIndex + 1, anchor.endIndex - 1);
+    if (endIndex <= anchor.startIndex) continue;
+    requests.push({
+      updateTextStyle: {
+        range: { startIndex: anchor.startIndex, endIndex },
+        textStyle: {
+          fontSize: { magnitude: 1, unit: "PT" },
+          foregroundColor: { color: { rgbColor: { red: 1, green: 1, blue: 1 } } }
+        },
+        fields: "fontSize,foregroundColor"
+      }
+    });
+  }
+  await batchUpdateDoc({ docs, docId, requests });
+}
+
 async function maybeMigrateCommandsTableV1(params: { docs: docs_v1.Docs; docId: string }) {
   const { docs, docId } = params;
   const doc = await getDoc(docs, docId);
@@ -443,6 +486,167 @@ async function maybeMigrateCommandsTableV1(params: { docs: docs_v1.Docs; docId: 
 
   const requests = groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);
   await batchUpdateDoc({ docs, docId, requests });
+}
+
+/**
+ * Apply professional Google Doc styling — heading levels, bold table headers, branded colors.
+ * Runs idempotently; safe to call multiple times.
+ */
+async function styleDocTemplate(params: { docs: docs_v1.Docs; docId: string }) {
+  const { docs, docId } = params;
+  const doc = await getDoc(docs, docId);
+  const content = doc.body?.content ?? [];
+  const requests: docs_v1.Schema$Request[] = [];
+
+  // Section heading texts we want to style as HEADING_2
+  const sectionHeadings = new Set([
+    "⚙️ Configuration", "📋 Commands", "💬 Chat", "💰 Balances",
+    "📊 Open Orders", "🕐 Recent Activity", "🔗 WalletConnect Sessions", "📝 Audit Log",
+    // Legacy headings
+    "Config", "Commands", "Chat", "Dashboard — Balances",
+    "Dashboard — Open Orders", "Dashboard — Recent Activity",
+    "WalletConnect Sessions", "Audit Log"
+  ]);
+
+  for (const el of content) {
+    if (!el.paragraph) continue;
+    const para = el.paragraph;
+    const text = paragraphPlainText(para).trim();
+    const startIdx = el.startIndex;
+    const endIdx = el.endIndex;
+    if (typeof startIdx !== "number" || typeof endIdx !== "number") continue;
+
+    // Title — "FrankyDocs" or "🟢 FrankyDocs"
+    if (text.includes("FrankyDocs") && !text.includes("ANCHOR") && text.length < 30) {
+      const currentStyle = para.paragraphStyle?.namedStyleType;
+      if (currentStyle !== "TITLE") {
+        requests.push({
+          updateParagraphStyle: {
+            range: { startIndex: startIdx, endIndex: endIdx },
+            paragraphStyle: { namedStyleType: "TITLE" },
+            fields: "namedStyleType"
+          }
+        });
+        requests.push({
+          updateTextStyle: {
+            range: { startIndex: startIdx, endIndex: endIdx - 1 },
+            textStyle: {
+              bold: true,
+              fontSize: { magnitude: 26, unit: "PT" },
+              foregroundColor: { color: { rgbColor: { red: 0.06, green: 0.35, blue: 0.85 } } }
+            },
+            fields: "bold,fontSize,foregroundColor"
+          }
+        });
+      }
+    }
+
+    // Subtitle line
+    if (text.startsWith("Autonomous multi-sig") || text.startsWith("Multi-sig treasury")) {
+      requests.push({
+        updateParagraphStyle: {
+          range: { startIndex: startIdx, endIndex: endIdx },
+          paragraphStyle: { namedStyleType: "SUBTITLE" },
+          fields: "namedStyleType"
+        }
+      });
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex: startIdx, endIndex: endIdx - 1 },
+          textStyle: {
+            foregroundColor: { color: { rgbColor: { red: 0.37, green: 0.39, blue: 0.41 } } },
+            fontSize: { magnitude: 12, unit: "PT" }
+          },
+          fields: "foregroundColor,fontSize"
+        }
+      });
+    }
+
+    // Section headings → HEADING_2
+    if (sectionHeadings.has(text)) {
+      const currentStyle = para.paragraphStyle?.namedStyleType;
+      if (currentStyle !== "HEADING_2") {
+        requests.push({
+          updateParagraphStyle: {
+            range: { startIndex: startIdx, endIndex: endIdx },
+            paragraphStyle: { namedStyleType: "HEADING_2" },
+            fields: "namedStyleType"
+          }
+        });
+        requests.push({
+          updateTextStyle: {
+            range: { startIndex: startIdx, endIndex: endIdx - 1 },
+            textStyle: {
+              bold: true,
+              fontSize: { magnitude: 14, unit: "PT" },
+              foregroundColor: { color: { rgbColor: { red: 0.13, green: 0.13, blue: 0.13 } } }
+            },
+            fields: "bold,fontSize,foregroundColor"
+          }
+        });
+      }
+    }
+  }
+
+  // Style table header rows (row 0 of each table) with bold text and light blue background
+  const allAnchors = [
+    DOCWALLET_CONFIG_ANCHOR, DOCWALLET_COMMANDS_ANCHOR, DOCWALLET_CHAT_ANCHOR,
+    DOCWALLET_BALANCES_ANCHOR, DOCWALLET_OPEN_ORDERS_ANCHOR, DOCWALLET_RECENT_ACTIVITY_ANCHOR,
+    DOCWALLET_SESSIONS_ANCHOR, DOCWALLET_AUDIT_ANCHOR
+  ];
+
+  for (const anchorText of allAnchors) {
+    const anchor = findAnchor(doc, anchorText);
+    if (!anchor) continue;
+    const tableInfo = findNextTable(doc, anchor.elementIndex);
+    if (!tableInfo?.table) continue;
+    const headerRow = tableInfo.table.tableRows?.[0];
+    if (!headerRow) continue;
+
+    // Bold + background color for header cells
+    for (const cell of headerRow.tableCells ?? []) {
+      const range = tableCellRange(cell);
+      if (!range) continue;
+
+      // Bold text in header
+      if (range.endIndex > range.startIndex + 1) {
+        requests.push({
+          updateTextStyle: {
+            range: { startIndex: range.startIndex, endIndex: range.endIndex - 1 },
+            textStyle: {
+              bold: true,
+              fontSize: { magnitude: 9, unit: "PT" },
+              foregroundColor: { color: { rgbColor: { red: 0.13, green: 0.13, blue: 0.13 } } }
+            },
+            fields: "bold,fontSize,foregroundColor"
+          }
+        });
+      }
+
+      // Light blue-gray background for header cell
+      requests.push({
+        updateTableCellStyle: {
+          tableRange: {
+            tableCellLocation: {
+              tableStartLocation: { index: tableInfo.startIndex },
+              rowIndex: 0,
+              columnIndex: (headerRow.tableCells ?? []).indexOf(cell)
+            },
+            rowSpan: 1,
+            columnSpan: 1
+          },
+          tableCellStyle: {
+            backgroundColor: { color: { rgbColor: { red: 0.91, green: 0.94, blue: 0.98 } } }
+          },
+          fields: "backgroundColor"
+        }
+      });
+    }
+  }
+
+  if (requests.length > 0) {
+    await batchUpdateDoc({ docs, docId, requests });
+  }
 }
 
 export function cellPlainText(cell: docs_v1.Schema$TableCell): string {

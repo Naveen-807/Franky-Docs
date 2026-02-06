@@ -424,6 +424,12 @@ export function parseCommand(raw: string): ParseResult {
     return { ok: true, value: { type: "SCHEDULE", intervalHours, innerCommand } };
   }
 
+  if (op === "UNSCHEDULE") {
+    const scheduleId = parts[2];
+    if (!scheduleId) return { ok: false, error: "Missing schedule id" };
+    return { ok: true, value: { type: "CANCEL_SCHEDULE", scheduleId } };
+  }
+
   if (op === "CANCEL_SCHEDULE") {
     const scheduleId = parts[2];
     if (!scheduleId) return { ok: false, error: "Missing schedule id" };
@@ -491,6 +497,18 @@ export function parseCommand(raw: string): ParseResult {
     const qty = parseNumber(qtyStr);
     if (qty === null || qty <= 0) return { ok: false, error: "Invalid qty" };
     return { ok: true, value: { type: "MARKET_SELL", base: "SUI", quote: "USDC", qty } };
+  }
+
+  if (op === "ALERT") {
+    // DW ALERT USDC BELOW 500
+    const coinType = (parts[2] ?? "").toUpperCase();
+    const belowKw = (parts[3] ?? "").toUpperCase();
+    const belowStr = parts[4] ?? "";
+    if (!coinType) return { ok: false, error: "ALERT expects <coinType> BELOW <amount>" };
+    if (belowKw !== "BELOW") return { ok: false, error: "ALERT expects BELOW <amount>" };
+    const below = parseNumber(belowStr);
+    if (below === null || below < 0) return { ok: false, error: "Invalid threshold amount" };
+    return { ok: true, value: { type: "ALERT_THRESHOLD", coinType, below } };
   }
 
   if (op === "ALERT_THRESHOLD") {

@@ -91,6 +91,26 @@ export class Engine {
         const tables = await loadDocWalletTables({ docs, docId });
         const configMap = readConfig(tables.config.table);
         const ensName = configMap["ENS_NAME"]?.value?.trim() || d.ens_name || "";
+        const docCellApprovalsEnabled = configMap["DOC_CELL_APPROVALS"]?.value?.trim() === "1";
+        const autoPropEnabled = configMap["AGENT_AUTOPROPOSE"]?.value?.trim();
+        const signerApprovalGasPaid = configMap["SIGNER_APPROVAL_GAS_PAID"]?.value?.trim();
+
+        if (configMap["ENS_NAME"] && ensName) {
+          repo.setDocConfig(docId, "ens_name", ensName);
+        }
+        if (configMap["POLICY_SOURCE"]) {
+          const policySource = configMap["POLICY_SOURCE"].value.trim();
+          if (policySource) repo.setDocConfig(docId, "policy_source", policySource);
+        }
+        if (configMap["DOC_CELL_APPROVALS"]) {
+          repo.setDocConfig(docId, "doc_cell_approvals", docCellApprovalsEnabled ? "1" : "0");
+        }
+        if (configMap["AGENT_AUTOPROPOSE"] && (autoPropEnabled === "1" || autoPropEnabled === "0")) {
+          repo.setDocConfig(docId, "agent_autopropose", autoPropEnabled);
+        }
+        if (configMap["SIGNER_APPROVAL_GAS_PAID"] && signerApprovalGasPaid) {
+          repo.setDocConfig(docId, "signer_approval_gas_paid", signerApprovalGasPaid);
+        }
 
         const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
 
@@ -146,8 +166,9 @@ export class Engine {
               if (cellStatus === "APPROVED") {
                 const quorum = repo.getDocQuorum(docId);
                 const signerCount = repo.listSigners(docId).length;
-                // Allow cell-based approval for single-signer or no-signer (demo) docs
-                if (quorum <= 1 || signerCount === 0) {
+                const allowCellApprovals = docCellApprovalsEnabled || quorum <= 1 || signerCount === 0;
+                // Allow cell-based approval for single-signer or no-signer (demo) docs or when config enabled
+                if (allowCellApprovals) {
                   repo.setCommandStatus(row.id, "APPROVED");
                   await this.audit(docId, `${row.id} APPROVED (cell-edit)`);
                   continue;
@@ -373,10 +394,8 @@ export class Engine {
 
         const response = suggestCommandFromChat(userText, { repo, docId });
 
-        // Auto-execute if user explicitly asked OR if the intent is clearly transactional
-        const shouldAutoExecute = isAutoExecute || detectTransactionalIntent(userText);
-
-        if (shouldAutoExecute) {
+        // Only auto-insert when user explicitly uses !execute
+        if (isAutoExecute) {
           // Extract the DW command from the suggestion and auto-insert it
           const dwMatch = response.match(/(?:Use:|Paste into Commands table:)\s*(DW\s+.+)/i);
           if (dwMatch) {
@@ -390,8 +409,8 @@ export class Engine {
               result: "",
               error: ""
             });
-            const label = isAutoExecute ? "Auto-submitted" : "🤖 Auto-detected & submitted";
-            await updateChatRowCells({ docs, docId, chatTable: tables.chat.table, rowIndex: row.rowIndex, agent: `✅ ${label}: ${dwCommand}` });
+            const label = "Auto-submitted";
+            await updateChatRowCells({ docs, docId, chatTable: tables.chat.table, rowIndex: row.rowIndex, agent: `OK ${label}: ${dwCommand}` });
           } else {
             await updateChatRowCells({ docs, docId, chatTable: tables.chat.table, rowIndex: row.rowIndex, agent: response });
           }
@@ -1225,6 +1244,17 @@ export class Engine {
     });
   }
 
+  private async bestEffortWriteConfig(docId: string, key: string, value: string) {
+    try {
+      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+      const configMap = readConfig(tables.config.table);
+      if (!configMap[key]) return;
+      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key, value });
+    } catch {
+      // ignore
+    }
+  }
+
   private async updateRowByIndex(
     docId: string,
     rowIndex: number,
@@ -1319,6 +1349,81 @@ export class Engine {
           }
         }
 
+        // Auto-proposals (agent suggestions inserted into Commands table)
+        const autoProp = repo.getDocConfig(docId, "agent_autopropose");
+        const autoPropEnabled = autoProp !== "0";
+        if (autoPropEnabled) {
+          const now = Date.now();
+          const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
+          const recent = repo.listRecentCommands(docId, 30);
+          const hasRecent = (raw: string) => {
+            const norm = raw.trim().toUpperCase();
+            return recent.some((c) => c.raw_command.trim().toUpperCase() === norm && ["PENDING_APPROVAL", "APPROVED", "EXECUTING"].includes(c.status));
+          };
+          const propose = async (rawCommand: string, reason: string, cooldownKey: string) => {
+            const lastMs = Number(repo.getDocConfig(docId, cooldownKey) ?? "0");
+            if (Number.isFinite(lastMs) && now - lastMs < 6 * 60 * 60 * 1000) return false;
+            if (hasRecent(rawCommand)) return false;
+            const parsed = parseCommand(rawCommand);
+            if (!parsed.ok) return false;
+
+            const cmdId = generateCmdId(docId, rawCommand);
+            repo.upsertCommand({
+              cmd_id: cmdId,
+              doc_id: docId,
+              raw_command: rawCommand,
+              parsed_json: JSON.stringify(parsed.value),
+              status: "PENDING_APPROVAL",
+              yellow_intent_id: null,
+              sui_tx_digest: null,
+              arc_tx_hash: null,
+              result_text: null,
+              error_text: null
+            });
+            const approvalUrl = `${publicBaseUrl}/cmd/${encodeURIComponent(docId)}/${encodeURIComponent(cmdId)}`;
+            await appendCommandRow({
+              docs: this.ctx.docs,
+              docId,
+              id: cmdId,
+              command: rawCommand,
+              status: "PENDING_APPROVAL",
+              approvalUrl,
+              result: "",
+              error: ""
+            });
+
+            repo.setDocConfig(docId, cooldownKey, String(now));
+            const lastProposalText = `${new Date().toISOString()} ${rawCommand}`;
+            repo.setDocConfig(docId, "last_proposal", lastProposalText);
+            repo.insertAgentActivity(docId, "PROPOSAL", rawCommand);
+
+            await appendRecentActivityRow({
+              docs: this.ctx.docs,
+              docId,
+              timestampIso: new Date().toISOString(),
+              type: "AGENT_PROPOSAL",
+              details: `${reason}: ${rawCommand}`.slice(0, 200),
+              tx: ""
+            });
+            await this.bestEffortWriteConfig(docId, "LAST_PROPOSAL", lastProposalText);
+            return true;
+          };
+
+          if (this.ctx.yellow) {
+            const hasSession = Boolean(repo.getYellowSession(docId));
+            const signerCount = repo.listSigners(docId).length;
+            if (!hasSession && signerCount > 0) {
+              await propose("DW SESSION_CREATE", "Yellow enabled, no session", "proposal_session_create_last_ms");
+            }
+          }
+
+          const ensNameCfg = repo.getDocConfig(docId, "ens_name") || doc.ens_name || "";
+          const policySourceCfg = repo.getDocConfig(docId, "policy_source") || doc.policy_source || "NONE";
+          if (ensNameCfg && policySourceCfg !== "ENS") {
+            await propose(`DW POLICY ENS ${ensNameCfg}`, "Policy not set", "proposal_policy_last_ms");
+          }
+        }
+
         // Log decision summary
         if (decisions.length > 0) {
           const summary = decisions.join(" | ");
@@ -1364,26 +1469,6 @@ function parseWcChainId(chainId?: string): number | null {
  * Detects if user input is clearly a transactional intent that should be auto-executed
  * without requiring the !execute prefix (WalletSheets-style passive interaction).
  */
-function detectTransactionalIntent(input: string): boolean {
-  const lower = input.toLowerCase().trim();
-  const patterns = [
-    /^send\s+[\d.]+\s*usdc\s+to\s+0x[0-9a-f]{40}$/i,
-    /^pay\s+[\d.]+\s*usdc\s+to\s+0x[0-9a-f]{40}$/i,
-    /^transfer\s+[\d.]+\s*usdc\s+to\s+0x[0-9a-f]{40}$/i,
-    /^buy\s+[\d.]+\s*sui\s+(?:at|@)\s*[\d.]+$/i,
-    /^sell\s+[\d.]+\s*sui\s+(?:at|@)\s*[\d.]+$/i,
-    /^bridge\s+[\d.]+\s*usdc\s+from\s+\w+\s+to\s+\w+$/i,
-    /^deposit\s+[\d.]+\s*\w+$/i,
-    /^withdraw\s+[\d.]+\s*\w+$/i,
-    /^market\s+buy\s+[\d.]+\s*sui$/i,
-    /^market\s+sell\s+[\d.]+\s*sui$/i,
-    /^settle$/i,
-    /^setup$/i,
-    /^\/setup$/i,
-  ];
-  return patterns.some(p => p.test(lower));
-}
-
 /**
  * Reconstructs a canonical DW command string from a parsed command.
  * Used when auto-detecting commands without DW prefix.
@@ -1419,7 +1504,7 @@ function reconstructDwCommand(cmd: ParsedCommand): string | null {
 
 export function suggestCommandFromChat(input: string, context?: { repo: Repo; docId: string }): string {
   const text = input.trim();
-  if (!text) return "Type a command or ask a question. Prefix with !execute to auto-submit.";
+  if (!text) return "Type a command or ask a question. Prefix with !execute to insert into the Commands table.";
   if (text.toUpperCase().startsWith("DW ")) return `Command detected. Paste into Commands table: ${text}`;
 
   const lower = text.toLowerCase();
@@ -1535,7 +1620,7 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
 
   // Cancel schedule
   const cancelSchedMatch = lower.match(/cancel\s+schedule\s+(sched_\w+)/i);
-  if (cancelSchedMatch) return `Use: DW CANCEL_SCHEDULE ${cancelSchedMatch[1]}`;
+  if (cancelSchedMatch) return `Use: DW UNSCHEDULE ${cancelSchedMatch[1]}`;
 
   // ENS Policy
   const policyMatch = lower.match(/policy\s+(?:ens\s+)?([a-z0-9-]+\.eth)/i);
@@ -1565,15 +1650,15 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
       "• DW PAYOUT <amt> USDC TO <addr>",
       "• DW BRIDGE <amt> USDC FROM <chain> TO <chain>",
       "• DW SCHEDULE EVERY <N>h: <command>",
-      "• DW CANCEL_SCHEDULE <schedId>",
+      "• DW UNSCHEDULE <schedId> (alias: CANCEL_SCHEDULE)",
       "• DW SESSION_CREATE — Yellow state channel",
       "• DW SESSION_CLOSE — Close Yellow session",
       "• DW SESSION_STATUS — Yellow session info",
-      "• DW ALERT_THRESHOLD <coin> <amount>",
+      "• DW ALERT <coin> BELOW <amount> (alias: ALERT_THRESHOLD)",
       "• DW AUTO_REBALANCE ON|OFF",
       "• DW POLICY ENS <name.eth>",
       "• DW CONNECT <wc:uri>",
-      "Prefix with !execute to auto-submit."
+      "Prefix with !execute to insert into Commands table."
     ].join("\n");
   }
 

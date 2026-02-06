@@ -245,6 +245,12 @@ export class Repo {
       .run(params.docId, params.cmdId, params.signerAddress, params.decision, now);
   }
 
+  getCommandApprovalDecision(params: { docId: string; cmdId: string; signerAddress: string }): CommandApprovalRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM command_approvals WHERE doc_id=? AND cmd_id=? AND signer_address=?`)
+      .get(params.docId, params.cmdId, params.signerAddress) as CommandApprovalRow | undefined;
+  }
+
   listCommandApprovals(params: { docId: string; cmdId: string }): CommandApprovalRow[] {
     return this.db
       .prepare(`SELECT * FROM command_approvals WHERE doc_id=? AND cmd_id=? ORDER BY created_at ASC`)
@@ -664,6 +670,18 @@ export class Repo {
       | { value: string }
       | undefined;
     return row?.value;
+  }
+
+  getDocCounter(docId: string, key: string): number {
+    const value = this.getDocConfig(docId, key);
+    const num = value === undefined ? 0 : Number(value);
+    return Number.isFinite(num) ? num : 0;
+  }
+
+  incrementDocCounter(docId: string, key: string, delta: number = 1): number {
+    const next = this.getDocCounter(docId, key) + delta;
+    this.setDocConfig(docId, key, String(next));
+    return next;
   }
 
   listDocConfig(docId: string): DocConfigRow[] {

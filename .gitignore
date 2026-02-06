@@ -50,11 +50,10 @@ Thumbs.db
 # package manager
 package-lock.json
 
-# docs/plans/tests (non-product artifacts)
+# local artifacts
 plans/
 demo/
-test/
-*.md
+FrankyDocs-Project-Explanation.md
 
 # misc
 .cache
