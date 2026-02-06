@@ -30,6 +30,9 @@ data/
 # logs/coverage
 *.log
 coverage
+.nyc_output
+.eslintcache
+.stylelintcache
 
 # OS/editor
 .DS_Store
@@ -46,6 +49,12 @@ Thumbs.db
 
 # package manager
 package-lock.json
+
+# docs/plans/tests (non-product artifacts)
+plans/
+demo/
+test/
+*.md
 
 # misc
 .cache
