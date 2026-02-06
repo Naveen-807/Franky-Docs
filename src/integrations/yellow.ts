@@ -4,6 +4,16 @@ import { keccak256 } from "viem";
 export type YellowQuorumSignature = { signer: string; signature: `0x${string}` };
 
 /**
+ * Off-chain allocation entry: tracks each participant's USDC balance in the state channel.
+ * Allocations always represent the FINAL state — the clearnode computes deltas internally.
+ */
+export type YellowAllocation = {
+  participant: string;
+  asset: string;
+  amount: string;
+};
+
+/**
  * Yellow NitroRPC (0.4) client.
  *
  * Notes:
@@ -28,7 +38,7 @@ export class NitroRpcYellowClient {
     signerPrivateKeysHex: Array<`0x${string}`>;
     definition: unknown;
     sessionData?: string;
-    allocations?: unknown[];
+    allocations?: YellowAllocation[];
   }): Promise<{ appSessionId: string }> {
     const res = await this.callSigned({
       method: "create_app_session",
@@ -46,7 +56,7 @@ export class NitroRpcYellowClient {
     version: number;
     intent: string;
     sessionData: string;
-    allocations?: unknown[];
+    allocations?: YellowAllocation[];
   }): Promise<{ version: number }> {
     const res = await this.callSigned({
       method: "submit_app_state",
@@ -111,6 +121,7 @@ export class NitroRpcYellowClient {
     command: string;
     approver: string;
     sessionData?: string;
+    allocations?: YellowAllocation[];
   }): Promise<{ version: number; intentId: string }> {
     const intent = `APPROVE:${params.cmdId}:${params.command}:${params.approver}:${Date.now()}`;
     const stateHash = keccak256(new TextEncoder().encode(intent));
@@ -118,28 +129,68 @@ export class NitroRpcYellowClient {
       signerPrivateKeysHex: params.signerPrivateKeysHex,
       appSessionId: params.appSessionId,
       version: params.version,
-      intent,
+      intent: "operate",
       sessionData: params.sessionData ?? `approval:${params.cmdId}`,
-      allocations: []
+      allocations: params.allocations ?? []
     });
     return { version: res.version, intentId: stateHash };
   }
 
   /**
-   * Close a Yellow state channel session. Settles all off-chain state.
+   * Submit an off-chain USDC payment via the state channel.
+   * Uses submit_app_state with intent=operate to redistribute funds between participants.
+   * This is a REAL off-chain transaction — no gas, instant settlement.
+   */
+  async submitOffChainPayment(params: {
+    signerPrivateKeysHex: Array<`0x${string}`>;
+    appSessionId: string;
+    version: number;
+    allocations: YellowAllocation[];
+    cmdId: string;
+    amountUsdc: number;
+    from: string;
+    to: string;
+  }): Promise<{ version: number }> {
+    const sessionData = JSON.stringify({
+      type: "PAYMENT",
+      cmdId: params.cmdId,
+      amount: params.amountUsdc,
+      asset: "usdc",
+      from: params.from,
+      to: params.to,
+      timestamp: Date.now()
+    });
+
+    console.log(`[Yellow] Off-chain payment: ${params.amountUsdc} USDC ${params.from} -> ${params.to} (v${params.version})`);
+
+    return this.submitAppState({
+      signerPrivateKeysHex: params.signerPrivateKeysHex,
+      appSessionId: params.appSessionId,
+      version: params.version,
+      intent: "operate",
+      sessionData,
+      allocations: params.allocations
+    });
+  }
+
+  /**
+   * Close a Yellow state channel session. Settles all off-chain state on-chain.
+   * Final allocations determine how funds are returned to each participant's unified balance.
    */
   async closeAppSession(params: {
     signerPrivateKeysHex: Array<`0x${string}`>;
     appSessionId: string;
     version: number;
     sessionData?: string;
+    allocations?: YellowAllocation[];
   }): Promise<{ version: number }> {
     const res = await this.callSigned({
       method: "close_app_session",
       params: {
         app_session_id: params.appSessionId,
         version: params.version,
-        session_data: params.sessionData ?? ""
+        session_data: params.sessionData ?? "",
+        allocations: params.allocations ?? []
       },
       signerPrivateKeysHex: params.signerPrivateKeysHex
     });

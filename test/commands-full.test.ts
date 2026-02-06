@@ -515,6 +515,43 @@ describe("parseCommand — every command type", () => {
     });
   });
 
+  // 27. DW YELLOW_SEND
+
+  describe("YELLOW_SEND", () => {
+    it("parses DW YELLOW_SEND 5 USDC TO <addr>", () => {
+      const r = parseCommand(`DW YELLOW_SEND 5 USDC TO ${ADDR1}`);
+      expect(r).toEqual({ ok: true, value: { type: "YELLOW_SEND", amountUsdc: 5, to: ADDR1 } });
+    });
+    it("parses DW YELLOW_SEND 0.5 USDC TO <addr>", () => {
+      const r = parseCommand(`DW YELLOW_SEND 0.5 USDC TO ${ADDR2}`);
+      expect(r).toEqual({ ok: true, value: { type: "YELLOW_SEND", amountUsdc: 0.5, to: ADDR2 } });
+    });
+    it("case-insensitive", () => {
+      const r = parseCommand(`dw yellow_send 10 usdc to ${ADDR1}`);
+      expect(r).toEqual({ ok: true, value: { type: "YELLOW_SEND", amountUsdc: 10, to: ADDR1 } });
+    });
+    it("rejects zero amount", () => {
+      const r = parseCommand(`DW YELLOW_SEND 0 USDC TO ${ADDR1}`);
+      expect(r.ok).toBe(false);
+    });
+    it("rejects negative amount", () => {
+      const r = parseCommand(`DW YELLOW_SEND -5 USDC TO ${ADDR1}`);
+      expect(r.ok).toBe(false);
+    });
+    it("rejects missing TO keyword", () => {
+      const r = parseCommand(`DW YELLOW_SEND 5 USDC ${ADDR1}`);
+      expect(r.ok).toBe(false);
+    });
+    it("rejects non-USDC unit", () => {
+      const r = parseCommand(`DW YELLOW_SEND 5 ETH TO ${ADDR1}`);
+      expect(r.ok).toBe(false);
+    });
+    it("rejects invalid address", () => {
+      const r = parseCommand("DW YELLOW_SEND 5 USDC TO 0xinvalid");
+      expect(r.ok).toBe(false);
+    });
+  });
+
   // ============================================================
   // EDGE CASES
   // ============================================================

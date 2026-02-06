@@ -443,12 +443,17 @@ ${rows}`
             }
 
             const nextVersion = (yellowSession.version ?? 0) + 1;
+
+            // Load current allocations so the approval records real off-chain state
+            const currentAllocations = JSON.parse(yellowSession.allocations_json || "[]");
+
             const out = await yellow.submitAppState({
               signerPrivateKeysHex,
               appSessionId: yellowSession.app_session_id,
               version: nextVersion,
               intent: "operate",
-              sessionData
+              sessionData,
+              allocations: currentAllocations
             });
             deps.repo.setYellowSessionVersion({ docId, version: out.version, status: "OPEN" });
 

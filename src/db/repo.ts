@@ -60,6 +60,7 @@ export type YellowSessionRow = {
   definition_json: string;
   version: number;
   status: string;
+  allocations_json: string;
   created_at: number;
   updated_at: number;
 };
@@ -261,33 +262,41 @@ export class Repo {
     this.db.prepare(`DELETE FROM command_approvals WHERE doc_id=? AND cmd_id=?`).run(params.docId, params.cmdId);
   }
 
-  upsertYellowSession(params: { docId: string; appSessionId: string; definitionJson: string; version?: number; status?: string }) {
+  upsertYellowSession(params: { docId: string; appSessionId: string; definitionJson: string; version?: number; status?: string; allocationsJson?: string }) {
     const now = Date.now();
     const version = params.version ?? this.getYellowSession(params.docId)?.version ?? 0;
     const status = params.status ?? this.getYellowSession(params.docId)?.status ?? "OPEN";
+    const allocationsJson = params.allocationsJson ?? this.getYellowSession(params.docId)?.allocations_json ?? "[]";
     this.db
       .prepare(
-        `INSERT INTO yellow_sessions(doc_id,app_session_id,definition_json,version,status,created_at,updated_at)
-         VALUES(?,?,?,?,?,?,?)
+        `INSERT INTO yellow_sessions(doc_id,app_session_id,definition_json,version,status,allocations_json,created_at,updated_at)
+         VALUES(?,?,?,?,?,?,?,?)
          ON CONFLICT(doc_id) DO UPDATE SET
            app_session_id=excluded.app_session_id,
            definition_json=excluded.definition_json,
            version=excluded.version,
            status=excluded.status,
+           allocations_json=excluded.allocations_json,
            updated_at=excluded.updated_at`
       )
-      .run(params.docId, params.appSessionId, params.definitionJson, version, status, now, now);
+      .run(params.docId, params.appSessionId, params.definitionJson, version, status, allocationsJson, now, now);
   }
 
   getYellowSession(docId: string): YellowSessionRow | undefined {
     return this.db.prepare(`SELECT * FROM yellow_sessions WHERE doc_id=?`).get(docId) as YellowSessionRow | undefined;
   }
 
-  setYellowSessionVersion(params: { docId: string; version: number; status?: string }) {
+  setYellowSessionVersion(params: { docId: string; version: number; status?: string; allocationsJson?: string }) {
     const now = Date.now();
-    this.db
-      .prepare(`UPDATE yellow_sessions SET version=?, status=COALESCE(?, status), updated_at=? WHERE doc_id=?`)
-      .run(params.version, params.status ?? null, now, params.docId);
+    if (params.allocationsJson) {
+      this.db
+        .prepare(`UPDATE yellow_sessions SET version=?, status=COALESCE(?, status), allocations_json=?, updated_at=? WHERE doc_id=?`)
+        .run(params.version, params.status ?? null, params.allocationsJson, now, params.docId);
+    } else {
+      this.db
+        .prepare(`UPDATE yellow_sessions SET version=?, status=COALESCE(?, status), updated_at=? WHERE doc_id=?`)
+        .run(params.version, params.status ?? null, now, params.docId);
+    }
   }
 
   upsertYellowSessionKey(params: {

@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS yellow_sessions (
   definition_json TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'OPEN',
+  allocations_json TEXT DEFAULT '[]',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

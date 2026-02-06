@@ -29,6 +29,7 @@ import { ArcClient } from "./integrations/arc.js";
 import { CircleArcClient } from "./integrations/circle.js";
 import { EnsPolicyClient } from "./integrations/ens.js";
 import { NitroRpcYellowClient } from "./integrations/yellow.js";
+import type { YellowAllocation } from "./integrations/yellow.js";
 import type { DeepBookClient } from "./integrations/deepbook.js";
 import type { WalletConnectService } from "./integrations/walletconnect.js";
 
@@ -864,7 +865,14 @@ export class Engine {
       const q = repo.getDocQuorum(docId);
       const signerCount = repo.listSigners(docId).length;
       const y = repo.getYellowSession(docId);
-      const status = y ? `YELLOW_SESSION=${y.app_session_id} v${y.version}` : "YELLOW_SESSION=NONE";
+      let status = "YELLOW_SESSION=NONE";
+      if (y) {
+        const allocs: { participant: string; amount: string }[] = JSON.parse(y.allocations_json || "[]");
+        const allocSummary = allocs.length > 0
+          ? ` ALLOC=[${allocs.map(a => `${a.participant.slice(0,8)}..=${a.amount}`).join(",")}]`
+          : "";
+        status = `YELLOW_SESSION=${y.app_session_id} v${y.version} ${y.status}${allocSummary}`;
+      }
       return { resultText: `QUORUM=${q} SIGNERS=${signerCount} ${status}` };
     }
 
@@ -897,16 +905,26 @@ export class Engine {
         return parsed.privateKeyHex;
       });
 
-      const created = await yellow.createAppSession({ signerPrivateKeysHex, definition, sessionData: `DocWallet:${docId}` });
+      // Build initial allocations: each participant locks USDC from their unified balance.
+      // Default: 100 USDC per participant (equal shares for treasury operations).
+      const perParticipantUsdc = "100.0";
+      const initialAllocations: YellowAllocation[] = keyRows.map((r) => ({
+        participant: r.key!.session_key_address,
+        asset: "usdc",
+        amount: perParticipantUsdc
+      }));
+
+      const created = await yellow.createAppSession({ signerPrivateKeysHex, definition, sessionData: `DocWallet:${docId}`, allocations: initialAllocations });
       const appSessionId = created.appSessionId as any;
 
-      repo.upsertYellowSession({ docId, appSessionId, definitionJson, version: 0, status: "OPEN" });
+      repo.upsertYellowSession({ docId, appSessionId, definitionJson, version: 0, status: "OPEN", allocationsJson: JSON.stringify(initialAllocations) });
 
       const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
       await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "YELLOW_SESSION_ID", value: appSessionId });
       await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "YELLOW_PROTOCOL", value: "NitroRPC/0.4" });
 
-      return { resultText: `YELLOW_SESSION=${appSessionId}` };
+      const allocSummary = initialAllocations.map(a => `${a.participant.slice(0,8)}..=${a.amount}`).join(", ");
+      return { resultText: `YELLOW_SESSION=${appSessionId} LOCKED=[${allocSummary}]` };
     }
 
     if (command.type === "CONNECT") {
@@ -1093,14 +1111,19 @@ export class Engine {
           return parsed.privateKeyHex;
         });
 
+      // Load final allocations for settlement — funds return to unified balances
+      const finalAllocations: YellowAllocation[] = JSON.parse(session.allocations_json || "[]");
+
       const result = await yellow.closeAppSession({
         signerPrivateKeysHex,
         appSessionId: session.app_session_id,
-        version: session.version,
-        sessionData: `DocWallet:${docId}:close`
+        version: session.version + 1,
+        sessionData: `DocWallet:${docId}:close`,
+        allocations: finalAllocations
       });
-      repo.setYellowSessionVersion({ docId, version: result.version, status: "CLOSED" });
-      return { resultText: `YELLOW_SESSION_CLOSED v${result.version}` };
+      repo.setYellowSessionVersion({ docId, version: result.version, status: "CLOSED", allocationsJson: JSON.stringify(finalAllocations) });
+      const settledSummary = finalAllocations.map(a => `${a.participant.slice(0,8)}..=${a.amount}`).join(", ");
+      return { resultText: `YELLOW_SESSION_CLOSED v${result.version} SETTLED=[${settledSummary}]` };
     }
 
     if (command.type === "SESSION_STATUS") {
@@ -1111,6 +1134,68 @@ export class Engine {
       const connInfo = yellow.getConnectionInfo();
       return {
         resultText: `YELLOW_SESSION=${session.app_session_id} v${status.version} STATUS=${status.status} PROTOCOL=${connInfo.protocol} PARTICIPANTS=${status.participants.length}`
+      };
+    }
+
+    if (command.type === "YELLOW_SEND") {
+      if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1)");
+      const session = repo.getYellowSession(docId);
+      if (!session) throw new Error("No Yellow session found. Create one with DW SESSION_CREATE.");
+      if (session.status !== "OPEN") throw new Error(`Yellow session is ${session.status}. Only OPEN sessions can send.`);
+
+      // Load current allocations from DB (FINAL state, not deltas)
+      const currentAllocations: YellowAllocation[] = JSON.parse(session.allocations_json || "[]");
+      if (currentAllocations.length === 0) throw new Error("Session has no allocations. Close and recreate with DW SESSION_CREATE.");
+
+      // Find sender: the first participant with enough USDC
+      const senderIdx = currentAllocations.findIndex((a) => parseFloat(a.amount) >= command.amountUsdc);
+      if (senderIdx < 0) throw new Error(`No participant has ${command.amountUsdc} USDC available in the state channel.`);
+      const sender = currentAllocations[senderIdx]!;
+
+      // Build new allocations: decrease sender, increase or add recipient
+      const newAllocations: YellowAllocation[] = currentAllocations.map((a) => ({ ...a }));
+      newAllocations[senderIdx]!.amount = (parseFloat(sender.amount) - command.amountUsdc).toFixed(6);
+
+      const recipientIdx = newAllocations.findIndex((a) => a.participant.toLowerCase() === command.to.toLowerCase());
+      if (recipientIdx >= 0) {
+        // Existing participant — add to their balance
+        newAllocations[recipientIdx]!.amount = (parseFloat(newAllocations[recipientIdx]!.amount) + command.amountUsdc).toFixed(6);
+      } else {
+        // New external recipient — add as participant with the sent amount
+        newAllocations.push({ participant: command.to, asset: "usdc", amount: command.amountUsdc.toFixed(6) });
+      }
+
+      // Get session signing keys
+      const signers = repo.listSigners(docId);
+      const keyRows = signers.map((s) => ({ signer: s, key: repo.getYellowSessionKey({ docId, signerAddress: s.address }) }));
+      const signerPrivateKeysHex = keyRows
+        .filter((r) => r.key)
+        .map((r) => {
+          const plain = decryptWithMasterKey({ masterKey: config.DOCWALLET_MASTER_KEY, blob: r.key!.encrypted_session_key_private });
+          const parsed = JSON.parse(plain.toString("utf8")) as { privateKeyHex: `0x${string}` };
+          return parsed.privateKeyHex;
+        });
+
+      const newVersion = session.version + 1;
+      const cmdId = `ysend_${Date.now()}_${sha256Hex(`${docId}:${command.amountUsdc}:${command.to}`).slice(0, 8)}`;
+
+      // Submit off-chain payment via Yellow state channel (real transaction!)
+      const result = await yellow.submitOffChainPayment({
+        signerPrivateKeysHex,
+        appSessionId: session.app_session_id,
+        version: newVersion,
+        allocations: newAllocations,
+        cmdId,
+        amountUsdc: command.amountUsdc,
+        from: sender.participant,
+        to: command.to
+      });
+
+      // Persist new state
+      repo.setYellowSessionVersion({ docId, version: result.version, allocationsJson: JSON.stringify(newAllocations) });
+
+      return {
+        resultText: `YELLOW_SENT=${command.amountUsdc} USDC TO=${command.to.slice(0, 10)}... v${result.version} OFF_CHAIN=true GAS=0`
       };
     }
 
@@ -1503,6 +1588,7 @@ function reconstructDwCommand(cmd: ParsedCommand): string | null {
     case "SCHEDULE": return `DW SCHEDULE EVERY ${cmd.intervalHours}h: ${cmd.innerCommand.replace(/^DW\s+/i, "")}`;
     case "ALERT_THRESHOLD": return `DW ALERT_THRESHOLD ${cmd.coinType} ${cmd.below}`;
     case "AUTO_REBALANCE": return `DW AUTO_REBALANCE ${cmd.enabled ? "ON" : "OFF"}`;
+    case "YELLOW_SEND": return `DW YELLOW_SEND ${cmd.amountUsdc} USDC TO ${cmd.to}`;
     default: return null;
   }
 }
@@ -1604,6 +1690,10 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
   const payoutMatch = lower.match(/(?:send|payout|transfer|pay)\s+([\d.]+)\s*usdc\s+(?:to\s+)?(0x[a-f0-9]{40})/i);
   if (payoutMatch) return `Use: DW PAYOUT ${payoutMatch[1]} USDC TO ${payoutMatch[2]}`;
 
+  // Yellow off-chain send
+  const yellowSendMatch = lower.match(/(?:yellow.?send|off.?chain.?send|state.?channel.?send)\s+([\d.]+)\s*usdc\s+(?:to\s+)?(0x[a-f0-9]{40})/i);
+  if (yellowSendMatch) return `Use: DW YELLOW_SEND ${yellowSendMatch[1]} USDC TO ${yellowSendMatch[2]}`;
+
   // Bridge
   const bridgeMatch = lower.match(/bridge\s+([\d.]+)\s*usdc\s+(?:from\s+)?(\w+)\s+(?:to\s+)?(\w+)/i);
   if (bridgeMatch) return `Use: DW BRIDGE ${bridgeMatch[1]} USDC FROM ${bridgeMatch[2]} TO ${bridgeMatch[3]}`;
@@ -1659,6 +1749,7 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
       "• DW SESSION_CREATE — Yellow state channel",
       "• DW SESSION_CLOSE — Close Yellow session",
       "• DW SESSION_STATUS — Yellow session info",
+      "• DW YELLOW_SEND <amt> USDC TO <addr> — Off-chain instant transfer (gasless)",
       "• DW ALERT <coin> BELOW <amount> (alias: ALERT_THRESHOLD)",
       "• DW AUTO_REBALANCE ON|OFF",
       "• DW POLICY ENS <name.eth>",

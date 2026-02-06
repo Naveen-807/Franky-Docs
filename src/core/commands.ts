@@ -38,7 +38,8 @@ export type ParsedCommand =
   | { type: "MARKET_BUY"; base: "SUI"; quote: "USDC"; qty: number }
   | { type: "MARKET_SELL"; base: "SUI"; quote: "USDC"; qty: number }
   | { type: "ALERT_THRESHOLD"; coinType: string; below: number }
-  | { type: "AUTO_REBALANCE"; enabled: boolean };
+  | { type: "AUTO_REBALANCE"; enabled: boolean }
+  | { type: "YELLOW_SEND"; amountUsdc: number; to: `0x${string}` };
 
 const HexString = z
   .string()
@@ -154,6 +155,11 @@ export const ParsedCommandSchema: z.ZodType<ParsedCommand, z.ZodTypeDef, unknown
   z.object({
     type: z.literal("AUTO_REBALANCE"),
     enabled: z.boolean()
+  }),
+  z.object({
+    type: z.literal("YELLOW_SEND"),
+    amountUsdc: z.number().positive(),
+    to: AddressString
   })
 ]);
 
@@ -526,6 +532,21 @@ export function parseCommand(raw: string): ParseResult {
     const toggle = (parts[2] ?? "").toUpperCase();
     if (toggle !== "ON" && toggle !== "OFF") return { ok: false, error: "AUTO_REBALANCE expects ON or OFF" };
     return { ok: true, value: { type: "AUTO_REBALANCE", enabled: toggle === "ON" } };
+  }
+
+  if (op === "YELLOW_SEND") {
+    // DW YELLOW_SEND 5 USDC TO 0x...
+    const amountStr = parts[2] ?? "";
+    const unit = (parts[3] ?? "").toUpperCase();
+    const toKw = (parts[4] ?? "").toUpperCase();
+    const to = parts[5] ?? "";
+    if (unit !== "USDC") return { ok: false, error: "YELLOW_SEND only supports USDC" };
+    if (toKw !== "TO") return { ok: false, error: "YELLOW_SEND expects TO <address>" };
+    const amountUsdc = parseNumber(amountStr);
+    if (amountUsdc === null || amountUsdc <= 0) return { ok: false, error: "Invalid amount" };
+    const parsed = ParsedCommandSchema.safeParse({ type: "YELLOW_SEND", amountUsdc, to });
+    if (!parsed.success) return { ok: false, error: "Invalid address" };
+    return { ok: true, value: parsed.data };
   }
 
   return { ok: false, error: `Unknown command: ${op}` };
