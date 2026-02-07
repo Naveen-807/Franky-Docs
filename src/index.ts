@@ -75,6 +75,7 @@ async function main() {
     publicBaseUrl,
     yellow,
     yellowApplicationName: config.YELLOW_APP_NAME ?? "DocWallet",
+    yellowAsset: config.YELLOW_ASSET,
     walletconnect
   });
 

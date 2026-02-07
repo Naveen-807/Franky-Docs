@@ -47,6 +47,7 @@ const EnvSchema = z.object({
   YELLOW_RPC_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   YELLOW_WS_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   YELLOW_APP_NAME: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
+  YELLOW_ASSET: z.string().optional().default("ytest.usd").transform((v) => v.trim()),
   WALLETCONNECT_ENABLED: z.string().optional().default("0").pipe(BoolString),
   WALLETCONNECT_PROJECT_ID: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   WALLETCONNECT_RELAY_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),

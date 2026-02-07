@@ -150,12 +150,13 @@ export class NitroRpcYellowClient {
     amountUsdc: number;
     from: string;
     to: string;
+    asset?: string;
   }): Promise<{ version: number }> {
     const sessionData = JSON.stringify({
       type: "PAYMENT",
       cmdId: params.cmdId,
       amount: params.amountUsdc,
-      asset: "usdc",
+      asset: params.asset ?? "ytest.usd",
       from: params.from,
       to: params.to,
       timestamp: Date.now()

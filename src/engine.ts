@@ -1097,13 +1097,14 @@ export class Engine {
         return parsed.privateKeyHex;
       });
 
-      // Build initial allocations: each participant locks USDC from their unified balance.
-      // Default: 100 USDC per participant (equal shares for treasury operations).
-      const perParticipantUsdc = "100.0";
+      // Build initial allocations: each participant locks tokens from their unified balance.
+      // Yellow uses 'ytest.usd' in sandbox, 'usdc' in production.
+      const yellowAsset = config.YELLOW_ASSET ?? "ytest.usd";
+      const perParticipantAmount = "100.0";
       const initialAllocations: YellowAllocation[] = keyRows.map((r) => ({
         participant: r.key!.session_key_address,
-        asset: "usdc",
-        amount: perParticipantUsdc
+        asset: yellowAsset,
+        amount: perParticipantAmount
       }));
 
       const created = await yellow.createAppSession({ signerPrivateKeysHex, definition, sessionData: `DocWallet:${docId}`, allocations: initialAllocations });
@@ -1354,7 +1355,8 @@ export class Engine {
         newAllocations[recipientIdx]!.amount = (parseFloat(newAllocations[recipientIdx]!.amount) + command.amountUsdc).toFixed(6);
       } else {
         // New external recipient — add as participant with the sent amount
-        newAllocations.push({ participant: command.to, asset: "usdc", amount: command.amountUsdc.toFixed(6) });
+        const yellowAsset = config.YELLOW_ASSET ?? "ytest.usd";
+        newAllocations.push({ participant: command.to, asset: yellowAsset, amount: command.amountUsdc.toFixed(6) });
       }
 
       // Get session signing keys
@@ -1380,16 +1382,18 @@ export class Engine {
         cmdId,
         amountUsdc: command.amountUsdc,
         from: sender.participant,
-        to: command.to
+        to: command.to,
+        asset: config.YELLOW_ASSET ?? "ytest.usd"
       });
 
       // Persist new state
       repo.setYellowSessionVersion({ docId, version: result.version, allocationsJson: JSON.stringify(newAllocations) });
 
       // Build allocation summary for proof-of-settlement
+      const yellowAssetLabel = (config.YELLOW_ASSET ?? "ytest.usd").toUpperCase();
       const allocSummary = newAllocations.map(a => `${a.participant.slice(0, 8)}..=${a.amount}`).join(", ");
       return {
-        resultText: `YELLOW_SENT=${command.amountUsdc} USDC TO=${command.to.slice(0, 10)}... v${result.version} OFF_CHAIN=true GAS=0 SESSION=${session.app_session_id.slice(0, 12)}... ALLOC=[${allocSummary}]`
+        resultText: `YELLOW_SENT=${command.amountUsdc} ${yellowAssetLabel} TO=${command.to.slice(0, 10)}... v${result.version} OFF_CHAIN=true GAS=0 SESSION=${session.app_session_id.slice(0, 12)}... ALLOC=[${allocSummary}]`
       };
     }
 

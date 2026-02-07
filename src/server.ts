@@ -18,6 +18,7 @@ type ServerDeps = {
   publicBaseUrl: string;
   yellow?: NitroRpcYellowClient;
   yellowApplicationName?: string;
+  yellowAsset?: string;
   walletconnect?: WalletConnectService;
 };
 
@@ -88,8 +89,8 @@ export function startServer(deps: ServerDeps) {
   <div class="card mini" style="border-left:3px solid #FFD700">
     <div class="kpi-label">Yellow Network</div>
     <div style="font-size:.95rem;font-weight:600;color:var(--gray-900)">State Channels</div>
-    <div class="card-meta">Off-chain gasless payments</div>
-    <div class="badge badge-ok" style="margin-top:6px">NitroRPC/0.4</div>
+    <div class="card-meta">Off-chain gasless ytest.usd payments</div>
+    <div class="badge badge-ok" style="margin-top:6px">NitroRPC/0.4 · ytest.usd</div>
   </div>
   <div class="card mini" style="border-left:3px solid #0052FF">
     <div class="kpi-label">Arc + Circle</div>
@@ -346,7 +347,10 @@ ${rows}`
         if (deps.yellow) {
           const application = String(deps.yellowApplicationName ?? "DocWallet");
           const scope = "app.create,app.submit,transfer";
-          const allowances: Array<{ asset: string; amount: string }> = [];
+          const yellowAsset = deps.yellowAsset ?? "ytest.usd";
+          const allowances: Array<{ asset: string; amount: string }> = [
+            { asset: yellowAsset, amount: "1000000000" }
+          ];
           const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
 
           const sk = generateEvmWallet();
