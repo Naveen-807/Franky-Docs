@@ -18,6 +18,7 @@
     "@circle-fin/developer-controlled-wallets": "^2.0.0",
     "@mysten/deepbook-v3": "^0.16.1",
     "@mysten/sui": "^1.28.0",
+    "@noble/curves": "^1.9.0",
     "@walletconnect/core": "^2.13.3",
     "@walletconnect/utils": "^2.13.3",
     "@walletconnect/web3wallet": "^1.10.4",
