@@ -78,11 +78,63 @@ export function startServer(deps: ServerDeps) {
           `<div class="spacer-sm"></div>
 <div class="row" style="justify-content:space-between;margin-bottom:20px">
   <div>
-    <h1>Dashboard</h1>
-    <p style="margin-top:4px">Manage your multi-sig treasury docs</p>
+    <h1>FrankyDocs Treasury</h1>
+    <p style="margin-top:4px">Multi-chain DeFi treasury powered by Google Docs</p>
   </div>
   <span class="badge badge-blue">${docs.length} Doc${docs.length !== 1 ? "s" : ""}</span>
 </div>
+
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:24px">
+  <div class="card mini" style="border-left:3px solid #FFD700">
+    <div class="kpi-label">Yellow Network</div>
+    <div style="font-size:.95rem;font-weight:600;color:var(--gray-900)">State Channels</div>
+    <div class="card-meta">Off-chain gasless payments</div>
+    <div class="badge badge-ok" style="margin-top:6px">NitroRPC/0.4</div>
+  </div>
+  <div class="card mini" style="border-left:3px solid #0052FF">
+    <div class="kpi-label">Arc + Circle</div>
+    <div style="font-size:.95rem;font-weight:600;color:var(--gray-900)">USDC Treasury</div>
+    <div class="card-meta">Dev wallets + CCTP bridge</div>
+    <div class="badge badge-ok" style="margin-top:6px">Chain 5042002</div>
+  </div>
+  <div class="card mini" style="border-left:3px solid #6FBCF0">
+    <div class="kpi-label">Sui DeepBook V3</div>
+    <div style="font-size:.95rem;font-weight:600;color:var(--gray-900)">CLOB Trading</div>
+    <div class="card-meta">Limit, market, stop-loss</div>
+    <div class="badge badge-ok" style="margin-top:6px">PTB Orders</div>
+  </div>
+  <div class="card mini" style="border-left:3px solid #5298FF">
+    <div class="kpi-label">ENS Policy</div>
+    <div style="font-size:.95rem;font-weight:600;color:var(--gray-900)">Governance</div>
+    <div class="card-meta">On-chain spend limits</div>
+    <div class="badge badge-ok" style="margin-top:6px">Text Records</div>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:20px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#fff;border:none">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+    <span style="font-size:1.5rem">🌟</span>
+    <div>
+      <div style="font-weight:700;font-size:1.1rem">How It Works</div>
+      <div style="opacity:.8;font-size:.88rem">Type commands in a Google Doc → Approve via MetaMask → Execute on-chain</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+    <div style="background:rgba(255,255,255,.08);border-radius:8px;padding:10px 14px">
+      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Proposers</div>
+      <div style="font-size:.9rem;margin-top:2px">No wallet needed — just type in the Doc</div>
+    </div>
+    <div style="background:rgba(255,255,255,.08);border-radius:8px;padding:10px 14px">
+      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Approvers</div>
+      <div style="font-size:.9rem;margin-top:2px">Sign once via Yellow session keys (gasless)</div>
+    </div>
+    <div style="background:rgba(255,255,255,.08);border-radius:8px;padding:10px 14px">
+      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Agent</div>
+      <div style="font-size:.9rem;margin-top:2px">Auto-proposes, monitors risk, sweeps yield</div>
+    </div>
+  </div>
+</div>
+
 ${rows}`
         );
       }
@@ -91,6 +143,66 @@ ${rows}`
       if (req.method === "GET" && activityPageMatch) {
         const docId = decodeURIComponent(activityPageMatch.docId);
         return sendHtml(res, "Activity", activityPageHtml({ docId }));
+      }
+
+      // API: List docs with full integration status (for demo/judges)
+      if (req.method === "GET" && url.pathname === "/api/docs") {
+        const allDocs = deps.repo.listDocs();
+        const docData = allDocs.map((d) => {
+          const yellowSession = deps.repo.getYellowSession(d.doc_id);
+          const circleW = deps.repo.getCircleWallet(d.doc_id);
+          const signers = deps.repo.listSigners(d.doc_id);
+          const quorum = deps.repo.getDocQuorum(d.doc_id);
+          const stats = deps.repo.getTradeStats(d.doc_id);
+          const condOrders = deps.repo.listActiveConditionalOrders(d.doc_id);
+          const schedules = deps.repo.listSchedules(d.doc_id).filter((s) => s.status === "ACTIVE");
+          const cachedPrice = deps.repo.getPrice("SUI/USDC");
+          return {
+            docId: d.doc_id,
+            name: d.name,
+            evmAddress: d.evm_address,
+            suiAddress: d.sui_address,
+            ensName: d.ens_name,
+            integrations: {
+              yellow: {
+                enabled: !!deps.yellow,
+                sessionId: yellowSession?.app_session_id ?? null,
+                sessionVersion: yellowSession?.version ?? 0,
+                sessionStatus: yellowSession?.status ?? "NONE",
+                protocol: "NitroRPC/0.4"
+              },
+              arc: {
+                enabled: true,
+                chainId: 5042002,
+                circleWalletId: circleW?.wallet_id ?? null,
+                circleWalletAddress: circleW?.wallet_address ?? null
+              },
+              deepbook: {
+                enabled: true,
+                pool: "SUI_DBUSDC",
+                cachedPrice: cachedPrice?.mid_price ?? null,
+                spread: cachedPrice && cachedPrice.mid_price > 0
+                  ? ((cachedPrice.ask - cachedPrice.bid) / cachedPrice.mid_price * 100)
+                  : null
+              },
+              ens: {
+                policySource: d.policy_source ?? "NONE",
+                ensName: d.ens_name ?? null
+              }
+            },
+            signers: signers.length,
+            quorum,
+            trading: {
+              pnl: stats.netPnl,
+              totalBuys: stats.totalBuys,
+              totalSells: stats.totalSells,
+              activeStopLoss: condOrders.filter(o => o.type === "STOP_LOSS").length,
+              activeTakeProfit: condOrders.filter(o => o.type === "TAKE_PROFIT").length,
+              activeSchedules: schedules.length
+            }
+          };
+        });
+        return sendJson(res, 200, { ok: true, docs: docData });
       }
 
       const apiActivityMatch = matchPath(url.pathname, ["api", "activity", ":docId"]);
@@ -1064,7 +1176,7 @@ async function poll(){
   badge.textContent = data.cmd.status;
   const mode = document.getElementById('approvalMode');
   mode.textContent = data.approvalMode || 'WEB';
-  mode.className = 'badge' + (data.approvalMode === 'YELLOW' ? ' ok' : '');
+  mode.className = 'badge ' + (data.approvalMode === 'YELLOW' ? 'badge-ok' : 'badge-gray');
   const approvals = (data.approvals || []).filter(a => a.decision === 'APPROVE');
   const approvedWeight = data.approvedWeight || 0;
   const quorum = data.quorum || 0;
@@ -1306,15 +1418,15 @@ function summarizeCommand(raw: string): string {
     case "POLICY_ENS": return `Set policy from ${cmd.ensName}`;
     case "SCHEDULE": return `Schedule every ${cmd.intervalHours}h: ${cmd.innerCommand}`;
     case "CANCEL_SCHEDULE": return `Cancel schedule ${cmd.scheduleId}`;
-    case "BRIDGE": return `Bridge ${cmd.amountUsdc} USDC ${cmd.fromChain} -> ${cmd.toChain}`;
+    case "BRIDGE": return `CCTP Bridge ${cmd.amountUsdc} USDC ${cmd.fromChain} → ${cmd.toChain}`;
     case "ALERT_THRESHOLD": return `Alert when ${cmd.coinType} < ${cmd.below}`;
     case "AUTO_REBALANCE": return `Auto-rebalance ${cmd.enabled ? "ON" : "OFF"}`;
-    case "YELLOW_SEND": return `Yellow send ${cmd.amountUsdc} USDC to ${shortAddress(cmd.to)}`;
-    case "STOP_LOSS": return `Stop-loss ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
-    case "TAKE_PROFIT": return `Take-profit ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
-    case "SWEEP_YIELD": return "Sweep yield";
-    case "TRADE_HISTORY": return "Show trade history & P&L";
-    case "PRICE": return "Show live price";
+    case "YELLOW_SEND": return `⚡ Yellow send ${cmd.amountUsdc} USDC to ${shortAddress(cmd.to)} (gasless, off-chain)`;
+    case "STOP_LOSS": return `🛡️ Stop-loss ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
+    case "TAKE_PROFIT": return `📈 Take-profit ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
+    case "SWEEP_YIELD": return "🧹 Sweep yield (settle + consolidate cross-chain)";
+    case "TRADE_HISTORY": return "📊 Show trade history & P&L";
+    case "PRICE": return "💹 Show live DeepBook price";
     case "CANCEL_ORDER": return `Cancel conditional order ${cmd.orderId}`;
     default: return raw;
   }

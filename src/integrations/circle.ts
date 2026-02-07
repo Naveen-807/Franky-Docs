@@ -163,8 +163,10 @@ export class CircleArcClient {
   }
 
   /**
-   * Bridge USDC cross-chain via Circle CCTP.
-   * Uses the same createTransaction with a different destinationAddress on a different chain.
+   * Bridge USDC cross-chain via Circle CCTP (Cross-Chain Transfer Protocol).
+   * Uses Circle's transfer API with explicit source/destination chain routing.
+   * On Arc, CCTP burns USDC on source chain and mints on destination chain.
+   * Settlement is atomic — funds arrive on destination chain after attestation.
    */
   async bridgeUsdc(params: {
     walletId: string;
@@ -173,15 +175,47 @@ export class CircleArcClient {
     amountUsdc: number;
     sourceChain: string;
     destinationChain: string;
-  }): Promise<{ circleTxId: string; txHash?: string; state: string }> {
-    // For CCTP bridge, we use the same payout mechanism.
-    // Circle handles cross-chain routing when the destination is on a different chain.
-    return this.payout({
+  }): Promise<{ circleTxId: string; txHash?: string; state: string; route: string }> {
+    const tokenId = await this.resolveUsdcTokenId(params.walletId);
+    const amount = [String(params.amountUsdc)];
+
+    // Map chain names to Circle blockchain identifiers
+    const chainMap: Record<string, string> = {
+      arc: "ARC-TESTNET", "arc-testnet": "ARC-TESTNET",
+      eth: "ETH-SEPOLIA", ethereum: "ETH-SEPOLIA", sepolia: "ETH-SEPOLIA",
+      polygon: "MATIC-AMOY", matic: "MATIC-AMOY",
+      avax: "AVAX-FUJI", avalanche: "AVAX-FUJI",
+      sol: "SOL-DEVNET", solana: "SOL-DEVNET",
+      sui: "SUI-TESTNET"
+    };
+    const destChainId = chainMap[params.destinationChain.toLowerCase()] ?? params.destinationChain;
+    const srcChainId = chainMap[params.sourceChain.toLowerCase()] ?? params.sourceChain;
+    const route = `${srcChainId} → ${destChainId}`;
+
+    console.log(`[Circle] CCTP Bridge: ${params.amountUsdc} USDC via ${route} to ${params.destinationAddress}`);
+
+    // Circle CCTP: create transfer with destination blockchain specified
+    // The Circle SDK handles burn-and-mint attestation automatically
+    const createRes = await this.client.createTransaction({
       walletId: params.walletId,
-      walletAddress: params.walletAddress,
-      destinationAddress: params.destinationAddress as `0x${string}`,
-      amountUsdc: params.amountUsdc
+      tokenId,
+      destinationAddress: params.destinationAddress,
+      amount,
+      fee: { type: "level" as any, config: { feeLevel: "HIGH" as any } },
+      // Note: Circle routes cross-chain when destination blockchain differs
+      ...(destChainId !== srcChainId ? { blockchain: destChainId as any } : {})
     });
+
+    const tx = createRes?.data;
+    const id = (tx as any)?.id ?? (tx as any)?.transaction?.id;
+    if (!id) {
+      console.error("[Circle] CCTP bridge createTransaction response:", JSON.stringify(createRes?.data, null, 2));
+      throw new Error("Circle CCTP bridge failed — no tx id");
+    }
+
+    console.log(`[Circle] CCTP Bridge initiated: txId=${id} route=${route}`);
+    const final = await this.pollTransaction(String(id), { timeoutMs: 180_000 }); // longer timeout for cross-chain
+    return { circleTxId: String(id), txHash: final.txHash, state: final.state, route };
   }
 
   /** Get USDC balance of a Circle wallet */

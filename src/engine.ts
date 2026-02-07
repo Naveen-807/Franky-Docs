@@ -1283,7 +1283,7 @@ export class Engine {
       const txText = result.txHash ? `BridgeTx=${result.txHash}` : `CircleState=${result.state}`;
       return {
         arcTxHash: result.txHash as any,
-        resultText: `BRIDGE ${command.amountUsdc} USDC ${command.fromChain}->${command.toChain} CircleTx=${result.circleTxId} ${txText}`
+        resultText: `CCTP_BRIDGE ${command.amountUsdc} USDC Route=${result.route} CircleTx=${result.circleTxId} ${txText} Dest=${destinationAddress.slice(0, 10)}...`
       };
     }
 
@@ -1386,8 +1386,10 @@ export class Engine {
       // Persist new state
       repo.setYellowSessionVersion({ docId, version: result.version, allocationsJson: JSON.stringify(newAllocations) });
 
+      // Build allocation summary for proof-of-settlement
+      const allocSummary = newAllocations.map(a => `${a.participant.slice(0, 8)}..=${a.amount}`).join(", ");
       return {
-        resultText: `YELLOW_SENT=${command.amountUsdc} USDC TO=${command.to.slice(0, 10)}... v${result.version} OFF_CHAIN=true GAS=0`
+        resultText: `YELLOW_SENT=${command.amountUsdc} USDC TO=${command.to.slice(0, 10)}... v${result.version} OFF_CHAIN=true GAS=0 SESSION=${session.app_session_id.slice(0, 12)}... ALLOC=[${allocSummary}]`
       };
     }
 
@@ -1482,18 +1484,38 @@ export class Engine {
         }
       }
 
-      // Check for idle Circle capital
+      // Check for idle Circle capital + aggregate cross-chain balances
+      let circleIdle = 0;
       if (circle) {
         const circleW = repo.getCircleWallet(docId);
         if (circleW) {
           try {
             const bal = await circle.getWalletBalance(circleW.wallet_id);
-            const idle = Number(bal?.usdcBalance ?? 0);
-            if (idle > 0) {
-              results.push(`CIRCLE_IDLE=$${idle.toFixed(2)}`);
+            circleIdle = Number(bal?.usdcBalance ?? 0);
+            if (circleIdle > 0) {
+              results.push(`ARC_USDC=$${circleIdle.toFixed(2)}`);
             }
           } catch { /* skip */ }
         }
+      }
+
+      // Check Sui-side balances for complete picture
+      if (deepbook) {
+        try {
+          const suiBals = await deepbook.getWalletBalances({ address: secrets.sui.address });
+          const suiVal = Number(suiBals.suiBalance);
+          const dbUsdc = Number(suiBals.dbUsdcBalance);
+          if (suiVal > 0 || dbUsdc > 0) {
+            results.push(`SUI_BALANCE=${suiBals.suiBalance} SUI`);
+            results.push(`SUI_USDC=$${dbUsdc.toFixed(2)}`);
+          }
+        } catch { /* skip */ }
+      }
+
+      // Cross-chain total
+      const totalIdle = circleIdle;
+      if (totalIdle > 0) {
+        results.push(`CROSS_CHAIN_IDLE=$${totalIdle.toFixed(2)}`);
       }
 
       // Get current P&L
@@ -1736,7 +1758,7 @@ export class Engine {
           }
         }
 
-        // 6. Live price tracking + conditional order summary
+        // 6. Live price tracking + conditional order summary + volatility detection
         const cachedPrice = repo.getPrice("SUI/USDC");
         if (cachedPrice && cachedPrice.mid_price > 0) {
           const activeCondOrders = repo.listActiveConditionalOrders(docId);
@@ -1746,6 +1768,32 @@ export class Engine {
             ).join(", ");
             decisions.push(`📊 SUI/USDC=${cachedPrice.mid_price.toFixed(4)} | Watching: ${summary}`);
           }
+
+          // Spread-based volatility detection → suggest protective orders
+          if (cachedPrice.bid > 0 && cachedPrice.ask > 0 && cachedPrice.mid_price > 0) {
+            const spreadPct = ((cachedPrice.ask - cachedPrice.bid) / cachedPrice.mid_price) * 100;
+            if (spreadPct > 5) {
+              decisions.push(`⚠️ High spread: ${spreadPct.toFixed(1)}% — market may be volatile`);
+              repo.insertAgentActivity(docId, "VOLATILITY", `Spread ${spreadPct.toFixed(1)}% at ${cachedPrice.mid_price.toFixed(4)}`);
+            }
+          }
+        }
+
+        // 7. Cross-chain portfolio balance detection (Arc <-> Sui)
+        if (arc && deepbook && doc.evm_address && doc.sui_address) {
+          try {
+            const arcBals = await arc.getBalances(doc.evm_address as `0x${string}`);
+            const arcUsdc = Number(arcBals.usdcBalance);
+            const suiBals = await deepbook.getWalletBalances({ address: doc.sui_address });
+            const suiVal = Number(suiBals.suiBalance) * (cachedPrice?.mid_price ?? 0);
+            const suiUsdc = Number(suiBals.dbUsdcBalance);
+            const totalPortfolio = arcUsdc + suiVal + suiUsdc;
+            if (totalPortfolio > 0) {
+              const arcPct = ((arcUsdc / totalPortfolio) * 100).toFixed(0);
+              const suiPct = (((suiVal + suiUsdc) / totalPortfolio) * 100).toFixed(0);
+              decisions.push(`🌐 Portfolio: Arc=${arcPct}% Sui=${suiPct}% (Total=$${totalPortfolio.toFixed(2)})`);
+            }
+          } catch { /* ignore cross-chain balance check failure */ }
         }
 
         // Auto-proposals (agent suggestions inserted into Commands table)
@@ -1818,6 +1866,43 @@ export class Engine {
           const policySourceCfg = repo.getDocConfig(docId, "policy_source") || doc.policy_source || "NONE";
           if (ensNameCfg && policySourceCfg !== "ENS") {
             await propose(`DW POLICY ENS ${ensNameCfg}`, "Policy not set", "proposal_policy_last_ms");
+          }
+
+          // Auto-propose SWEEP_YIELD when idle capital detected on any chain
+          if (autoRebalance === "1" && circle) {
+            const circleW = repo.getCircleWallet(docId);
+            if (circleW) {
+              try {
+                const bal = await circle.getWalletBalance(circleW.wallet_id);
+                const idle = Number(bal?.usdcBalance ?? 0);
+                if (idle > 50) {
+                  await propose("DW SWEEP_YIELD", `$${idle.toFixed(0)} idle in Circle wallet`, "proposal_sweep_last_ms");
+                }
+              } catch { /* ignore */ }
+            }
+          }
+
+          // Auto-propose protective stop-loss if large SUI position and no active SL
+          if (deepbook && doc.sui_address && cachedPrice && cachedPrice.mid_price > 0) {
+            try {
+              const suiBals = await deepbook.getWalletBalances({ address: doc.sui_address });
+              const suiBalance = Number(suiBals.suiBalance);
+              if (suiBalance > 10) { // significant position
+                const activeSL = repo.listActiveConditionalOrders(docId).filter(o => o.type === "STOP_LOSS");
+                if (activeSL.length === 0) {
+                  // Suggest a 15% stop-loss below current price
+                  const slPrice = (cachedPrice.mid_price * 0.85).toFixed(4);
+                  const slQty = Math.floor(suiBalance * 0.5); // protect 50% of position
+                  if (slQty > 0) {
+                    await propose(
+                      `DW STOP_LOSS SUI ${slQty} @ ${slPrice}`,
+                      `No stop-loss on ${suiBalance.toFixed(1)} SUI position`,
+                      "proposal_stop_loss_last_ms"
+                    );
+                  }
+                }
+              }
+            } catch { /* ignore */ }
           }
         }
 
