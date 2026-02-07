@@ -113,6 +113,35 @@ export function evaluatePolicy(
     }
   }
 
+  if (cmd.type === "MARKET_BUY" || cmd.type === "MARKET_SELL") {
+    if (policy.allowedPairs && !policy.allowedPairs.includes("SUI/USDC")) {
+      return { ok: false, reason: "Blocked by policy (allowedPairs)" };
+    }
+  }
+
+  if (cmd.type === "STOP_LOSS" || cmd.type === "TAKE_PROFIT") {
+    if (policy.allowedPairs && !policy.allowedPairs.includes("SUI/USDC")) {
+      return { ok: false, reason: "Blocked by policy (allowedPairs)" };
+    }
+    if (policy.maxNotionalUsdc !== undefined) {
+      const notional = cmd.qty * cmd.triggerPrice;
+      if (notional > policy.maxNotionalUsdc) {
+        return { ok: false, reason: `Blocked by policy (maxNotionalUsdc=${policy.maxNotionalUsdc})` };
+      }
+    }
+  }
+
+  if (cmd.type === "YELLOW_SEND") {
+    if (policy.maxSingleTxUsdc !== undefined && cmd.amountUsdc > policy.maxSingleTxUsdc) {
+      return { ok: false, reason: `Blocked by policy (maxSingleTxUsdc=${policy.maxSingleTxUsdc})` };
+    }
+    if (policy.dailyLimitUsdc !== undefined && context?.dailySpendUsdc !== undefined) {
+      if (context.dailySpendUsdc + cmd.amountUsdc > policy.dailyLimitUsdc) {
+        return { ok: false, reason: `Blocked by policy (dailyLimitUsdc=${policy.dailyLimitUsdc}, spent=${context.dailySpendUsdc.toFixed(2)})` };
+      }
+    }
+  }
+
   return { ok: true };
 }
 

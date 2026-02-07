@@ -448,7 +448,13 @@ export class Engine {
 
       for (const d of tracked) {
         const docId = d.doc_id;
-        const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+        let secrets: ReturnType<typeof loadDocSecrets>;
+        try {
+          secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+        } catch (e) {
+          console.error(`[balances] Failed to decrypt secrets for ${docId.slice(0, 8)}:`, e);
+          continue;
+        }
         if (!secrets) continue; // Not set up yet
 
         const tables = await loadDocWalletTables({ docs, docId });
@@ -1055,6 +1061,11 @@ export class Engine {
       const current = repo.getPrice("SUI/USDC");
       const priceInfo = current ? ` CURRENT=${current.mid_price.toFixed(4)}` : "";
       return { resultText: `TAKE_PROFIT=${orderId} SELL ${command.qty} SUI WHEN ≥ ${command.triggerPrice}${priceInfo}` };
+    }
+
+    if (command.type === "CANCEL_ORDER") {
+      repo.cancelConditionalOrder(command.orderId);
+      return { resultText: `CANCELLED conditional order ${command.orderId}` };
     }
 
     if (command.type === "SESSION_CREATE") {
@@ -1669,7 +1680,7 @@ export class Engine {
           if (coinType === "USDC" && arc && doc.evm_address) {
             try {
               const balances = await arc.getBalances(doc.evm_address as `0x${string}`);
-              const balNum = Number(balances.usdcBalance) / 1e6;
+              const balNum = Number(balances.usdcBalance); // already human-readable from formatUnits
               if (balNum < belowValue) {
                 decisions.push(`⚠️ ${coinType} balance ${balNum.toFixed(2)} below threshold ${belowValue}`);
                 repo.insertAgentActivity(docId, "ALERT_BALANCE", `${coinType} ${balNum.toFixed(2)} < ${belowValue}`);
@@ -1695,6 +1706,8 @@ export class Engine {
 
         // 5. Auto-rebalance execution (not just alerting!)
         const autoRebalance = repo.getDocConfig(docId, "auto_rebalance");
+        const autoProp = repo.getDocConfig(docId, "agent_autopropose");
+        const autoPropEnabled = autoProp !== "0";
         if (autoRebalance === "1") {
           // Check SUI gas critically low → propose sweep to collect settled funds
           if (deepbook && doc.sui_address) {
@@ -1704,8 +1717,8 @@ export class Engine {
               repo.insertAgentActivity(docId, "REBALANCE_NEEDED", `SUI gas at ${gasCheck.suiBalance.toFixed(4)}`);
             }
           }
-          // Check idle Circle capital → propose sweep_yield to collect it
-          if (circle) {
+          // Check idle Circle capital → propose sweep_yield command to collect it
+          if (circle && autoPropEnabled) {
             const circleW = repo.getCircleWallet(docId);
             if (circleW) {
               try {
@@ -1714,8 +1727,7 @@ export class Engine {
                 if (idle > 200) {
                   const lastSweep = Number(repo.getDocConfig(docId, "last_sweep_ms") ?? "0");
                   if (Date.now() - lastSweep > 3600_000) {
-                    decisions.push(`🔄 Auto-sweep: $${idle.toFixed(2)} idle USDC detected`);
-                    repo.insertAgentActivity(docId, "AUTO_SWEEP", `$${idle.toFixed(2)} idle, proposing sweep`);
+                    decisions.push(`🔄 Auto-sweep: $${idle.toFixed(2)} idle USDC → proposing SWEEP_YIELD`);
                     repo.setDocConfig(docId, "last_sweep_ms", String(Date.now()));
                   }
                 }
@@ -1737,8 +1749,6 @@ export class Engine {
         }
 
         // Auto-proposals (agent suggestions inserted into Commands table)
-        const autoProp = repo.getDocConfig(docId, "agent_autopropose");
-        const autoPropEnabled = autoProp !== "0";
         if (autoPropEnabled) {
           const now = Date.now();
           const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
@@ -1891,6 +1901,7 @@ function reconstructDwCommand(cmd: ParsedCommand): string | null {
     case "SWEEP_YIELD": return "DW SWEEP_YIELD";
     case "TRADE_HISTORY": return "DW TRADE_HISTORY";
     case "PRICE": return "DW PRICE";
+    case "CANCEL_ORDER": return `DW CANCEL_ORDER ${cmd.orderId}`;
     default: return null;
   }
 }
@@ -1947,12 +1958,12 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
       return lines.join("\n");
     }
 
-    if (lower.includes("stop") || lower.includes("conditional") || lower.includes("watching")) {
+    if (lower.includes("stop") || lower.includes("conditional") || lower.includes("watching") || lower.includes("cancel order")) {
       const orders = repo.listActiveConditionalOrders(docId);
       if (orders.length === 0) return "No active stop-loss or take-profit orders.\nUse: DW STOP_LOSS SUI <qty> @ <price>\nUse: DW TAKE_PROFIT SUI <qty> @ <price>";
       const cached = repo.getPrice("SUI/USDC");
       const priceInfo = cached ? ` (current: $${cached.mid_price.toFixed(4)})` : "";
-      const list = orders.map(o => `${o.order_id}: ${o.type} ${o.qty} SUI @ ${o.trigger_price}`).join("\n");
+      const list = orders.map(o => `${o.order_id}: ${o.type} ${o.qty} SUI @ ${o.trigger_price} → cancel: DW CANCEL_ORDER ${o.order_id}`).join("\n");
       return `Active conditional orders${priceInfo}:\n${list}`;
     }
 
@@ -2052,6 +2063,10 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
   // Sweep yield
   if (lower.match(/^(?:sweep|collect|harvest)/)) return "Use: DW SWEEP_YIELD";
 
+  // Cancel conditional order
+  const cancelOrdMatch = lower.match(/cancel\s+(?:order\s+|stop.?loss\s+|take.?profit\s+)?((?:sl|tp|ord)_\w+)/);
+  if (cancelOrdMatch) return `Use: DW CANCEL_ORDER ${cancelOrdMatch[1]}`;
+
   // Price check
   if (lower.match(/^(?:price|prices|quote|what.?s?\s+sui)/)) return "Use: DW PRICE";
 
@@ -2104,6 +2119,7 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
       "• DW DEPOSIT <coin> <amount> — Deposit to DeepBook",
       "• DW WITHDRAW <coin> <amount> — Withdraw from DeepBook",
       "• DW CANCEL <orderId>",
+      "• DW CANCEL_ORDER <orderId> — Cancel stop-loss/take-profit",
       "• DW SETTLE — Withdraw filled orders",
       "• DW SWEEP_YIELD — Settle + sweep idle capital",
       "• DW TRADE_HISTORY — P&L and recent trades",

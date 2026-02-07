@@ -739,14 +739,14 @@ export class Repo {
 
   listPendingCommands(docId: string): CommandRow[] {
     return this.db
-      .prepare(`SELECT * FROM commands WHERE doc_id=? AND status IN ('PENDING','APPROVED') ORDER BY created_at ASC`)
+      .prepare(`SELECT * FROM commands WHERE doc_id=? AND status IN ('PENDING_APPROVAL','APPROVED') ORDER BY created_at ASC`)
       .all(docId) as CommandRow[];
   }
 
   listStaleCommands(maxAgeMs: number = 3600_000): CommandRow[] {
     const cutoff = Date.now() - maxAgeMs;
     return this.db
-      .prepare(`SELECT * FROM commands WHERE status IN ('PENDING','APPROVED') AND created_at < ? ORDER BY created_at ASC`)
+      .prepare(`SELECT * FROM commands WHERE status IN ('PENDING_APPROVAL','APPROVED') AND created_at < ? ORDER BY created_at ASC`)
       .all(cutoff) as CommandRow[];
   }
 

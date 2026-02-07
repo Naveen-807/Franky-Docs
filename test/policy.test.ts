@@ -26,6 +26,24 @@ describe("evaluatePolicy", () => {
     expect(res.ok).toBe(false);
   });
 
+  it("blocks market orders with disallowed pair", () => {
+    const cmd: ParsedCommand = { type: "MARKET_BUY", base: "SUI", quote: "USDC", qty: 10 };
+    const res = evaluatePolicy({ allowedPairs: ["ETH/USDC"] }, cmd);
+    expect(res.ok).toBe(false);
+  });
+
+  it("blocks stop-loss when notional exceeds max", () => {
+    const cmd: ParsedCommand = { type: "STOP_LOSS", base: "SUI", quote: "USDC", qty: 100, triggerPrice: 1.5 };
+    const res = evaluatePolicy({ maxNotionalUsdc: 100 }, cmd);
+    expect(res.ok).toBe(false);
+  });
+
+  it("enforces dailyLimitUsdc on YELLOW_SEND", () => {
+    const cmd: ParsedCommand = { type: "YELLOW_SEND", amountUsdc: 60, to: addr };
+    const res = evaluatePolicy({ dailyLimitUsdc: 100 }, cmd, { dailySpendUsdc: 80 });
+    expect(res.ok).toBe(false);
+  });
+
   it("enforces schedule limits", () => {
     const cmd: ParsedCommand = { type: "SCHEDULE", intervalHours: 48, innerCommand: "DW PAYOUT 1 USDC TO 0x0" };
     const res1 = evaluatePolicy({ schedulingAllowed: false }, cmd);

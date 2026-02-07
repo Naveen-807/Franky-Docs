@@ -358,7 +358,13 @@ export class DeepBookV3Client implements DeepBookClient {
 
     const tx = new Transaction();
     if (isBid) {
-      const notionalUsdc = Math.max(0, params.qty * extremePrice);
+      // Estimate sane deposit: use cached mid-price * 2x slippage, fallback to 10x qty
+      let estimatedUnitPrice = 2; // conservative SUI/USDC fallback
+      try {
+        const priceData = await this.getMidPrice({ poolKey: params.poolKey });
+        if (priceData.mid > 0) estimatedUnitPrice = priceData.mid;
+      } catch { /* use fallback */ }
+      const notionalUsdc = Math.max(1, params.qty * estimatedUnitPrice * 2); // 2x slippage buffer
       deepbook.balanceManager.depositIntoManager(managerKey, quoteKey, notionalUsdc)(tx);
     } else {
       deepbook.balanceManager.depositIntoManager(managerKey, baseKey, params.qty)(tx);

@@ -655,6 +655,27 @@ describe("parseCommand — every command type", () => {
   });
 
   // ============================================================
+  // CANCEL_ORDER
+  // ============================================================
+  describe("CANCEL_ORDER", () => {
+    it("parses DW CANCEL_ORDER sl_12345", () => {
+      const r = parseCommand("DW CANCEL_ORDER sl_12345");
+      expect(r).toEqual({ ok: true, value: { type: "CANCEL_ORDER", orderId: "sl_12345" } });
+    });
+    it("parses DW CANCEL_ORDER tp_abc", () => {
+      const r = parseCommand("DW CANCEL_ORDER tp_abc");
+      expect(r).toEqual({ ok: true, value: { type: "CANCEL_ORDER", orderId: "tp_abc" } });
+    });
+    it("rejects missing orderId", () => {
+      expect(parseCommand("DW CANCEL_ORDER").ok).toBe(false);
+    });
+    it("case-insensitive", () => {
+      const r = parseCommand("dw cancel_order sl_123");
+      expect(r).toEqual({ ok: true, value: { type: "CANCEL_ORDER", orderId: "sl_123" } });
+    });
+  });
+
+  // ============================================================
   // EDGE CASES
   // ============================================================
   describe("edge cases", () => {
@@ -764,6 +785,20 @@ describe("tryAutoDetect — natural language shortcuts", () => {
   });
   it("returns null for unknown text", () => {
     expect(tryAutoDetect("hello world")).toBe(null);
+  });
+  it("auto-detects 'cancel order ord_123'", () => {
+    const r = tryAutoDetect("cancel order ord_123");
+    expect(r?.ok).toBe(true);
+    if (r?.ok && r.value.type === "CANCEL_ORDER") {
+      expect(r.value.orderId).toBe("ord_123");
+    }
+  });
+  it("auto-detects 'cancel stop loss sl_abc'", () => {
+    const r = tryAutoDetect("cancel stop loss sl_abc");
+    expect(r?.ok).toBe(true);
+    if (r?.ok && r.value.type === "CANCEL_ORDER") {
+      expect(r.value.orderId).toBe("sl_abc");
+    }
   });
   it("returns null for empty string", () => {
     expect(tryAutoDetect("")).toBe(null);

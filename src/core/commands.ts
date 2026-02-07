@@ -44,7 +44,8 @@ export type ParsedCommand =
   | { type: "TAKE_PROFIT"; base: "SUI"; quote: "USDC"; qty: number; triggerPrice: number }
   | { type: "SWEEP_YIELD" }
   | { type: "TRADE_HISTORY" }
-  | { type: "PRICE" };
+  | { type: "PRICE" }
+  | { type: "CANCEL_ORDER"; orderId: string };
 
 const HexString = z
   .string()
@@ -182,7 +183,8 @@ export const ParsedCommandSchema: z.ZodType<ParsedCommand, z.ZodTypeDef, unknown
   }),
   z.object({ type: z.literal("SWEEP_YIELD") }),
   z.object({ type: z.literal("TRADE_HISTORY") }),
-  z.object({ type: z.literal("PRICE") })
+  z.object({ type: z.literal("PRICE") }),
+  z.object({ type: z.literal("CANCEL_ORDER"), orderId: z.string().min(1) })
 ]);
 
 export type ParseResult =
@@ -308,6 +310,12 @@ export function tryAutoDetect(raw: string): ParseResult | null {
   // "price" / "prices"
   if (lower === "price" || lower === "prices") {
     return parseCommand("DW PRICE");
+  }
+
+  // "cancel order ord_..." / "cancel stop loss sl_..." / "cancel take profit tp_..."
+  const cancelOrdMatch = trimmed.match(/^cancel\s+(?:order\s+|stop[\s-]?loss\s+|take[\s-]?profit\s+)?((?:ord|sl|tp)_\w+)$/i);
+  if (cancelOrdMatch) {
+    return parseCommand(`DW CANCEL_ORDER ${cancelOrdMatch[1]}`);
   }
 
   return null;
@@ -638,6 +646,12 @@ export function parseCommand(raw: string): ParseResult {
 
   if (op === "PRICE" || op === "PRICES") {
     return { ok: true, value: { type: "PRICE" } };
+  }
+
+  if (op === "CANCEL_ORDER") {
+    const orderId = parts[2];
+    if (!orderId) return { ok: false, error: "CANCEL_ORDER expects <orderId>" };
+    return { ok: true, value: { type: "CANCEL_ORDER", orderId } };
   }
 
   return { ok: false, error: `Unknown command: ${op}` };

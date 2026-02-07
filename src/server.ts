@@ -1309,6 +1309,13 @@ function summarizeCommand(raw: string): string {
     case "BRIDGE": return `Bridge ${cmd.amountUsdc} USDC ${cmd.fromChain} -> ${cmd.toChain}`;
     case "ALERT_THRESHOLD": return `Alert when ${cmd.coinType} < ${cmd.below}`;
     case "AUTO_REBALANCE": return `Auto-rebalance ${cmd.enabled ? "ON" : "OFF"}`;
+    case "YELLOW_SEND": return `Yellow send ${cmd.amountUsdc} USDC to ${shortAddress(cmd.to)}`;
+    case "STOP_LOSS": return `Stop-loss ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
+    case "TAKE_PROFIT": return `Take-profit ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
+    case "SWEEP_YIELD": return "Sweep yield";
+    case "TRADE_HISTORY": return "Show trade history & P&L";
+    case "PRICE": return "Show live price";
+    case "CANCEL_ORDER": return `Cancel conditional order ${cmd.orderId}`;
     default: return raw;
   }
 }
