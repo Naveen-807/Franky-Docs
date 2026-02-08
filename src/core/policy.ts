@@ -20,7 +20,7 @@ export const EnsPolicySchema = z
 
 export type EnsPolicy = z.infer<typeof EnsPolicySchema>;
 
-export type PolicyDecision = { ok: true } | { ok: false; reason: string };
+export type PolicyDecision = { ok: true; autoApprove?: boolean } | { ok: false; reason: string };
 
 export function evaluatePolicy(
   policy: EnsPolicy,
@@ -29,6 +29,10 @@ export function evaluatePolicy(
 ): PolicyDecision {
   const deny = new Set((policy.denyCommands ?? []).map((s) => s.toUpperCase()));
   if (deny.has(cmd.type.toUpperCase())) return { ok: false, reason: `Blocked by policy (denyCommands: ${cmd.type})` };
+
+  // Enforce requireApproval — when explicitly false, signal that auto-approval is policy-allowed
+  // This lets low-risk commands bypass the approval queue when the policy says so
+  const autoApprove = policy.requireApproval === false ? true : undefined;
 
   if (cmd.type === "LIMIT_BUY" || cmd.type === "LIMIT_SELL") {
     if (policy.allowedPairs && !policy.allowedPairs.includes("SUI/USDC")) {
@@ -165,6 +169,6 @@ export function evaluatePolicy(
     }
   }
 
-  return { ok: true };
+  return { ok: true, autoApprove };
 }
 

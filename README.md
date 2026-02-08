@@ -1,10 +1,10 @@
 # FrankyDocs (DocWallet)
 
-**HackMoney 2026** — Yellow · Arc · Sui DeepBook · ENS
+**HackMoney 2026** — Yellow · Arc · Sui DeepBook
 
 > Turn any Google Doc into a multi-chain DeFi treasury. Proposers need no wallet; approvers sign once via Yellow delegated keys (gasless). The autonomous agent monitors prices, executes stop-losses, sweeps yield, and rebalances capital across Arc, Sui, and Yellow — all from a Google Doc.
 
-Note: the codebase uses the internal name "DocWallet" in env vars, database schema, and template anchors (for example `DOCWALLET_*` and `docwallet.policy`).
+Note: the codebase uses the internal name "DocWallet" in env vars, database schema, and template anchors (for example `DOCWALLET_*`).
 
 ---
 
@@ -13,11 +13,10 @@ Note: the codebase uses the internal name "DocWallet" in env vars, database sche
 1. [Prize Track Alignment](#-prize-track-alignment)
 2. [Architecture](#architecture)
 3. [How It Works](#how-it-works)
-4. [All 36 Commands — Complete Reference](#-all-36-commands--complete-reference)
+4. [All 35 Commands — Complete Reference](#-all-35-commands--complete-reference)
 5. [Integration Deep Dives](#-integration-deep-dives)
 6. [Autonomous Agent Behaviors](#-autonomous-agent-behaviors)
-7. [ENS Policy Governance](#️-ens-policy-governance)
-8. [Unified Treasury & Cross-Chain Rebalance](#-unified-treasury--cross-chain-rebalance)
+7. [Unified Treasury & Cross-Chain Rebalance](#-unified-treasury--cross-chain-rebalance)
 9. [Dashboard & Web UI](#️-dashboard--web-ui)
 10. [Database Schema](#️-database-schema)
 11. [NLP Auto-Detect (Natural Language)](#️-nlp-auto-detect-natural-language)
@@ -66,14 +65,6 @@ Note: the codebase uses the internal name "DocWallet" in env vars, database sche
 - **Gas checking** — validates Sui gas balance before submitting transactions
 - **Coin merging** — PTB-based coin merging for deposits
 
-### ENS ($5K) — Policy Governance
-- **On-chain spend limits** via ENS text records (`docwallet.policy`)
-- **Fine-grained controls** — `maxNotionalUsdc`, `dailyLimitUsdc`, `maxSingleTxUsdc`, `allowedPairs`, `payoutAllowlist`, `denyCommands`
-- **Scheduling rules** — `schedulingAllowed`, `maxScheduleIntervalHours`
-- **Bridge controls** — `bridgeAllowed`, `allowedChains`
-- **ENS client** with caching (60s TTL) — reads policy from Ethereum mainnet text records
-- **Policy evaluated for all command types**: LIMIT_BUY/SELL, PAYOUT, PAYOUT_SPLIT, SCHEDULE, BRIDGE, MARKET_BUY/SELL, STOP_LOSS, TAKE_PROFIT, YELLOW_SEND, REBALANCE
-
 ---
 
 ## Architecture
@@ -88,7 +79,6 @@ flowchart TB
   Agent --> DeepBook["DeepBook V3<br/>(Sui CLOB · SUI/USDC)"]
   Agent --> Arc["Arc L1 Testnet<br/>(EVM · Chain 5042002)"]
   Agent --> Circle["Circle Dev Wallets<br/>(CCTP Bridge · USDC)"]
-  Agent --> ENS["ENS Policy<br/>(Ethereum Mainnet)"]
   Agent --> WC["WalletConnect v2<br/>(dApp Gateway)"]
 ```
 
@@ -114,7 +104,7 @@ flowchart TB
 ## How It Works
 
 1. **Proposers** type `DW <command>` in a Google Doc — no wallet needed
-2. **Agent** discovers the Doc, parses commands, validates against ENS policy
+2. **Agent** discovers the Doc, parses commands, validates quorum
 3. **Approvers** sign via MetaMask on the web UI → approval stored on Yellow state channel (gasless)
 4. **Quorum met** → Agent auto-executes the command on the target chain
 5. **Results** written back to the Google Doc (Commands table, Audit Log, Recent Activity)
@@ -128,7 +118,7 @@ flowchart TB
 
 ---
 
-## 📋 All 36 Commands — Complete Reference
+## 📋 All 35 Commands — Complete Reference
 
 ### Setup & Administration
 | Command | Syntax | Description |
@@ -176,11 +166,6 @@ flowchart TB
 | **TREASURY** | `DW TREASURY` | Unified cross-chain balance view (Sui + Arc + Yellow) with USD valuation and distribution % |
 | **REBALANCE** | `DW REBALANCE 100 FROM arc TO sui` | Moves capital between chains (6 routes: arc⇄sui⇄yellow) |
 | **SWEEP_YIELD** | `DW SWEEP_YIELD` | Settles DeepBook orders, reports idle capital across all chains including Yellow |
-
-### Policy & Governance
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| **POLICY_ENS** | `DW POLICY ENS name.eth` | Fetches and applies spend-limit policy from ENS text records |
 
 ### WalletConnect v2
 | Command | Syntax | Description |
@@ -260,18 +245,7 @@ flowchart TB
 | Gas Check | `checkGas()` — validates minimum SUI for transactions |
 | Deposit/Withdraw | PTB coin merging for deposits, direct withdraw to owner |
 
-### 5. ENS — Policy Governance
-
-**File**: `src/integrations/ens.ts` (45 lines)
-
-| Feature | Detail |
-|---------|--------|
-| Network | Ethereum mainnet via `viem` public client |
-| Text Record Key | `docwallet.policy` |
-| Schema | Zod-validated JSON (strict mode) |
-| Caching | 60s TTL in-memory cache |
-
-### 6. WalletConnect v2
+### 5. WalletConnect v2
 
 **File**: `src/integrations/walletconnect.ts` (212 lines)
 
@@ -307,52 +281,13 @@ When `AGENT_AUTOPROPOSE=1` in the doc config:
 |----------|---------|------------------|
 | **Setup reminder** | No wallets created yet | `DW SETUP` |
 | **Session create** | No Yellow session active | `DW SESSION_CREATE` |
-| **ENS policy** | Doc has ENS name but no policy loaded | `DW POLICY ENS <name.eth>` |
 | **Sweep yield** | Settled balance > $1 detected | `DW SWEEP_YIELD` |
 | **Stop-loss** | Active buy orders without protection | `DW STOP_LOSS SUI <qty> @ <price>` |
 | **Cross-chain rebalance** | One chain holds >80% of total USD | `DW REBALANCE <amt> FROM <chain> TO <chain>` |
 
 ---
 
-## 🛡️ ENS Policy Governance
-
-Policy is stored as a JSON text record on ENS (`docwallet.policy`):
-
-```json
-{
-  "requireApproval": true,
-  "maxNotionalUsdc": 1000,
-  "dailyLimitUsdc": 5000,
-  "maxSingleTxUsdc": 500,
-  "allowedPairs": ["SUI/USDC"],
-  "payoutAllowlist": ["0xABCD...1234", "0xDEAD...BEEF"],
-  "denyCommands": ["SESSION_CLOSE"],
-  "schedulingAllowed": true,
-  "maxScheduleIntervalHours": 24,
-  "bridgeAllowed": true,
-  "allowedChains": ["arc", "sui", "yellow"]
-}
-```
-
-### Policy Fields
-
-| Field | Type | Enforced On |
-|-------|------|-------------|
-| `requireApproval` | `boolean` | All commands |
-| `maxNotionalUsdc` | `number` | LIMIT_BUY, LIMIT_SELL, STOP_LOSS, TAKE_PROFIT (qty × price) |
-| `dailyLimitUsdc` | `number` | PAYOUT, PAYOUT_SPLIT, BRIDGE, YELLOW_SEND, REBALANCE (cumulative daily) |
-| `maxSingleTxUsdc` | `number` | PAYOUT, PAYOUT_SPLIT, BRIDGE, YELLOW_SEND, REBALANCE, LIMIT_BUY/SELL |
-| `allowedPairs` | `string[]` | LIMIT_BUY/SELL, MARKET_BUY/SELL, STOP_LOSS, TAKE_PROFIT |
-| `payoutAllowlist` | `0x...[]` | PAYOUT, PAYOUT_SPLIT (address whitelist) |
-| `denyCommands` | `string[]` | Any command type (blacklist) |
-| `schedulingAllowed` | `boolean` | SCHEDULE |
-| `maxScheduleIntervalHours` | `number` | SCHEDULE |
-| `bridgeAllowed` | `boolean` | BRIDGE, REBALANCE |
-| `allowedChains` | `string[]` | BRIDGE, REBALANCE (chain whitelist) |
-
----
-
-## 💰 Unified Treasury & Cross-Chain Rebalance
+##  Unified Treasury & Cross-Chain Rebalance
 
 ### TREASURY Command
 
@@ -396,7 +331,7 @@ Agent auto-proposes rebalance when any single chain holds >80% of total USD port
 
 | Route | Description |
 |-------|-------------|
-| `GET /` | **Dashboard** — Doc cards, integration status cards (Yellow, Arc+Circle, DeepBook, ENS), treasury flow diagram, "How It Works" section |
+| `GET /` | **Dashboard** — Doc cards, integration status cards (Yellow, Arc+Circle, DeepBook), treasury flow diagram, "How It Works" section |
 | `GET /join/:docId` | **Join page** — MetaMask connect → create Yellow session key (gasless) |
 | `GET /signers/:docId` | **Signers page** — list all registered signers with weights |
 | `GET /activity/:docId` | **Activity page** — agent activity log |
@@ -413,7 +348,6 @@ Agent auto-proposes rebalance when any single chain holds >80% of total USD port
 - **Yellow Network** — "State Channels · Off-chain gasless ytest.usd payments · NitroRPC/0.4"
 - **Arc + Circle** — "USDC Treasury · Dev wallets + CCTP bridge · Chain 5042002"
 - **Sui DeepBook V3** — "CLOB Trading · Limit, market, stop-loss · PTB Orders"
-- **ENS Policy** — "Governance · On-chain spend limits · Text Records"
 
 ### Treasury Flow Diagram (in dashboard)
 
@@ -430,7 +364,7 @@ SQLite with WAL mode. **15 tables**:
 
 | Table | Purpose |
 |-------|---------|
-| `docs` | Tracked Google Docs (doc_id, name, evm_address, sui_address, ens_name) |
+| `docs` | Tracked Google Docs (doc_id, name, evm_address, sui_address) |
 | `secrets` | AES-encrypted wallet private keys |
 | `commands` | All parsed commands with status, tx digests, result/error text |
 | `doc_settings` | Per-doc quorum settings |
@@ -560,11 +494,6 @@ All config via environment variables (`.env`), validated with **Zod**:
 | `WALLETCONNECT_PROJECT_ID` | — | WalletConnect Cloud project ID (required when enabled) |
 | `WALLETCONNECT_RELAY_URL` | — | Custom relay URL |
 
-### ENS
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ENS_RPC_URL` | — | Ethereum RPC for ENS resolution |
-
 ### Zod Cross-Field Validation
 - `YELLOW_RPC_URL` required when `YELLOW_ENABLED=1`
 - `SUI_RPC_URL` required when `DEEPBOOK_ENABLED=1`
@@ -581,7 +510,7 @@ Each Google Doc contains these tables (auto-synced by the agent):
 
 | Table | Purpose |
 |-------|---------|
-| **Config** | Key-value settings (DOC_ID, WEB_BASE_URL, QUORUM, ENS_NAME, POLICY_SOURCE, DOC_CELL_APPROVALS, AGENT_AUTOPROPOSE, SIGNER_APPROVAL_GAS_PAID) |
+| **Config** | Key-value settings (DOC_ID, WEB_BASE_URL, QUORUM, DOC_CELL_APPROVALS, AGENT_AUTOPROPOSE, SIGNER_APPROVAL_GAS_PAID) |
 | **Commands** | `DW <command>` rows with status, result, and approval tracking |
 | **Balances** | Live cross-chain balances (Sui SUI, Sui DBUSDC, Arc Native, Arc USDC, Circle USDC, Yellow ytest.usd, Total USD) |
 | **Audit Log** | Timestamped record of all executed commands and results |
@@ -613,15 +542,18 @@ Encryption: `AES-256-CBC` with the master key (via Node.js `crypto` module + `no
 
 ## 🧪 Test Suite
 
-**174 tests** across 5 test files — all passing ✅
+**196 tests** across 8 test files — all passing ✅
 
 | Test File | Tests | Coverage |
 |-----------|:-----:|----------|
-| `test/commands-full.test.ts` | 153 | All 36 command types + NLP auto-detect + edge cases |
+| `test/commands-full.test.ts` | 150 | All 35 command types + NLP auto-detect + edge cases |
 | `test/commands.test.ts` | 6 | Core parsing fundamentals |
-| `test/policy.test.ts` | 11 | ENS policy evaluation for all command types (including REBALANCE, BRIDGE, YELLOW_SEND) |
+| `test/policy.test.ts` | 11 | Policy evaluation for all command types (including REBALANCE, BRIDGE, YELLOW_SEND) |
 | `test/repo-metrics.test.ts` | 2 | Database metrics and trade stats |
 | `test/state.test.ts` | 2 | Command status state machine transitions |
+| `test/deepbook-route.test.ts` | — | DeepBook routing tests |
+| `test/sui-faucet.test.ts` | — | Sui faucet integration tests |
+| `test/one-phrase.test.ts` | — | One-phrase NLP tests |
 
 ### Running Tests
 
@@ -631,9 +563,9 @@ npm run test:watch   # Watch mode
 ```
 
 ### What's Tested
-- ✅ All 36 command parsers (valid + invalid inputs)
+- ✅ All 35 command parsers (valid + invalid inputs)
 - ✅ NLP auto-detect for 20+ natural language patterns
-- ✅ Policy enforcement: `maxNotionalUsdc`, `dailyLimitUsdc`, `maxSingleTxUsdc`, `allowedPairs`, `payoutAllowlist`, `denyCommands`, `bridgeAllowed`, `allowedChains`, `schedulingAllowed`
+- ✅ Policy evaluation: `maxNotionalUsdc`, `dailyLimitUsdc`, `maxSingleTxUsdc`, `allowedPairs`, `payoutAllowlist`, `denyCommands`, `bridgeAllowed`, `allowedChains`, `schedulingAllowed`
 - ✅ YELLOW_SEND accepts USDC, ytest.usd, and USD
 - ✅ REBALANCE valid routes (arc/sui/yellow) and invalid chain rejection
 - ✅ PAYOUT_SPLIT percentage validation (must sum to 100)
@@ -699,7 +631,7 @@ Open `http://localhost:8787` — integration cards, treasury flow diagram, appro
 ### Prerequisites
 - Node.js 20+
 - Google Cloud service account with Docs + Drive API enabled
-- (Optional) Circle API key, Yellow testnet access, Sui RPC, ENS RPC
+- (Optional) Circle API key, Yellow testnet access, Sui RPC
 
 ### Install & Run
 
@@ -730,8 +662,8 @@ FrankyDocs/
 │   ├── engine.ts                # Core engine — 8 tick loops, 36 command handlers, agent AI (2522 lines)
 │   ├── server.ts                # HTTP server — dashboard, join/approval UI, API endpoints (1506 lines)
 │   ├── core/
-│   │   ├── commands.ts          # 36 command parsers + NLP auto-detect (702 lines)
-│   │   ├── policy.ts            # ENS policy evaluation for all command types (180 lines)
+│   │   ├── commands.ts          # 35 command parsers + NLP auto-detect (702 lines)
+│   │   ├── policy.ts            # Policy evaluation for all command types (180 lines)
 │   │   └── state.ts             # Command status state machine
 │   ├── db/
 │   │   ├── schema.ts            # SQLite schema — 15 tables, WAL mode (207 lines)
@@ -747,7 +679,6 @@ FrankyDocs/
 │   │   ├── arc.ts               # Arc L1 EVM client (140 lines)
 │   │   ├── circle.ts            # Circle developer-controlled wallets + CCTP (239 lines)
 │   │   ├── deepbook.ts          # DeepBook V3 Sui CLOB client (526 lines)
-│   │   ├── ens.ts               # ENS policy resolver with caching (45 lines)
 │   │   ├── walletconnect.ts     # WalletConnect v2 service (212 lines)
 │   │   └── yellow.ts            # Yellow NitroRPC/0.4 client (403 lines)
 │   ├── tools/
@@ -789,7 +720,7 @@ FrankyDocs/
 | Package | Version | Purpose |
 |---------|---------|---------|
 | `googleapis` | ^140.0.0 | Google Docs + Drive API |
-| `viem` | ^2.21.30 | EVM wallets, ENS, signing, Arc transactions |
+| `viem` | ^2.21.30 | EVM wallets, signing, Arc transactions |
 | `@mysten/sui` | ^1.28.0 | Sui blockchain client |
 | `@mysten/deepbook-v3` | ^0.16.1 | DeepBook V3 CLOB SDK |
 | `@circle-fin/developer-controlled-wallets` | ^2.0.0 | Circle wallet + CCTP bridge SDK |

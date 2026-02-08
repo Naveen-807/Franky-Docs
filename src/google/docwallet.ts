@@ -15,6 +15,7 @@ import {
   DOCWALLET_COMMANDS_ANCHOR,
   DOCWALLET_CONFIG_ANCHOR,
   DOCWALLET_OPEN_ORDERS_ANCHOR,
+  DOCWALLET_PAYOUT_RULES_ANCHOR,
   DOCWALLET_RECENT_ACTIVITY_ANCHOR,
   DOCWALLET_SESSIONS_ANCHOR,
   ensureDocWalletTemplate
@@ -625,6 +626,94 @@ export async function updateOpenOrdersTable(params: {
     if (!row) break;
     for (let c = 0; c < 7; c++) write(row, c, "");
   }
+
+  if (groups.length > 0) {
+    const requests = groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);
+    await batchUpdateDoc({ docs, docId, requests });
+  }
+}
+
+/* ═══ Payout Rules Table ═══ */
+
+export interface PayoutRuleRow {
+  rowIndex: number;
+  label: string;
+  recipient: string;
+  amountUsdc: string;
+  frequency: string;
+  nextRun: string;
+  lastTx: string;
+  status: string;
+}
+
+/**
+ * Read the Payout Rules table from the doc.
+ * Returns data rows only (skips header). Returns empty if table doesn't exist.
+ */
+export function readPayoutRulesTable(table: docs_v1.Schema$Table | null | undefined): PayoutRuleRow[] {
+  if (!table) return [];
+  const rows = table.tableRows ?? [];
+  const result: PayoutRuleRow[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const cells = rows[i]?.tableCells ?? [];
+    const label = cellText(cells[0]);
+    const recipient = cellText(cells[1]);
+    const amountUsdc = cellText(cells[2]);
+    const frequency = cellText(cells[3]);
+    const nextRun = cellText(cells[4]);
+    const lastTx = cellText(cells[5]);
+    const status = cellText(cells[6]);
+    if (!label && !recipient && !amountUsdc) continue; // empty row
+    result.push({ rowIndex: i, label, recipient, amountUsdc, frequency, nextRun, lastTx, status });
+  }
+  return result;
+}
+
+/**
+ * Load payout rules table from the doc (nullable — old docs may not have it).
+ */
+export async function loadPayoutRulesTable(params: {
+  docs: docs_v1.Docs;
+  docId: string;
+}): Promise<docs_v1.Schema$Table | null> {
+  const { docs, docId } = params;
+  try {
+    const doc = await getDoc(docs, docId);
+    const anchor = findAnchor(doc, DOCWALLET_PAYOUT_RULES_ANCHOR);
+    if (!anchor) return null;
+    const tableInfo = findNextTable(doc, anchor.elementIndex);
+    return tableInfo?.table ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Update specific cells in a payout rules row.
+ */
+export async function updatePayoutRulesRowCells(params: {
+  docs: docs_v1.Docs;
+  docId: string;
+  payoutRulesTable: docs_v1.Schema$Table;
+  rowIndex: number;
+  updates: { nextRun?: string; lastTx?: string; status?: string };
+}) {
+  const { docs, docId, payoutRulesTable, rowIndex, updates } = params;
+  const rows = payoutRulesTable.tableRows ?? [];
+  const row = rows[rowIndex];
+  if (!row) return;
+
+  const groups: Array<{ sortIndex: number; requests: docs_v1.Schema$Request[] }> = [];
+  const write = (col: number, value: string | undefined) => {
+    if (value === undefined) return;
+    const cell = row.tableCells?.[col];
+    if (!cell) return;
+    groups.push({ sortIndex: tableCellStartIndex(cell) ?? 0, requests: buildWriteCellRequests({ cell, text: value }) });
+  };
+
+  write(4, updates.nextRun);   // NEXT_RUN
+  write(5, updates.lastTx);    // LAST_TX
+  write(6, updates.status);    // STATUS
 
   if (groups.length > 0) {
     const requests = groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);

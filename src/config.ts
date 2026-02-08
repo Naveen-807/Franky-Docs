@@ -41,8 +41,7 @@ const EnvSchema = z.object({
   CIRCLE_ENTITY_SECRET: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   CIRCLE_WALLET_SET_ID: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   CIRCLE_BLOCKCHAIN: z.string().optional().default("ARC-TESTNET"),
-  CIRCLE_ACCOUNT_TYPE: z.string().optional().default("EOA"),
-  ENS_RPC_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
+  CIRCLE_ACCOUNT_TYPE: z.string().optional().default("SCA"),
   YELLOW_ENABLED: z.string().optional().default("0").pipe(BoolString),
   YELLOW_RPC_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   YELLOW_WS_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
@@ -52,7 +51,9 @@ const EnvSchema = z.object({
   WALLETCONNECT_PROJECT_ID: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   WALLETCONNECT_RELAY_URL: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
   BALANCE_POLL_INTERVAL_MS: z.string().optional().default("60000").pipe(NumberString),
-  SCHEDULER_INTERVAL_MS: z.string().optional().default("30000").pipe(NumberString)
+  SCHEDULER_INTERVAL_MS: z.string().optional().default("30000").pipe(NumberString),
+  DEMO_MODE: z.string().optional().default("1").pipe(BoolString),
+  SUI_FAUCET_URL: z.string().optional().default("https://faucet.testnet.sui.io/v1/gas"),
 }).superRefine((env, ctx) => {
   if (env.YELLOW_ENABLED && !env.YELLOW_RPC_URL) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["YELLOW_RPC_URL"], message: "Required when YELLOW_ENABLED=1" });

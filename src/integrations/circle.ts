@@ -110,13 +110,27 @@ export class CircleArcClient {
     const tokenId = await this.resolveUsdcTokenId(params.walletId);
     const amount = [String(params.amountUsdc)];
 
-    const createRes = await this.client.createTransaction({
-      walletId: params.walletId,
-      tokenId,
-      destinationAddress: params.destinationAddress,
-      amount,
-      fee: { type: "level" as any, config: { feeLevel: "MEDIUM" as any } }
-    });
+    let createRes: any;
+    try {
+      createRes = await this.client.createTransaction({
+        walletId: params.walletId,
+        tokenId,
+        destinationAddress: params.destinationAddress,
+        amount,
+        fee: { type: "level" as any, config: { feeLevel: "MEDIUM" as any } }
+      });
+    } catch (e) {
+      // Retry once after 2s for transient failures
+      console.warn(`[Circle] createTransaction failed, retrying in 2s:`, (e as Error).message);
+      await sleep(2000);
+      createRes = await this.client.createTransaction({
+        walletId: params.walletId,
+        tokenId,
+        destinationAddress: params.destinationAddress,
+        amount,
+        fee: { type: "level" as any, config: { feeLevel: "MEDIUM" as any } }
+      });
+    }
 
     const tx = createRes?.data;
     const id = (tx as any)?.id ?? (tx as any)?.transaction?.id;
@@ -184,6 +198,7 @@ export class CircleArcClient {
       arc: "ARC-TESTNET", "arc-testnet": "ARC-TESTNET",
       eth: "ETH-SEPOLIA", ethereum: "ETH-SEPOLIA", sepolia: "ETH-SEPOLIA",
       polygon: "MATIC-AMOY", matic: "MATIC-AMOY",
+      arbitrum: "ARB-SEPOLIA", arb: "ARB-SEPOLIA",
       avax: "AVAX-FUJI", avalanche: "AVAX-FUJI",
       sol: "SOL-DEVNET", solana: "SOL-DEVNET",
       sui: "SUI-TESTNET"

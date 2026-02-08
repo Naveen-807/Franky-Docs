@@ -20,6 +20,7 @@ type ServerDeps = {
   yellowApplicationName?: string;
   yellowAsset?: string;
   walletconnect?: WalletConnectService;
+  demoMode?: boolean;
 };
 
 type Session = { docId: string; signerAddress: `0x${string}`; createdAt: number };
@@ -51,8 +52,6 @@ export function startServer(deps: ServerDeps) {
           ? docs.map((d) => {
               const name = escapeHtml(d.name ?? d.doc_id);
               const shortId = d.doc_id.length > 20 ? d.doc_id.slice(0, 20) + "…" : d.doc_id;
-              const joinUrl = `${deps.publicBaseUrl}/join/${encodeURIComponent(d.doc_id)}`;
-              const signersUrl = `${deps.publicBaseUrl}/signers/${encodeURIComponent(d.doc_id)}`;
               const activityUrl = `${deps.publicBaseUrl}/activity/${encodeURIComponent(d.doc_id)}`;
               const sessionsUrl = `${deps.publicBaseUrl}/sessions/${encodeURIComponent(d.doc_id)}`;
               return `<div class="card" style="margin-bottom:14px">
@@ -64,9 +63,7 @@ export function startServer(deps: ServerDeps) {
     <span class="badge badge-green">● Active</span>
   </div>
   <div class="row">
-    <a href="${joinUrl}" class="btn btn-primary btn-sm">Join</a>
-    <a href="${signersUrl}" class="btn btn-outline btn-sm">Signers</a>
-    <a href="${activityUrl}" class="btn btn-ghost btn-sm">Activity</a>
+    <a href="${activityUrl}" class="btn btn-primary btn-sm">Activity</a>
     <a href="${sessionsUrl}" class="btn btn-ghost btn-sm">Sessions</a>
   </div>
 </div>`;
@@ -104,12 +101,6 @@ export function startServer(deps: ServerDeps) {
     <div class="card-meta">Limit, market, stop-loss</div>
     <div class="badge badge-ok" style="margin-top:6px">PTB Orders</div>
   </div>
-  <div class="card mini" style="border-left:3px solid #5298FF">
-    <div class="kpi-label">ENS Policy</div>
-    <div style="font-size:.95rem;font-weight:600;color:var(--gray-900)">Governance</div>
-    <div class="card-meta">On-chain spend limits</div>
-    <div class="badge badge-ok" style="margin-top:6px">Text Records</div>
-  </div>
 </div>
 
 <div class="card" style="margin-bottom:20px;border:2px solid #e2e8f0;background:linear-gradient(135deg,#f8fafc 0%,#f1f5f9 100%)">
@@ -142,26 +133,38 @@ export function startServer(deps: ServerDeps) {
   </div>
 </div>
 
+<div class="card" style="margin-bottom:20px;border:2px solid #e8f5e9;background:linear-gradient(135deg,#f1f8e9 0%,#e8f5e9 100%)">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+    <span style="font-size:1.3rem">🔒</span>
+    <div style="font-weight:700;font-size:1.05rem;color:var(--gray-900)">Wallet Abstraction — No Extensions Needed</div>
+    <span class="badge badge-green" style="margin-left:auto">Circle SCA</span>
+  </div>
+  <div style="font-size:.88rem;color:var(--gray-700);line-height:1.6">
+    This treasury uses <strong>Circle developer-controlled wallets</strong> (Smart Contract Accounts). No browser extension or seed phrase needed.
+    Your funds are secured by Circle's enterprise infrastructure with built-in gasless transactions.
+  </div>
+</div>
+
 <div class="card" style="margin-bottom:20px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#fff;border:none">
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
     <span style="font-size:1.5rem">🌟</span>
     <div>
       <div style="font-weight:700;font-size:1.1rem">How It Works</div>
-      <div style="opacity:.8;font-size:.88rem">Type commands in a Google Doc → Approve via MetaMask → Execute on-chain</div>
+      <div style="opacity:.8;font-size:.88rem">Type commands in a Google Doc → Approve with one click → Execute on-chain</div>
     </div>
   </div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
     <div style="background:rgba(255,255,255,.08);border-radius:8px;padding:10px 14px">
-      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Proposers</div>
-      <div style="font-size:.9rem;margin-top:2px">No wallet needed — just type in the Doc</div>
+      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Step 1</div>
+      <div style="font-size:.9rem;margin-top:2px">Type a command in the Google Doc — no wallet needed</div>
     </div>
     <div style="background:rgba(255,255,255,.08);border-radius:8px;padding:10px 14px">
-      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Approvers</div>
-      <div style="font-size:.9rem;margin-top:2px">Sign once via Yellow session keys (gasless)</div>
+      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Step 2</div>
+      <div style="font-size:.9rem;margin-top:2px">Commands auto-execute — wallets created on first use</div>
     </div>
     <div style="background:rgba(255,255,255,.08);border-radius:8px;padding:10px 14px">
-      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Agent</div>
-      <div style="font-size:.9rem;margin-top:2px">Auto-proposes, monitors risk, sweeps yield</div>
+      <div style="font-size:.75rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Step 3</div>
+      <div style="font-size:.9rem;margin-top:2px">Results written back to the Doc — balances auto-refresh</div>
     </div>
   </div>
 </div>
@@ -193,7 +196,6 @@ ${rows}`
             name: d.name,
             evmAddress: d.evm_address,
             suiAddress: d.sui_address,
-            ensName: d.ens_name,
             integrations: {
               yellow: {
                 enabled: !!deps.yellow,
@@ -216,10 +218,6 @@ ${rows}`
                   ? ((cachedPrice.ask - cachedPrice.bid) / cachedPrice.mid_price * 100)
                   : null
               },
-              ens: {
-                policySource: d.policy_source ?? "NONE",
-                ensName: d.ens_name ?? null
-              }
             },
             signers: signers.length,
             quorum,
@@ -303,210 +301,93 @@ ${rows}`
         });
       }
 
+      // Legacy join/signers routes redirect to activity
       const joinMatch = matchPath(url.pathname, ["join", ":docId"]);
       if (req.method === "GET" && joinMatch) {
         const docId = decodeURIComponent(joinMatch.docId);
-        return sendHtml(res, "Join", joinPageHtml({ docId }));
+        res.writeHead(302, { Location: `/activity/${encodeURIComponent(docId)}` });
+        res.end();
+        return;
       }
-
       const signersMatch = matchPath(url.pathname, ["signers", ":docId"]);
       if (req.method === "GET" && signersMatch) {
         const docId = decodeURIComponent(signersMatch.docId);
-        const quorum = deps.repo.getDocQuorum(docId);
-        const signers = deps.repo.listSigners(docId);
-        const rows = signers.length > 0
-          ? signers.map((s) =>
-              `<tr><td><code>${escapeHtml(s.address)}</code></td><td style="font-weight:600;text-align:center">${s.weight}</td></tr>`
-            ).join("\n")
-          : `<tr><td colspan="2" class="card-meta" style="text-align:center;padding:24px">No signers registered yet</td></tr>`;
-        const totalWeight = signers.reduce((sum, s) => sum + s.weight, 0);
-        return sendHtml(
-          res,
-          "Signers",
-          `<div class="spacer-sm"></div>
-<div class="card">
-  <div class="card-header">
-    <div>
-      <h1>Signers</h1>
-      <div class="card-meta">Multi-sig signer roster for this treasury doc</div>
-    </div>
-    <span class="badge badge-blue">${signers.length} Signer${signers.length !== 1 ? "s" : ""}</span>
-  </div>
-  <div style="background:var(--gray-50);border-radius:var(--radius-sm);padding:8px 14px;margin-bottom:16px">
-    <span class="card-meta">Document:</span> <code>${escapeHtml(docId)}</code>
-  </div>
-  <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:18px">
-    <div class="card mini" style="border-left:3px solid var(--primary)">
-      <div class="kpi-label">Quorum Required</div>
-      <div class="kpi">${quorum}</div>
-    </div>
-    <div class="card mini" style="border-left:3px solid var(--success)">
-      <div class="kpi-label">Total Weight</div>
-      <div class="kpi">${totalWeight}</div>
-    </div>
-  </div>
-  <table><thead><tr><th>Address</th><th style="text-align:center;width:100px">Weight</th></tr></thead><tbody>${rows}</tbody></table>
-</div>`
-        );
+        res.writeHead(302, { Location: `/activity/${encodeURIComponent(docId)}` });
+        res.end();
+        return;
       }
 
       const cmdMatch = matchPath(url.pathname, ["cmd", ":docId", ":cmdId"]);
       if (req.method === "GET" && cmdMatch) {
         const docId = decodeURIComponent(cmdMatch.docId);
         const cmdId = decodeURIComponent(cmdMatch.cmdId);
-        const session = getSession(req, sessions);
-        if (!session || session.docId !== docId) return sendHtml(res, "Not signed in", notSignedInHtml({ docId }));
 
         const cmd = deps.repo.getCommand(cmdId);
         if (!cmd || cmd.doc_id !== docId) return sendHtml(res, "Not found", `<h1>Command not found</h1>`);
 
-        return sendHtml(res, `Command ${cmdId}`, cmdPageHtml({ docId, cmdId, signerAddress: session.signerAddress, raw: cmd.raw_command, status: cmd.status }));
+        return sendHtml(res, `Command ${cmdId}`, cmdPageHtml({ docId, cmdId, signerAddress: "", raw: cmd.raw_command, status: cmd.status }));
       }
 
-      if (req.method === "POST" && url.pathname === "/api/join/start") {
+      // Legacy join/auth endpoints — single-user mode, no external signers needed
+      if (req.method === "POST" && (url.pathname === "/api/join/start" || url.pathname === "/api/join/finish" || url.pathname === "/api/quick-auth")) {
+        return sendJson(res, 410, { ok: false, error: "FrankyDocs runs in single-user mode. Approve commands directly in the Google Doc by setting STATUS to APPROVED." });
+      }
+
+      // --- Demo approve: one-click approval without wallet (demo mode only) ---
+      if (req.method === "POST" && url.pathname === "/api/cmd/demo-approve") {
         const body = await readJsonBody(req);
         const docId = String(body.docId ?? "");
-        const address = String(body.address ?? "").toLowerCase();
-        const weight = Number(body.weight ?? 1);
+        const cmdId = String(body.cmdId ?? "");
+        if (!docId || !cmdId) return sendJson(res, 400, { ok: false, error: "Missing docId/cmdId" });
+        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Demo mode is not enabled" });
 
-        if (!docId) return sendJson(res, 400, { ok: false, error: "Missing docId" });
-        if (!/^0x[0-9a-f]{40}$/.test(address)) return sendJson(res, 400, { ok: false, error: "Invalid address" });
-        if (!Number.isFinite(weight) || weight <= 0 || Math.floor(weight) !== weight) return sendJson(res, 400, { ok: false, error: "Invalid weight" });
+        const cmd = deps.repo.getCommand(cmdId);
+        if (!cmd || cmd.doc_id !== docId) return sendJson(res, 404, { ok: false, error: "Command not found" });
+        if (cmd.status !== "PENDING_APPROVAL") return sendJson(res, 409, { ok: false, error: `Already ${cmd.status}` });
 
-        // If Yellow is enabled, require real delegated session key authorization (no stubs).
-        if (deps.yellow) {
-          const application = String(deps.yellowApplicationName ?? "DocWallet");
-          const scope = "app.create,app.submit,transfer";
-          const yellowAsset = deps.yellowAsset ?? "ytest.usd";
-          const allowances: Array<{ asset: string; amount: string }> = [
-            { asset: yellowAsset, amount: "1000000000" }
-          ];
-          const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
-
-          const sk = generateEvmWallet();
-          const out = await deps.yellow.authRequest({
-            address: address as `0x${string}`,
-            sessionKeyAddress: sk.address,
-            application,
-            scope,
-            allowances,
-            expiresAt
-          });
-          const challengeMessage = String(out?.challenge_message ?? out?.challengeMessage ?? out?.challenge ?? "");
-          if (!challengeMessage) return sendJson(res, 502, { ok: false, error: `Yellow auth_request missing challenge_message` });
-
-          const joinToken = randomToken();
-          pendingYellowJoins.set(joinToken, {
-            docId,
-            address: address as `0x${string}`,
-            weight,
-            sessionKeyAddress: sk.address,
-            sessionKeyPrivateKeyHex: sk.privateKeyHex,
-            application,
-            scope,
-            allowances,
-            expiresAt,
-            challengeMessage,
-            createdAt: Date.now()
-          });
-
-          const typedData = yellowPolicyTypedData({
-            application,
-            challenge: challengeMessage,
-            scope,
-            wallet: address as `0x${string}`,
-            sessionKey: sk.address,
-            expiresAt,
-            allowances
-          });
-
-          return sendJson(res, 200, {
-            ok: true,
-            mode: "yellow",
-            joinToken,
-            sessionKeyAddress: sk.address,
-            typedData
-          });
-        }
-
-        // No Yellow: basic join uses personal_sign.
-        const nonce = randomToken().slice(0, 8);
-        const message = `FrankyDocs join\\nDocId: ${docId}\\nAddress: ${address}\\nWeight: ${weight}\\nNonce: ${nonce}`;
-        return sendJson(res, 200, { ok: true, mode: "basic", message });
+        deps.repo.setCommandStatus(cmdId, "APPROVED", { errorText: null });
+        await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "APPROVED", error: "", result: "Demo-approved (no wallet)" } });
+        await bestEffortAudit(deps.docs, docId, `${cmdId} APPROVED (demo-mode, no wallet)`);
+        return sendJson(res, 200, { ok: true, status: "APPROVED" });
       }
 
-      if (req.method === "POST" && url.pathname === "/api/join/finish") {
+      // --- Demo reject: one-click rejection without wallet (demo mode only) ---
+      if (req.method === "POST" && url.pathname === "/api/cmd/demo-reject") {
         const body = await readJsonBody(req);
-        const mode = String(body.mode ?? "");
-        if (mode !== "yellow" && mode !== "basic") return sendJson(res, 400, { ok: false, error: "Invalid mode" });
+        const docId = String(body.docId ?? "");
+        const cmdId = String(body.cmdId ?? "");
+        if (!docId || !cmdId) return sendJson(res, 400, { ok: false, error: "Missing docId/cmdId" });
+        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Demo mode is not enabled" });
 
-        if (mode === "basic") {
-          const docId = String(body.docId ?? "");
-          const address = String(body.address ?? "").toLowerCase();
-          const weight = Number(body.weight ?? 1);
-          const message = String(body.message ?? "");
-          const signature = String(body.signature ?? "");
+        const cmd = deps.repo.getCommand(cmdId);
+        if (!cmd || cmd.doc_id !== docId) return sendJson(res, 404, { ok: false, error: "Command not found" });
+        if (cmd.status !== "PENDING_APPROVAL") return sendJson(res, 409, { ok: false, error: `Already ${cmd.status}` });
 
-          if (!docId) return sendJson(res, 400, { ok: false, error: "Missing docId" });
-          if (!/^0x[0-9a-f]{40}$/.test(address)) return sendJson(res, 400, { ok: false, error: "Invalid address" });
-          if (!Number.isFinite(weight) || weight <= 0 || Math.floor(weight) !== weight) return sendJson(res, 400, { ok: false, error: "Invalid weight" });
-          if (!message || !signature) return sendJson(res, 400, { ok: false, error: "Missing signature" });
-
-          const recovered = await recoverMessageAddress({ message, signature: signature as `0x${string}` });
-          if (recovered.toLowerCase() !== address) return sendJson(res, 401, { ok: false, error: "Bad signature" });
-
-          deps.repo.upsertSigner({ docId, address, weight });
-          const token = randomToken();
-          sessions.set(token, { docId, signerAddress: address as `0x${string}`, createdAt: Date.now() });
-          setCookie(res, "dw_session", token);
-          await bestEffortSyncSignersToDoc({ docs: deps.docs, repo: deps.repo, docId });
-          return sendJson(res, 200, { ok: true, signerAddress: address });
-        }
-
-        // Yellow mode
-        if (!deps.yellow) return sendJson(res, 400, { ok: false, error: "Yellow is not enabled on this agent" });
-        const joinToken = String(body.joinToken ?? "");
-        const signature = String(body.signature ?? "");
-        if (!joinToken || !signature) return sendJson(res, 400, { ok: false, error: "Missing joinToken/signature" });
-
-        const pending = pendingYellowJoins.get(joinToken);
-        if (!pending) return sendJson(res, 404, { ok: false, error: "Join session expired. Reload /join and try again." });
-
-        // Expire pending joins after 10 minutes.
-        if (Date.now() - pending.createdAt > 10 * 60 * 1000) {
-          pendingYellowJoins.delete(joinToken);
-          return sendJson(res, 410, { ok: false, error: "Join session expired. Reload /join and try again." });
-        }
-
-        const verified = await deps.yellow.authVerify({ signature: signature as `0x${string}`, challengeMessage: pending.challengeMessage });
-        const jwtToken = verified?.jwt_token ?? verified?.jwtToken ?? null;
-
-        deps.repo.upsertSigner({ docId: pending.docId, address: pending.address, weight: pending.weight });
-        const encrypted = encryptWithMasterKey({
-          masterKey: deps.masterKey,
-          plaintext: Buffer.from(JSON.stringify({ privateKeyHex: pending.sessionKeyPrivateKeyHex }), "utf8")
-        });
-        deps.repo.upsertYellowSessionKey({
-          docId: pending.docId,
-          signerAddress: pending.address,
-          sessionKeyAddress: pending.sessionKeyAddress,
-          encryptedSessionKeyPrivate: encrypted,
-          expiresAt: pending.expiresAt,
-          allowancesJson: JSON.stringify({ scope: pending.scope, allowances: pending.allowances }),
-          jwtToken: jwtToken ? String(jwtToken) : null
-        });
-
-        // Cookie session for approvals
-        const token = randomToken();
-        sessions.set(token, { docId: pending.docId, signerAddress: pending.address, createdAt: Date.now() });
-        setCookie(res, "dw_session", token);
-
-        pendingYellowJoins.delete(joinToken);
-
-        await bestEffortSyncSignersToDoc({ docs: deps.docs, repo: deps.repo, docId: pending.docId });
-        return sendJson(res, 200, { ok: true, signerAddress: pending.address, sessionKeyAddress: pending.sessionKeyAddress });
+        deps.repo.setCommandStatus(cmdId, "REJECTED", { errorText: "Rejected (demo mode)" });
+        await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "REJECTED", error: "Rejected by user", result: "" } });
+        await bestEffortAudit(deps.docs, docId, `${cmdId} REJECTED (demo-mode)`);
+        return sendJson(res, 200, { ok: true, status: "REJECTED" });
       }
 
+      // --- Bulk approve all PENDING_APPROVAL commands for a doc (demo mode) ---
+      if (req.method === "POST" && url.pathname === "/api/cmd/demo-approve-all") {
+        const body = await readJsonBody(req);
+        const docId = String(body.docId ?? "");
+        if (!docId) return sendJson(res, 400, { ok: false, error: "Missing docId" });
+        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Demo mode is not enabled" });
+
+        const cmds = deps.repo.listRecentCommands(docId, 100).filter(c => c.status === "PENDING_APPROVAL");
+        let approved = 0;
+        for (const cmd of cmds) {
+          deps.repo.setCommandStatus(cmd.cmd_id, "APPROVED", { errorText: null });
+          await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId: cmd.cmd_id, updates: { status: "APPROVED", error: "", result: "Demo-approved" } });
+          approved++;
+        }
+        await bestEffortAudit(deps.docs, docId, `DEMO_APPROVE_ALL: ${approved} commands approved`);
+        return sendJson(res, 200, { ok: true, approved, total: cmds.length });
+      }
+
+      // Single-user decision endpoint — no signer session required
       if (req.method === "POST" && url.pathname === "/api/cmd/decision") {
         const body = await readJsonBody(req);
         const docId = String(body.docId ?? "");
@@ -515,112 +396,58 @@ ${rows}`
         if (!docId || !cmdId) return sendJson(res, 400, { ok: false, error: "Missing docId/cmdId" });
         if (decision !== "APPROVE" && decision !== "REJECT") return sendJson(res, 400, { ok: false, error: "Invalid decision" });
 
-        const session = getSession(req, sessions);
-        if (!session || session.docId !== docId) return sendJson(res, 401, { ok: false, error: "Not signed in for this doc" });
-
         const cmd = deps.repo.getCommand(cmdId);
         if (!cmd || cmd.doc_id !== docId) return sendJson(res, 404, { ok: false, error: "Command not found" });
-
         if (cmd.status !== "PENDING_APPROVAL") return sendJson(res, 409, { ok: false, error: `Cannot decide when status=${cmd.status}` });
-
-        const priorDecision = deps.repo.getCommandApprovalDecision({ docId, cmdId, signerAddress: session.signerAddress });
-        deps.repo.recordCommandApproval({ docId, cmdId, signerAddress: session.signerAddress, decision: decision as "APPROVE" | "REJECT" });
-
-        if (decision === "APPROVE" && priorDecision?.decision !== "APPROVE") {
-          deps.repo.incrementDocCounter(docId, "approvals_total", 1);
-          deps.repo.incrementDocCounter(docId, "approval_tx_avoided", 1);
-          deps.repo.setDocConfig(docId, "last_approval", `${new Date().toISOString()} ${session.signerAddress}`);
-          await bestEffortSyncMetricsToDoc({ docs: deps.docs, repo: deps.repo, docId });
-        }
 
         if (decision === "REJECT") {
           deps.repo.setCommandStatus(cmdId, "REJECTED", { errorText: null });
-          await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "REJECTED", error: "" } });
-          await bestEffortAudit(deps.docs, docId, `${cmdId} REJECTED by ${session.signerAddress}`);
-          const wcReq = deps.repo.getWalletConnectRequestByCmdId(cmdId);
-          if (wcReq) {
-            deps.repo.setWalletConnectRequestStatus({ topic: wcReq.topic, requestId: wcReq.request_id, status: "REJECTED" });
-            if (deps.walletconnect) {
-              await deps.walletconnect.respondError(wcReq.topic, wcReq.request_id, "Rejected by quorum");
-            }
-          }
-          deps.repo.clearCommandApprovals({ docId, cmdId });
+          await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "REJECTED", error: "Rejected by owner" } });
+          await bestEffortAudit(deps.docs, docId, `${cmdId} REJECTED by owner`);
           return sendJson(res, 200, { ok: true, status: "REJECTED" });
         }
 
-        const quorum = deps.repo.getDocQuorum(docId);
-        const signers = deps.repo.listSigners(docId);
-        const weights = new Map(signers.map((s) => [s.address.toLowerCase(), s.weight]));
-        const approvals = deps.repo.listCommandApprovals({ docId, cmdId }).filter((a) => a.decision === "APPROVE");
-        const approvedWeight = approvals.reduce((sum, a) => sum + (weights.get(a.signer_address.toLowerCase()) ?? 0), 0);
+        // APPROVE — single-user, no quorum check needed
+        deps.repo.incrementDocCounter(docId, "approvals_total", 1);
+        deps.repo.incrementDocCounter(docId, "approval_tx_avoided", 1);
+        deps.repo.setDocConfig(docId, "last_approval", new Date().toISOString());
+        try { await bestEffortSyncMetricsToDoc({ docs: deps.docs, repo: deps.repo, docId }); } catch { /* best effort */ }
 
-        const approvedBy = approvals.filter((a) => a.decision === "APPROVE").map((a) => a.signer_address);
-        await bestEffortUpdateCommandRow({
-          docs: deps.docs,
-          docId,
-          cmdId,
-          updates: { result: `Approvals=${approvedWeight}/${quorum}` }
-        });
+        const approvalTxAvoided = deps.repo.getDocCounter(docId, "approval_tx_avoided");
+        const gasPerApproval = Number(deps.repo.getDocConfig(docId, "signer_approval_gas_paid") ?? "0.003");
+        const gasSavedEth = ((approvalTxAvoided) * gasPerApproval).toFixed(4);
+        let finalResult = `Owner-approved · Gasless (saved ~${gasSavedEth} ETH)`;
 
-        if (approvedWeight >= quorum) {
-          // If Yellow is enabled, it is the source-of-truth for approvals (no silent fallbacks).
-          const yellow = deps.yellow;
-          const yellowSession = deps.repo.getYellowSession(docId);
-          const parsed = safeParseParsedJson(cmd.parsed_json);
-          const isSessionCreate = parsed?.type === "SESSION_CREATE";
-
-          if (yellow && !yellowSession && !isSessionCreate) {
-            return sendJson(res, 409, { ok: false, error: "Yellow session not created. Run DW SESSION_CREATE first." });
-          }
-
-          let finalResult = `Approvals=${approvedWeight}/${quorum} ApprovedBy=${formatApproverList(approvedBy)} Gasless=YES`;
-          if (yellow && yellowSession && !isSessionCreate) {
-            const payload = { docId, cmdId, command: cmd.raw_command, ts: Date.now(), approvals: approvals.map((a) => a.signer_address) };
-            const sessionData = keccak256(new TextEncoder().encode(JSON.stringify(payload)));
-
-            const signerPrivateKeysHex: Array<`0x${string}`> = [];
-            for (const a of approvals) {
-              const keyRow = deps.repo.getYellowSessionKey({ docId, signerAddress: a.signer_address });
-              if (!keyRow) return sendJson(res, 409, { ok: false, error: `Missing Yellow session key for signer ${a.signer_address}. Re-join via /join/<docId>.` });
-              if (keyRow.expires_at <= Date.now()) return sendJson(res, 409, { ok: false, error: `Expired Yellow session key for signer ${a.signer_address}. Re-join via /join/<docId>.` });
-              const plain = decryptWithMasterKey({ masterKey: deps.masterKey, blob: keyRow.encrypted_session_key_private });
-              const parsed = JSON.parse(plain.toString("utf8")) as { privateKeyHex: `0x${string}` };
-              signerPrivateKeysHex.push(parsed.privateKeyHex);
-            }
-
+        // Yellow gasless approval if session exists
+        const yellow = deps.yellow;
+        const yellowSession = deps.repo.getYellowSession(docId);
+        const parsed = safeParseParsedJson(cmd.parsed_json);
+        const isSessionCreate = parsed?.type === "SESSION_CREATE";
+        if (yellow && yellowSession && !isSessionCreate) {
+          try {
             const nextVersion = (yellowSession.version ?? 0) + 1;
-
-            // Load current allocations so the approval records real off-chain state
             const currentAllocations = JSON.parse(yellowSession.allocations_json || "[]");
-
-            const out = await yellow.submitAppState({
-              signerPrivateKeysHex,
+            const out = await yellow.submitGaslessApproval({
+              signerPrivateKeysHex: [],
               appSessionId: yellowSession.app_session_id,
               version: nextVersion,
-              intent: "operate",
-              sessionData,
+              cmdId,
+              command: cmd.raw_command,
+              approver: "owner",
               allocations: currentAllocations
             });
             deps.repo.setYellowSessionVersion({ docId, version: out.version, status: "OPEN" });
-
-            finalResult += ` YellowSession=${yellowSession.app_session_id} YellowV=${out.version}`;
-            await bestEffortAudit(deps.docs, docId, `${cmdId} Yellow submit_app_state v${out.version}`);
+            finalResult += ` · Yellow v${out.version}`;
+            await bestEffortAudit(deps.docs, docId, `${cmdId} Yellow gasless approval v${out.version}`);
+          } catch (e: any) {
+            console.warn(`[server] Yellow approval skipped: ${e.message}`);
           }
-
-          deps.repo.setCommandStatus(cmdId, "APPROVED", { errorText: null });
-          await bestEffortUpdateCommandRow({
-            docs: deps.docs,
-            docId,
-            cmdId,
-            updates: { status: "APPROVED", error: "", result: finalResult }
-          });
-          await bestEffortAudit(deps.docs, docId, `${cmdId} APPROVED (quorum ${approvedWeight}/${quorum})`);
-
-          deps.repo.clearCommandApprovals({ docId, cmdId });
-          return sendJson(res, 200, { ok: true, status: "APPROVED" });
         }
 
-        return sendJson(res, 200, { ok: true, status: "PENDING_APPROVAL", approvedWeight, quorum });
+        deps.repo.setCommandStatus(cmdId, "APPROVED", { errorText: null });
+        await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "APPROVED", error: "", result: finalResult } });
+        await bestEffortAudit(deps.docs, docId, `${cmdId} APPROVED by owner`);
+        return sendJson(res, 200, { ok: true, status: "APPROVED" });
       }
 
       // --- WalletConnect Session Management ---
@@ -707,32 +534,27 @@ ${rows}`
     }
   });
 
-  server.listen(deps.port);
+  server.listen(deps.port, () => {
+    console.log(`[http] listening on http://localhost:${deps.port}`);
+  });
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[http] Port ${deps.port} already in use — retrying in 3s…`);
+      setTimeout(() => {
+        server.close();
+        server.listen(deps.port);
+      }, 3_000);
+    } else {
+      console.error("[http] Server error:", err.message);
+    }
+  });
   return {
     url: deps.publicBaseUrl,
     close: () => new Promise<void>((resolve) => server.close(() => resolve()))
   };
 }
 
-async function bestEffortSyncSignersToDoc(params: { docs: docs_v1.Docs; repo: Repo; docId: string }) {
-  const { docs, repo, docId } = params;
-  try {
-    const tables = await loadDocWalletTables({ docs, docId });
-    const configMap = readConfig(tables.config.table);
-
-    const signers = repo.listSigners(docId).map((s) => s.address);
-    const quorum = repo.getDocQuorum(docId);
-
-    if (configMap["SIGNERS"]) {
-      await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "SIGNERS", value: signers.join(",") });
-    }
-    if (configMap["QUORUM"]) {
-      await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "QUORUM", value: String(quorum) });
-    }
-  } catch {
-    // ignore
-  }
-}
+// bestEffortSyncSignersToDoc removed — single-user mode, no external signers
 
 async function bestEffortUpdateCommandRow(params: {
   docs: docs_v1.Docs;
@@ -762,30 +584,24 @@ async function bestEffortAudit(docs: docs_v1.Docs, docId: string, message: strin
 
 async function bestEffortSyncMetricsToDoc(params: { docs: docs_v1.Docs; repo: Repo; docId: string }) {
   const { docs, repo, docId } = params;
+  // Helper: write one config value then reload to keep indices fresh
+  const safeWrite = async (key: string, value: string) => {
+    const t = await loadDocWalletTables({ docs, docId });
+    const cm = readConfig(t.config.table);
+    if (cm[key]) {
+      await writeConfigValue({ docs, docId, configTable: t.config.table, key, value });
+    }
+  };
   try {
-    const tables = await loadDocWalletTables({ docs, docId });
-    const configMap = readConfig(tables.config.table);
     const approvalsTotal = repo.getDocCounter(docId, "approvals_total");
     const approvalTxAvoided = repo.getDocCounter(docId, "approval_tx_avoided");
-    const gasPaid = repo.getDocConfig(docId, "signer_approval_gas_paid");
     const lastApproval = repo.getDocConfig(docId, "last_approval");
     const lastProposal = repo.getDocConfig(docId, "last_proposal");
 
-    if (configMap["APPROVALS_TOTAL"]) {
-      await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "APPROVALS_TOTAL", value: String(approvalsTotal) });
-    }
-    if (configMap["EST_APPROVAL_TX_AVOIDED"]) {
-      await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "EST_APPROVAL_TX_AVOIDED", value: String(approvalTxAvoided) });
-    }
-    if (gasPaid && configMap["SIGNER_APPROVAL_GAS_PAID"]) {
-      await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "SIGNER_APPROVAL_GAS_PAID", value: gasPaid });
-    }
-    if (lastApproval && configMap["LAST_APPROVAL"]) {
-      await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "LAST_APPROVAL", value: lastApproval });
-    }
-    if (lastProposal && configMap["LAST_PROPOSAL"]) {
-      await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "LAST_PROPOSAL", value: lastProposal });
-    }
+    await safeWrite("APPROVALS_TOTAL", String(approvalsTotal));
+    await safeWrite("EST_APPROVAL_TX_AVOIDED", String(approvalTxAvoided));
+    if (lastApproval) await safeWrite("LAST_APPROVAL", lastApproval);
+    if (lastProposal) await safeWrite("LAST_PROPOSAL", lastProposal);
   } catch {
     // ignore
   }
@@ -1028,88 +844,10 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
 }
 
-function joinPageHtml(params: { docId: string }): string {
-  const { docId } = params;
-  return `
-<div class="spacer-sm"></div>
-<div class="card">
-  <div class="card-header">
-    <div>
-      <h1>Join as Signer</h1>
-      <div class="card-meta">Connect your wallet to become a multi-sig signer</div>
-    </div>
-    <span class="badge badge-blue">Onboarding</span>
-  </div>
-
-  <div style="background:var(--gray-50);border-radius:var(--radius-sm);padding:14px 16px;margin-bottom:20px">
-    <div class="card-meta" style="margin-bottom:2px">Document ID</div>
-    <code style="font-size:.85rem">${escapeHtml(docId)}</code>
-  </div>
-
-  <div style="display:flex;flex-direction:column;gap:16px">
-    <div>
-      <div class="card-meta" style="margin-bottom:6px;font-weight:600;color:var(--gray-700)">Step 1 — Connect Wallet</div>
-      <div class="row">
-        <button class="btn btn-primary" id="connect">🦊 Connect MetaMask</button>
-        <span class="card-meta">(or any injected EVM wallet)</span>
-      </div>
-    </div>
-
-    <div>
-      <div class="card-meta" style="margin-bottom:6px;font-weight:600;color:var(--gray-700)">Step 2 — Set Weight & Register</div>
-      <div class="row">
-        <label class="card-meta" for="weight">Signer Weight</label>
-        <input class="input" id="weight" type="number" min="1" value="1" style="width:80px"/>
-        <button class="btn btn-outline" id="join">Register Signer</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="spacer"></div>
-  <pre id="out" style="min-height:40px">Waiting for wallet connection…</pre>
-</div>
-<script>
-let address = null;
-const out = document.getElementById('out');
-function log(x){ out.textContent = String(x); }
-document.getElementById('connect').onclick = async () => {
-  if(!window.ethereum) return log('No injected wallet found.');
-  const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-  address = accounts && accounts[0];
-  log('Connected: ' + address);
-};
-document.getElementById('join').onclick = async () => {
-  if(!address) return log('Connect a wallet first.');
-  const weight = Number(document.getElementById('weight').value || '1');
-  const start = await fetch('/api/join/start', { method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({ docId:'${escapeJs(docId)}', address, weight }) });
-  const startData = await start.json();
-  if(!startData.ok) return log('Error: ' + startData.error);
-
-  if(startData.mode === 'basic'){
-    const sig = await window.ethereum.request({ method: 'personal_sign', params: [startData.message, address] });
-    const finish = await fetch('/api/join/finish', { method:'POST', headers:{'content-type':'application/json'}, credentials:'include',
-      body: JSON.stringify({ mode:'basic', docId:'${escapeJs(docId)}', address, weight, message: startData.message, signature: sig }) });
-    const data = await finish.json();
-    if(!data.ok) return log('Error: ' + data.error);
-    return log('Joined! You can now open approval links from the Doc.');
-  }
-
-  // Yellow delegated session key flow
-  const typed = startData.typedData;
-  const sig = await window.ethereum.request({ method: 'eth_signTypedData_v4', params: [address, JSON.stringify(typed)] });
-  const finish = await fetch('/api/join/finish', { method:'POST', headers:{'content-type':'application/json'}, credentials:'include',
-    body: JSON.stringify({ mode:'yellow', joinToken: startData.joinToken, signature: sig }) });
-  const data = await finish.json();
-  if(!data.ok) return log('Error: ' + data.error);
-  log('Joined (Yellow)! Session key: ' + data.sessionKeyAddress + '\\nYou can now open approval links from the Doc.');
-};
-</script>
-`;
-}
+// joinPageHtml removed — single-user mode, no join/signer flow needed
 
 function cmdPageHtml(params: { docId: string; cmdId: string; signerAddress: string; raw: string; status: string }): string {
-  const { docId, cmdId, signerAddress, raw, status } = params;
+  const { docId, cmdId, raw, status } = params;
   return `
 <div class="spacer-sm"></div>
 <div class="card">
@@ -1121,17 +859,14 @@ function cmdPageHtml(params: { docId: string; cmdId: string; signerAddress: stri
     <span class="badge badge-blue" id="statusBadge">${escapeHtml(status)}</span>
   </div>
 
+  <!-- Command details -->
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
     <div style="background:var(--gray-50);border-radius:var(--radius-sm);padding:8px 14px;flex:1;min-width:200px">
-      <div class="card-meta" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px">Signer</div>
-      <code style="font-size:.82rem">${escapeHtml(signerAddress)}</code>
-    </div>
-    <div style="background:var(--gray-50);border-radius:var(--radius-sm);padding:8px 14px;flex:1;min-width:200px">
       <div class="card-meta" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px">Command ID</div>
-      <code style="font-size:.82rem" id="cmdId">${escapeHtml(cmdId)}</code>
+      <code style="font-size:.82rem">${escapeHtml(cmdId)}</code>
     </div>
     <div style="display:flex;align-items:center;gap:6px">
-      <span class="badge badge-gray" id="approvalMode">WEB</span>
+      <span class="badge badge-green">Single-User</span>
       <button class="btn btn-ghost btn-sm" id="copyLink">📋 Copy link</button>
     </div>
   </div>
@@ -1142,26 +877,34 @@ function cmdPageHtml(params: { docId: string; cmdId: string; signerAddress: stri
       <div class="kpi" id="actionSummary" style="font-size:1.2rem">—</div>
       <div class="card-meta" id="actionRaw" style="margin-top:4px"></div>
     </div>
-    <div class="card mini" style="border-left:3px solid #6366f1">
-      <div class="kpi-label">Approval Progress</div>
-      <div class="kpi" style="font-size:1.2rem"><span id="approvedWeight">0</span> <span style="font-weight:400;color:var(--gray-500)">of</span> <span id="quorum">0</span></div>
-      <div class="progress"><span id="progressFill"></span></div>
-      <div class="card-meta" id="approvedBy" style="margin-top:6px">No approvals yet</div>
-    </div>
     <div class="card mini" style="border-left:3px solid var(--success)">
       <div class="kpi-label">Gasless Savings</div>
       <div class="kpi" id="gasSaved" style="font-size:1.2rem;color:var(--success)">0.000 ETH</div>
       <div class="card-meta"><span id="approvalsTotal">0</span> on-chain approvals avoided</div>
-      <div class="card-meta" id="lastApproval"></div>
     </div>
   </div>
 
   <div class="kpi-label">Raw Command</div>
   <pre style="margin:6px 0 18px">${escapeHtml(raw)}</pre>
 
-  <div class="row" style="margin-bottom:16px">
-    <button class="btn btn-primary" id="approve">✓ Approve</button>
-    <button class="btn btn-danger" id="reject">✕ Reject</button>
+  <!-- Human-readable action summary -->
+  <div id="humanSummary" style="background:linear-gradient(135deg,#f0fdf4,#ecfdf5);border:1px solid #bbf7d0;border-radius:var(--radius-sm);padding:14px 18px;margin-bottom:16px">
+    <div style="font-weight:700;font-size:1rem;color:#166534;margin-bottom:4px" id="humanAction">${escapeHtml(summarizeCommand(raw))}</div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">
+      <span class="badge badge-green">Gasless Approval — $0 in fees (Yellow Network)</span>
+    </div>
+  </div>
+
+  <!-- Approve / Reject — no wallet needed -->
+  <div id="actionButtons" class="row" style="margin-bottom:16px">
+    <button class="btn btn-primary" id="approveBtn" style="font-size:1.1rem;padding:14px 36px;box-shadow:var(--shadow-md)">⚡ Approve</button>
+    <button class="btn btn-danger btn-sm" id="rejectBtn">✕ Reject</button>
+    <span class="card-meta" style="margin-left:8px">No wallet needed — owner-approved</span>
+  </div>
+
+  <div style="background:var(--gray-50);border-radius:var(--radius-sm);padding:10px 14px;margin-bottom:14px">
+    <div class="card-meta" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px">Tip</div>
+    <div style="font-size:.88rem;color:var(--gray-700)">You can also approve commands directly in the Google Doc by setting the STATUS cell to <code>APPROVED</code>.</div>
   </div>
 
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
@@ -1181,19 +924,44 @@ function cmdPageHtml(params: { docId: string; cmdId: string; signerAddress: stri
 <script>
 const out = document.getElementById('out');
 function log(x){ out.textContent = String(x); }
-function shortAddr(addr){
-  if(!addr) return '';
-  return addr.slice(0,6) + '...' + addr.slice(-4);
-}
-async function decide(decision){
-  const res = await fetch('/api/cmd/decision', { method:'POST', headers:{'content-type':'application/json'}, credentials:'include',
-    body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}', decision }) });
-  const data = await res.json();
+
+// --- Approve (uses demo-approve in demo mode, /api/cmd/decision otherwise) ---
+document.getElementById('approveBtn').onclick = async () => {
+  log('Approving…');
+  // Try demo-approve first, fall back to decision endpoint
+  let res = await fetch('/api/cmd/demo-approve', { method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}' }) });
+  let data = await res.json();
+  if (!data.ok && data.error && data.error.includes('Demo mode')) {
+    // Not in demo mode — use decision endpoint
+    res = await fetch('/api/cmd/decision', { method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}', decision:'APPROVE' }) });
+    data = await res.json();
+  }
   if(!data.ok) return log('Error: ' + data.error);
-  log('OK: ' + data.status);
-}
-document.getElementById('approve').onclick = () => decide('APPROVE');
-document.getElementById('reject').onclick = () => decide('REJECT');
+  log('✅ APPROVED! The agent will execute this command shortly.');
+  document.getElementById('statusBadge').textContent = 'APPROVED';
+  document.getElementById('statusBadge').className = 'badge badge-green';
+  document.getElementById('actionButtons').style.display = 'none';
+  poll();
+};
+document.getElementById('rejectBtn').onclick = async () => {
+  log('Rejecting…');
+  let res = await fetch('/api/cmd/demo-reject', { method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}' }) });
+  let data = await res.json();
+  if (!data.ok && data.error && data.error.includes('Demo mode')) {
+    res = await fetch('/api/cmd/decision', { method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}', decision:'REJECT' }) });
+    data = await res.json();
+  }
+  if(!data.ok) return log('Error: ' + data.error);
+  log('❌ REJECTED.');
+  document.getElementById('statusBadge').textContent = 'REJECTED';
+  document.getElementById('statusBadge').className = 'badge badge-red';
+  document.getElementById('actionButtons').style.display = 'none';
+  poll();
+};
 document.getElementById('copyLink').onclick = async () => {
   try{
     await navigator.clipboard.writeText(window.location.href);
@@ -1202,42 +970,33 @@ document.getElementById('copyLink').onclick = async () => {
     log('Copy failed');
   }
 };
+
+// --- Polling ---
 async function poll(){
-  const res = await fetch('/api/cmd/${escapeJs(docId)}/${escapeJs(cmdId)}');
-  const data = await res.json();
-  if(!data.ok) return;
-  const badge = document.getElementById('statusBadge');
-  badge.textContent = data.cmd.status;
-  const mode = document.getElementById('approvalMode');
-  mode.textContent = data.approvalMode || 'WEB';
-  mode.className = 'badge ' + (data.approvalMode === 'YELLOW' ? 'badge-ok' : 'badge-gray');
-  const approvals = (data.approvals || []).filter(a => a.decision === 'APPROVE');
-  const approvedWeight = data.approvedWeight || 0;
-  const quorum = data.quorum || 0;
-  document.getElementById('approvedWeight').textContent = String(approvedWeight);
-  document.getElementById('quorum').textContent = String(quorum);
-  const pct = quorum > 0 ? Math.min(100, Math.round((approvedWeight / quorum) * 100)) : 0;
-  document.getElementById('progressFill').style.width = pct + '%';
-  document.getElementById('approvedBy').textContent = approvals.length
-    ? approvals.map(a => shortAddr(a.signer)).join(', ')
-    : 'No approvals yet';
-  document.getElementById('actionSummary').textContent = data.actionSummary || '—';
-  document.getElementById('actionRaw').textContent = data.cmd.raw || '';
-  document.getElementById('resultText').textContent = data.cmd.result || '';
-  document.getElementById('errorText').textContent = data.cmd.error || '';
+  try {
+    const res = await fetch('/api/cmd/${escapeJs(docId)}/${escapeJs(cmdId)}');
+    const data = await res.json();
+    if(!data.ok) return;
+    document.getElementById('statusBadge').textContent = data.cmd.status;
+    document.getElementById('statusBadge').className = 'badge ' + (data.cmd.status === 'APPROVED' ? 'badge-green' : data.cmd.status === 'EXECUTED' ? 'badge-green' : data.cmd.status === 'REJECTED' ? 'badge-red' : 'badge-blue');
+    document.getElementById('actionSummary').textContent = data.actionSummary || '—';
+    document.getElementById('actionRaw').textContent = data.cmd.raw || '';
+    document.getElementById('resultText').textContent = data.cmd.result || '';
+    document.getElementById('errorText').textContent = data.cmd.error || '';
+    if(data.cmd.status !== 'PENDING_APPROVAL') document.getElementById('actionButtons').style.display = 'none';
+  } catch(e) { console.warn('Poll failed:', e); }
 }
 async function pollMetrics(){
-  const res = await fetch('/api/metrics/${escapeJs(docId)}');
-  const data = await res.json();
-  if(!data.ok) return;
-  const m = data.metrics || {};
-  const approvalsTotal = Number(m.approvalsTotal || 0);
-  const avoided = Number(m.approvalTxAvoided || approvalsTotal);
-  const gasPer = Number(m.signerApprovalGasPaid || 0.003);
-  const gasSaved = avoided * gasPer;
-  document.getElementById('approvalsTotal').textContent = String(avoided);
-  document.getElementById('gasSaved').textContent = gasSaved.toFixed(4) + ' ETH';
-  document.getElementById('lastApproval').textContent = m.lastApproval ? ('Last approval: ' + m.lastApproval) : '';
+  try {
+    const res = await fetch('/api/metrics/${escapeJs(docId)}');
+    const data = await res.json();
+    if(!data.ok) return;
+    const m = data.metrics || {};
+    const avoided = Number(m.approvalTxAvoided || m.approvalsTotal || 0);
+    const gasPer = Number(m.signerApprovalGasPaid || 0.003);
+    document.getElementById('approvalsTotal').textContent = String(avoided);
+    document.getElementById('gasSaved').textContent = (avoided * gasPer).toFixed(4) + ' ETH';
+  } catch(e) { console.warn('Metrics poll failed:', e); }
 }
 setInterval(poll, 3000);
 setInterval(pollMetrics, 5000);
@@ -1259,12 +1018,13 @@ function activityPageHtml(params: { docId: string }): string {
     </div>
     <span class="badge badge-green"><span class="status-dot live"></span>Live</span>
   </div>
-  <div style="background:var(--gray-50);border-radius:var(--radius-sm);padding:8px 14px;margin-bottom:16px">
-    <span class="card-meta">Document:</span> <code>${escapeHtml(docId)}</code>
+  <div style="background:var(--gray-50);border-radius:var(--radius-sm);padding:8px 14px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
+    <div><span class="card-meta">Document:</span> <code>${escapeHtml(docId)}</code></div>
+    <button id="approveAllBtn" class="btn btn-primary btn-sm" onclick="demoApproveAll()" style="white-space:nowrap">⚡ Approve All Pending</button>
   </div>
   <table>
     <thead>
-      <tr><th>Command</th><th>Status</th><th>Result</th><th>Error</th></tr>
+      <tr><th>Command</th><th>Status</th><th>Action</th><th>Result</th><th>Error</th></tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
@@ -1275,8 +1035,66 @@ const rows = document.getElementById('rows');
 const emptyState = document.getElementById('empty-state');
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function statusBadge(s){
-  const cls = s==='EXECUTED'?'badge-green':s==='REJECTED'?'badge-red':s==='PENDING_APPROVAL'?'badge-orange':'badge-gray';
+  const cls = s==='EXECUTED'?'badge-green':s==='REJECTED'||s==='FAILED'?'badge-red':s==='PENDING_APPROVAL'?'badge-orange':s==='APPROVED'||s==='EXECUTING'?'badge-blue':'badge-gray';
   return '<span class="badge '+cls+'">'+esc(s)+'</span>';
+}
+function humanizeCommand(raw){
+  if(!raw) return '';
+  // Translate command types to human-friendly actions
+  if(raw.includes('MARKET_BUY')) { const m=raw.match(/MARKET_BUY\\s+SUI\\s+([\\d.]+)/); return m ? 'Bought '+m[1]+' SUI at market price' : 'Market buy SUI'; }
+  if(raw.includes('MARKET_SELL')) { const m=raw.match(/MARKET_SELL\\s+SUI\\s+([\\d.]+)/); return m ? 'Sold '+m[1]+' SUI at market price' : 'Market sell SUI'; }
+  if(raw.includes('LIMIT_BUY')) { const m=raw.match(/LIMIT_BUY\\s+SUI\\s+([\\d.]+)\\s+USDC\\s+@\\s+([\\d.]+)/); return m ? 'Limit buy '+m[1]+' SUI at $'+m[2] : 'Limit buy SUI'; }
+  if(raw.includes('LIMIT_SELL')) { const m=raw.match(/LIMIT_SELL\\s+SUI\\s+([\\d.]+)\\s+USDC\\s+@\\s+([\\d.]+)/); return m ? 'Limit sell '+m[1]+' SUI at $'+m[2] : 'Limit sell SUI'; }
+  if(raw.includes('PAYOUT')) { const m=raw.match(/PAYOUT\\s+([\\d.]+)\\s+USDC\\s+TO\\s+(0x[a-f0-9]+)/i); return m ? 'Sent $'+m[1]+' USDC to '+m[2].slice(0,6)+'...' : 'USDC payout'; }
+  if(raw.includes('BRIDGE')) { const m=raw.match(/BRIDGE\\s+([\\d.]+)\\s+USDC\\s+FROM\\s+(\\w+)\\s+TO\\s+(\\w+)/i); return m ? 'Bridged $'+m[1]+' USDC from '+m[2]+' to '+m[3] : 'Cross-chain bridge'; }
+  if(raw.includes('STOP_LOSS')) return 'Stop-loss order';
+  if(raw.includes('TAKE_PROFIT')) return 'Take-profit order';
+  if(raw.includes('SWEEP_YIELD')) return 'Swept idle capital';
+  if(raw.includes('TREASURY')) return 'Treasury balance check';
+  if(raw.includes('PRICE')) return 'Price check';
+  if(raw.includes('SETUP')) return 'Initial setup';
+  if(raw.includes('SCHEDULE')) return 'Scheduled automation';
+  if(raw.includes('REBALANCE')) return 'Cross-chain rebalance';
+  return raw.replace(/^DW\\s+/,'');
+}
+async function demoApprove(cmdId){
+  const btn = document.getElementById('btn-'+cmdId);
+  if(btn) btn.textContent = '⏳…';
+  try{
+    const res = await fetch('/api/cmd/demo-approve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({docId:'${escapeJs(docId)}',cmdId})});
+    const data = await res.json();
+    if(!data.ok){ alert('Error: '+data.error); if(btn) btn.textContent='✓ Approve'; return; }
+    load();
+  }catch(e){ alert('Error: '+e.message); if(btn) btn.textContent='✓ Approve'; }
+}
+async function demoApproveAll(){
+  const btn = document.getElementById('approveAllBtn');
+  if(btn) btn.textContent = '⏳ Approving…';
+  try{
+    const res = await fetch('/api/cmd/demo-approve-all',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({docId:'${escapeJs(docId)}'})});
+    const data = await res.json();
+    if(!data.ok){ alert('Error: '+data.error); if(btn) btn.textContent='⚡ Approve All'; return; }
+    if(btn) btn.textContent = '✅ '+data.approved+' Approved!';
+    load();
+    setTimeout(()=>{ if(btn) btn.textContent='⚡ Approve All'; },2000);
+  }catch(e){ alert('Error: '+e.message); if(btn) btn.textContent='⚡ Approve All'; }
+}
+function actionCol(c){
+  if(c.status==='PENDING_APPROVAL'){
+    return '<button id="btn-'+esc(c.cmdId)+'" class="btn btn-primary btn-sm" style="white-space:nowrap" onclick="demoApprove(\''+esc(c.cmdId)+'\')">' +
+      '⚡ Approve</button>';
+  }
+  if(c.status==='EXECUTED' && c.result){
+    // Link to tx explorer if available
+    const suiMatch = (c.result||'').match(/SuiTx=(\\w+)/);
+    const arcMatch = (c.result||'').match(/ArcTx=(0x\\w+)/);
+    if(suiMatch) return '<a href="https://suiscan.xyz/testnet/tx/'+suiMatch[1]+'" target="_blank" class="btn btn-ghost btn-sm">🔍 Sui Explorer</a>';
+    if(arcMatch) return '<a href="https://explorer.testnet.arc.network/tx/'+arcMatch[1]+'" target="_blank" class="btn btn-ghost btn-sm">🔍 Arc Explorer</a>';
+    return '<span class="card-meta">Done</span>';
+  }
+  if(c.status==='EXECUTING') return '<span class="badge badge-blue">⏳ Running</span>';
+  if(c.status==='FAILED') return '<span class="badge badge-red">✕</span>';
+  return '<span class="card-meta">—</span>';
 }
 async function load(){
   const res = await fetch('/api/activity/${escapeJs(docId)}');
@@ -1286,10 +1104,14 @@ async function load(){
     rows.innerHTML='';emptyState.style.display='block';return;
   }
   emptyState.style.display='none';
-  rows.innerHTML = data.commands.map(c =>
-    '<tr><td><code style="font-size:.8rem">'+esc(c.cmdId)+'</code><div class="card-meta" style="margin-top:2px">'+esc(c.raw)+'</div></td>' +
-    '<td>'+statusBadge(c.status)+'</td><td style="font-size:.88rem">'+esc(c.result||'—')+'</td><td style="font-size:.88rem;color:var(--danger)">'+esc(c.error||'—')+'</td></tr>'
-  ).join('');
+  rows.innerHTML = data.commands.map(c => {
+    const raw = c.raw||'';
+    const chain = raw.includes('BRIDGE')||raw.includes('PAYOUT')||raw.includes('ARC')?'<span class="badge badge-blue" style="font-size:.65rem;margin-left:4px">Arc</span>':
+      raw.includes('SUI')||raw.includes('MARKET')||raw.includes('LIMIT')?'<span class="badge badge-ok" style="font-size:.65rem;margin-left:4px">Sui</span>':
+      raw.includes('YELLOW')?'<span class="badge badge-orange" style="font-size:.65rem;margin-left:4px">Yellow</span>':'';
+    return '<tr><td><div style="font-weight:500;font-size:.9rem">'+humanizeCommand(c.raw)+chain+'</div><code style="font-size:.72rem;color:var(--gray-500)">'+esc(c.cmdId)+'</code></td>' +
+    '<td>'+statusBadge(c.status)+'</td><td>'+actionCol(c)+'</td><td style="font-size:.88rem">'+esc(c.result||'—')+'</td><td style="font-size:.88rem;color:var(--danger)">'+esc(c.error||'—')+'</td></tr>';
+  }).join('');
 }
 load();
 setInterval(load, 3000);
@@ -1383,14 +1205,12 @@ setInterval(load, 5000);
 }
 
 function notSignedInHtml(params: { docId: string }): string {
-  const { docId } = params;
   return `
 <div class="spacer-lg"></div>
 <div class="card" style="max-width:480px;margin:0 auto;text-align:center">
-  <div style="font-size:3rem;margin-bottom:8px">🔒</div>
-  <h1 style="margin-bottom:8px">Not Signed In</h1>
-  <p style="color:var(--gray-500);margin-bottom:20px">You need to register as a signer before you can approve commands.</p>
-  <a href="/join/${encodeURIComponent(docId)}" class="btn btn-primary">Join this Doc</a>
+  <div style="font-size:3rem;margin-bottom:8px">📄</div>
+  <h1 style="margin-bottom:8px">Approve in the Doc</h1>
+  <p style="color:var(--gray-500);margin-bottom:20px">Set the command's <strong>STATUS</strong> cell to <code>APPROVED</code> in the Commands table of your Google Doc. The agent will pick it up on the next poll.</p>
 </div>`;
 }
 
@@ -1429,39 +1249,46 @@ function summarizeCommand(raw: string): string {
   if (!parsed.ok) return raw;
   const cmd = parsed.value;
   switch (cmd.type) {
-    case "SETUP": return "Setup wallets";
-    case "STATUS": return "Show status";
-    case "SESSION_CREATE": return "Open Yellow session";
-    case "SESSION_CLOSE": return "Close Yellow session";
-    case "SESSION_STATUS": return "Show Yellow session status";
-    case "SIGNER_ADD": return `Add signer ${shortAddress(cmd.address)} (weight ${cmd.weight})`;
-    case "QUORUM": return `Set quorum to ${cmd.quorum}`;
-    case "CONNECT": return "Connect WalletConnect session";
-    case "WC_TX": return `WalletConnect tx to ${shortAddress(cmd.to)}`;
-    case "WC_SIGN": return `WalletConnect sign as ${shortAddress(cmd.address)}`;
-    case "LIMIT_BUY": return `Limit buy ${cmd.qty} ${cmd.base} @ ${cmd.price} ${cmd.quote}`;
-    case "LIMIT_SELL": return `Limit sell ${cmd.qty} ${cmd.base} @ ${cmd.price} ${cmd.quote}`;
-    case "MARKET_BUY": return `Market buy ${cmd.qty} ${cmd.base}`;
-    case "MARKET_SELL": return `Market sell ${cmd.qty} ${cmd.base}`;
-    case "DEPOSIT": return `Deposit ${cmd.amount} ${cmd.coinType}`;
-    case "WITHDRAW": return `Withdraw ${cmd.amount} ${cmd.coinType}`;
+    case "SETUP": return "Create your treasury wallets (automatic, no setup needed)";
+    case "STATUS": return "Check treasury status";
+    case "SESSION_CREATE": return "Open a Yellow Network session for gasless approvals";
+    case "SESSION_CLOSE": return "Close the Yellow Network session";
+    case "SESSION_STATUS": return "Check Yellow session status";
+    case "SIGNER_ADD": return `Add ${shortAddress(cmd.address)} as a team approver (weight ${cmd.weight})`;
+    case "QUORUM": return `Set approval threshold to ${cmd.quorum} votes`;
+    case "CONNECT": return "Connect to an external app via WalletConnect";
+    case "WC_TX": return `Execute transaction to ${shortAddress(cmd.to)} via connected app`;
+    case "WC_SIGN": return `Sign message as ${shortAddress(cmd.address)}`;
+    case "LIMIT_BUY": {
+      const total = (cmd.qty * cmd.price).toFixed(2);
+      return `Buy ${cmd.qty} SUI at $${cmd.price} each (total ~$${total})`;
+    }
+    case "LIMIT_SELL": {
+      const total = (cmd.qty * cmd.price).toFixed(2);
+      return `Sell ${cmd.qty} SUI at $${cmd.price} each (receive ~$${total})`;
+    }
+    case "MARKET_BUY": return `Buy ${cmd.qty} SUI at the current market price`;
+    case "MARKET_SELL": return `Sell ${cmd.qty} SUI at the current market price`;
+    case "DEPOSIT": return `Deposit ${cmd.amount} ${cmd.coinType} into DeepBook`;
+    case "WITHDRAW": return `Withdraw ${cmd.amount} ${cmd.coinType} from DeepBook`;
     case "CANCEL": return `Cancel order ${cmd.orderId}`;
-    case "SETTLE": return "Settle orders";
-    case "PAYOUT": return `Payout ${cmd.amountUsdc} USDC to ${shortAddress(cmd.to)}`;
-    case "PAYOUT_SPLIT": return `Split payout ${cmd.amountUsdc} USDC to ${cmd.recipients.length} recipients`;
-    case "POLICY_ENS": return `Set policy from ${cmd.ensName}`;
-    case "SCHEDULE": return `Schedule every ${cmd.intervalHours}h: ${cmd.innerCommand}`;
-    case "CANCEL_SCHEDULE": return `Cancel schedule ${cmd.scheduleId}`;
-    case "BRIDGE": return `CCTP Bridge ${cmd.amountUsdc} USDC ${cmd.fromChain} → ${cmd.toChain}`;
-    case "ALERT_THRESHOLD": return `Alert when ${cmd.coinType} < ${cmd.below}`;
-    case "AUTO_REBALANCE": return `Auto-rebalance ${cmd.enabled ? "ON" : "OFF"}`;
-    case "YELLOW_SEND": return `⚡ Yellow send ${cmd.amountUsdc} USDC to ${shortAddress(cmd.to)} (gasless, off-chain)`;
-    case "STOP_LOSS": return `🛡️ Stop-loss ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
-    case "TAKE_PROFIT": return `📈 Take-profit ${cmd.qty} ${cmd.base} @ ${cmd.triggerPrice}`;
-    case "SWEEP_YIELD": return "🧹 Sweep yield (settle + consolidate cross-chain)";
-    case "TRADE_HISTORY": return "📊 Show trade history & P&L";
-    case "PRICE": return "💹 Show live DeepBook price";
+    case "SETTLE": return "Settle all filled orders";
+    case "PAYOUT": return `Send $${cmd.amountUsdc} USDC to ${shortAddress(cmd.to)}`;
+    case "PAYOUT_SPLIT": return `Split $${cmd.amountUsdc} USDC across ${cmd.recipients.length} recipients`;
+    case "SCHEDULE": return `Automate every ${cmd.intervalHours}h: ${cmd.innerCommand}`;
+    case "CANCEL_SCHEDULE": return `Cancel automated schedule ${cmd.scheduleId}`;
+    case "BRIDGE": return `Bridge $${cmd.amountUsdc} USDC from ${cmd.fromChain} to ${cmd.toChain}`;
+    case "ALERT_THRESHOLD": return `Alert when ${cmd.coinType} drops below ${cmd.below}`;
+    case "AUTO_REBALANCE": return `Auto-rebalance ${cmd.enabled ? "enabled" : "disabled"}`;
+    case "YELLOW_SEND": return `Send $${cmd.amountUsdc} USDC to ${shortAddress(cmd.to)} instantly (gasless, off-chain via Yellow)`;
+    case "STOP_LOSS": return `Auto-sell ${cmd.qty} SUI if price drops to $${cmd.triggerPrice} (downside protection)`;
+    case "TAKE_PROFIT": return `Auto-sell ${cmd.qty} SUI if price rises to $${cmd.triggerPrice} (lock in gains)`;
+    case "SWEEP_YIELD": return "Collect idle funds and settle trades across all chains";
+    case "TRADE_HISTORY": return "View trade history and profit/loss";
+    case "PRICE": return "Check live SUI/USDC price from DeepBook";
     case "CANCEL_ORDER": return `Cancel conditional order ${cmd.orderId}`;
+    case "TREASURY": return "View unified balance across all chains";
+    case "REBALANCE": return `Move $${cmd.amountUsdc} USDC from ${cmd.fromChain} to ${cmd.toChain}`;
     default: return raw;
   }
 }

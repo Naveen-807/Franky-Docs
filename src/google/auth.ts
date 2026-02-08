@@ -23,7 +23,15 @@ export async function createGoogleAuth(serviceAccountJson: string, scopes: strin
     key: key.private_key,
     scopes
   });
-  await auth.authorize();
+  // Best-effort pre-authorize with timeout — JWT will auto-authorize lazily on first API call anyway
+  try {
+    await Promise.race([
+      auth.authorize(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Auth timeout (10s) — will retry lazily")), 10_000))
+    ]);
+  } catch (e) {
+    console.warn(`[auth] ${(e as Error).message}`);
+  }
   return auth;
 }
 

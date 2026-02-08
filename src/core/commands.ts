@@ -27,7 +27,6 @@ export type ParsedCommand =
   | { type: "SETTLE" }
   | { type: "PAYOUT"; amountUsdc: number; to: `0x${string}` }
   | { type: "PAYOUT_SPLIT"; amountUsdc: number; recipients: Array<{ to: `0x${string}`; pct: number }> }
-  | { type: "POLICY_ENS"; ensName: string }
   | { type: "SCHEDULE"; intervalHours: number; innerCommand: string }
   | { type: "CANCEL_SCHEDULE"; scheduleId: string }
   | { type: "BRIDGE"; amountUsdc: number; fromChain: string; toChain: string }
@@ -118,7 +117,6 @@ export const ParsedCommandSchema: z.ZodType<ParsedCommand, z.ZodTypeDef, unknown
       )
       .min(2)
   }),
-  z.object({ type: z.literal("POLICY_ENS"), ensName: z.string().min(3) }),
   z.object({
     type: z.literal("SCHEDULE"),
     intervalHours: z.number().positive(),
@@ -221,10 +219,88 @@ export function tryAutoDetect(raw: string): ParseResult | null {
 
   const lower = trimmed.toLowerCase();
 
+  // --- Web2-friendly patterns: strip $ currency prefix ---
+  // "send $50 to 0x..." / "pay $100 to 0x..."
+  const dollarSendMatch = trimmed.match(/^(?:send|pay|transfer)\s+\$([\d.]+)\s+to\s+(0x[0-9a-fA-F]{40})$/i);
+  if (dollarSendMatch) {
+    return parseCommand(`DW PAYOUT ${dollarSendMatch[1]} USDC TO ${dollarSendMatch[2]}`);
+  }
+
   // "send 10 USDC to 0x..." / "pay 10 USDC to 0x..." / "transfer 10 USDC to 0x..."
   const sendMatch = trimmed.match(/^(?:send|pay|transfer)\s+([\d.]+)\s*USDC\s+to\s+(0x[0-9a-fA-F]{40})$/i);
   if (sendMatch) {
     return parseCommand(`DW PAYOUT ${sendMatch[1]} USDC TO ${sendMatch[2]}`);
+  }
+
+  // "swap 10 SUI for USDC" → MARKET_SELL
+  const swapSellMatch = trimmed.match(/^swap\s+([\d.]+)\s*SUI\s+(?:for|to)\s*(?:USDC|USD|\$)$/i);
+  if (swapSellMatch) {
+    return parseCommand(`DW MARKET_SELL SUI ${swapSellMatch[1]}`);
+  }
+
+  // "swap 50 USDC for SUI" / "swap $50 for SUI" → MARKET_BUY (interpret as qty of SUI based on rough estimate)
+  const swapBuyMatch = trimmed.match(/^swap\s+\$?([\d.]+)\s*(?:USDC|USD)?\s+(?:for|to)\s*SUI$/i);
+  if (swapBuyMatch) {
+    return parseCommand(`DW MARKET_BUY SUI ${swapBuyMatch[1]}`);
+  }
+
+  // "invest $100 in SUI" / "invest 100 in SUI"
+  const investMatch = trimmed.match(/^invest\s+\$?([\d.]+)\s+in\s+SUI$/i);
+  if (investMatch) {
+    return parseCommand(`DW MARKET_BUY SUI ${investMatch[1]}`);
+  }
+
+  // "buy 10 SUI at market" → MARKET_BUY (explicit market keyword)
+  const buyAtMarketMatch = trimmed.match(/^buy\s+([\d.]+)\s*SUI\s+at\s+market$/i);
+  if (buyAtMarketMatch) {
+    return parseCommand(`DW MARKET_BUY SUI ${buyAtMarketMatch[1]}`);
+  }
+
+  // "sell 10 SUI at market" → MARKET_SELL
+  const sellAtMarketMatch = trimmed.match(/^sell\s+([\d.]+)\s*SUI\s+at\s+market$/i);
+  if (sellAtMarketMatch) {
+    return parseCommand(`DW MARKET_SELL SUI ${sellAtMarketMatch[1]}`);
+  }
+
+  // "DCA 5 SUI daily" / "DCA 10 SUI weekly" / "DCA 5 SUI every 24h"
+  const dcaDailyMatch = trimmed.match(/^DCA\s+([\d.]+)\s*SUI\s+daily$/i);
+  if (dcaDailyMatch) {
+    return parseCommand(`DW SCHEDULE EVERY 24h: DW MARKET_BUY SUI ${dcaDailyMatch[1]}`);
+  }
+  const dcaWeeklyMatch = trimmed.match(/^DCA\s+([\d.]+)\s*SUI\s+weekly$/i);
+  if (dcaWeeklyMatch) {
+    return parseCommand(`DW SCHEDULE EVERY 168h: DW MARKET_BUY SUI ${dcaWeeklyMatch[1]}`);
+  }
+  const dcaEveryMatch = trimmed.match(/^DCA\s+([\d.]+)\s*SUI\s+every\s+([\d.]+)\s*h(?:ours?)?$/i);
+  if (dcaEveryMatch) {
+    return parseCommand(`DW SCHEDULE EVERY ${dcaEveryMatch[2]}h: DW MARKET_BUY SUI ${dcaEveryMatch[1]}`);
+  }
+
+  // "check balance" / "my balance" / "show balance" / "what's my balance"
+  if (lower === "check balance" || lower === "my balance" || lower === "show balance"
+      || lower.match(/^what'?s?\s+my\s+balance/)) {
+    return parseCommand("DW TREASURY");
+  }
+
+  // "help" / "?"
+  if (lower === "help" || lower === "?") {
+    return parseCommand("DW STATUS");
+  }
+
+  // "top up" / "fund wallet" / "get tokens" / "faucet" (returns STATUS to trigger balance view)
+  if (lower === "top up" || lower === "fund wallet" || lower === "get tokens" || lower === "faucet") {
+    return parseCommand("DW STATUS");
+  }
+
+  // "set budget X USDC per day" / "set limit X per day" → ALERT_THRESHOLD (spending awareness)
+  const budgetMatch = trimmed.match(/^set\s+(?:budget|limit|spending)\s+\$?([\d.]+)\s*(?:USDC\s+)?per\s+day$/i);
+  if (budgetMatch) {
+    return parseCommand(`DW ALERT_THRESHOLD USDC ${budgetMatch[1]}`);
+  }
+
+  // "show trades" / "my trades"
+  if (lower === "show trades" || lower === "my trades" || lower === "recent trades") {
+    return parseCommand("DW TRADE_HISTORY");
   }
 
   // "buy 50 SUI at 1.02" / "buy 50 SUI @ 1.02"
@@ -265,6 +341,17 @@ export function tryAutoDetect(raw: string): ParseResult | null {
   const marketSellMatch = trimmed.match(/^market\s+sell\s+([\d.]+)\s*SUI$/i);
   if (marketSellMatch) {
     return parseCommand(`DW MARKET_SELL SUI ${marketSellMatch[1]}`);
+  }
+
+  // "buy 50 SUI" (no price → MARKET_BUY) — one-phrase trading intent
+  const bareBuyMatch = trimmed.match(/^buy\s+([\d.]+)\s*SUI$/i);
+  if (bareBuyMatch) {
+    return parseCommand(`DW MARKET_BUY SUI ${bareBuyMatch[1]}`);
+  }
+  // "sell 50 SUI" (no price → MARKET_SELL) — one-phrase trading intent
+  const bareSellMatch = trimmed.match(/^sell\s+([\d.]+)\s*SUI$/i);
+  if (bareSellMatch) {
+    return parseCommand(`DW MARKET_SELL SUI ${bareSellMatch[1]}`);
   }
 
   // "setup" or "/setup"
@@ -477,14 +564,6 @@ export function parseCommand(raw: string): ParseResult {
     const parsed = ParsedCommandSchema.safeParse({ type: "PAYOUT_SPLIT", amountUsdc, recipients });
     if (!parsed.success) return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid split payout" };
     return { ok: true, value: parsed.data };
-  }
-
-  if (op === "POLICY") {
-    const sub = (parts[2] ?? "").toUpperCase();
-    if (sub !== "ENS") return { ok: false, error: "Only POLICY ENS <name.eth> supported" };
-    const ensName = parts[3];
-    if (!ensName) return { ok: false, error: "Missing ENS name" };
-    return { ok: true, value: { type: "POLICY_ENS", ensName } };
   }
 
   if (op === "SCHEDULE") {

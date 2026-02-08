@@ -1,23 +1,26 @@
 import type { docs_v1, drive_v3 } from "googleapis";
 import { parseCommand, tryAutoDetect } from "./core/commands.js";
 import type { ParsedCommand } from "./core/commands.js";
-import { evaluatePolicy } from "./core/policy.js";
 import { sha256Hex } from "./util/hash.js";
 import { privateKeyToAccount } from "viem/accounts";
 import { Repo } from "./db/repo.js";
+import type { YellowSessionRow } from "./db/repo.js";
 import { listAccessibleDocs } from "./google/drive.js";
 import {
   appendAuditRow,
   appendRecentActivityRow,
   appendCommandRow,
   loadDocWalletTables,
+  loadPayoutRulesTable,
   readChatTable,
   readCommandsTable,
   readConfig,
+  readPayoutRulesTable,
   updateBalancesTable,
   updateChatRowCells,
   updateCommandsRowCells,
   updateOpenOrdersTable,
+  updatePayoutRulesRowCells,
   upsertSessionRow,
   userEditableCommandsHash,
   writeConfigValue
@@ -27,11 +30,12 @@ import { decryptWithMasterKey } from "./wallet/crypto.js";
 import type { AppConfig } from "./config.js";
 import { ArcClient } from "./integrations/arc.js";
 import { CircleArcClient } from "./integrations/circle.js";
-import { EnsPolicyClient } from "./integrations/ens.js";
 import { NitroRpcYellowClient } from "./integrations/yellow.js";
 import type { YellowAllocation } from "./integrations/yellow.js";
 import type { DeepBookClient } from "./integrations/deepbook.js";
 import type { WalletConnectService } from "./integrations/walletconnect.js";
+import { requestTestnetSui } from "./integrations/sui-faucet.js";
+import { planMarketBuy, planMarketSell } from "./integrations/deepbook-route.js";
 
 type ExecutionContext = {
   config: AppConfig;
@@ -42,7 +46,6 @@ type ExecutionContext = {
   deepbook?: DeepBookClient;
   arc?: ArcClient;
   circle?: CircleArcClient;
-  ens?: EnsPolicyClient;
   walletconnect?: WalletConnectService;
 };
 
@@ -52,6 +55,7 @@ export class Engine {
   private executorRunning = false;
   private balancesRunning = false;
   private schedulerRunning = false;
+  private payoutRulesRunning = false;
 
   constructor(private ctx: ExecutionContext) {}
 
@@ -72,9 +76,17 @@ export class Engine {
         drive,
         namePrefix: config.DOCWALLET_DISCOVER_ALL ? undefined : config.DOCWALLET_NAME_PREFIX
       });
-      for (const f of files) {
-        repo.upsertDoc({ docId: f.id, name: f.name });
-        await loadDocWalletTables({ docs, docId: f.id });
+      // Upsert all docs first (cheap, synchronous DB ops)
+      for (const f of files) repo.upsertDoc({ docId: f.id, name: f.name });
+      // Load templates concurrently in batches of 4 to avoid API rate-limits
+      const BATCH_SIZE = 4;
+      for (let i = 0; i < files.length; i += BATCH_SIZE) {
+        const batch = files.slice(i, i + BATCH_SIZE);
+        await Promise.allSettled(
+          batch.map((f) => loadDocWalletTables({ docs, docId: f.id }).catch((err) => {
+            console.error(`[discovery] ${f.id.slice(0, 8)}… template error: ${(err as Error).message}`);
+          }))
+        );
       }
     } finally {
       this.discoveryRunning = false;
@@ -89,20 +101,17 @@ export class Engine {
       const tracked = repo.listDocs();
       for (const d of tracked) {
         const docId = d.doc_id;
-        const tables = await loadDocWalletTables({ docs, docId });
-        const configMap = readConfig(tables.config.table);
-        const ensName = configMap["ENS_NAME"]?.value?.trim() || d.ens_name || "";
+        let tables, configMap;
+        try {
+          tables = await loadDocWalletTables({ docs, docId });
+          configMap = readConfig(tables.config.table);
+        } catch (err) {
+          console.error(`[poll] ${docId.slice(0, 8)}… skipped — ${(err as Error).message}`);
+          continue;
+        }
         const docCellApprovalsEnabled = configMap["DOC_CELL_APPROVALS"]?.value?.trim() === "1";
         const autoPropEnabled = configMap["AGENT_AUTOPROPOSE"]?.value?.trim();
         const signerApprovalGasPaid = configMap["SIGNER_APPROVAL_GAS_PAID"]?.value?.trim();
-
-        if (configMap["ENS_NAME"] && ensName) {
-          repo.setDocConfig(docId, "ens_name", ensName);
-        }
-        if (configMap["POLICY_SOURCE"]) {
-          const policySource = configMap["POLICY_SOURCE"].value.trim();
-          if (policySource) repo.setDocConfig(docId, "policy_source", policySource);
-        }
         if (configMap["DOC_CELL_APPROVALS"]) {
           repo.setDocConfig(docId, "doc_cell_approvals", docCellApprovalsEnabled ? "1" : "0");
         }
@@ -115,38 +124,18 @@ export class Engine {
 
         const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
 
-        // Treat Config table as source of truth for quorum (so the doc can be edited without a command).
-        const qText = configMap["QUORUM"]?.value?.trim() ?? "";
-        const qNum = qText ? Number(qText) : NaN;
-        if (Number.isFinite(qNum) && qNum > 0 && Math.floor(qNum) === qNum && repo.getDocQuorum(docId) !== qNum) {
-          repo.setDocQuorum(docId, qNum);
-        }
-
-        // Best-effort sync some config rows so the doc is "judge-ready".
+        // Best-effort sync a few config rows so the doc is "judge-ready".
+        // IMPORTANT: Each writeConfigValue mutates document indices, so reload tables between writes.
         try {
           if (configMap["DOC_ID"] && configMap["DOC_ID"].value !== docId) {
             await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "DOC_ID", value: docId });
+            tables = await loadDocWalletTables({ docs, docId });
+            configMap = readConfig(tables.config.table);
           }
           if (configMap["WEB_BASE_URL"] && configMap["WEB_BASE_URL"].value !== publicBaseUrl) {
             await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "WEB_BASE_URL", value: publicBaseUrl });
-          }
-          if (configMap["JOIN_URL"]) {
-            const joinUrl = `${publicBaseUrl}/join/${encodeURIComponent(docId)}`;
-            if (configMap["JOIN_URL"].value !== joinUrl) {
-              await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "JOIN_URL", value: joinUrl });
-            }
-          }
-          if (configMap["QUORUM"]) {
-            const q = repo.getDocQuorum(docId);
-            if (configMap["QUORUM"].value !== String(q)) {
-              await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "QUORUM", value: String(q) });
-            }
-          }
-          if (configMap["SIGNERS"]) {
-            const signers = repo.listSigners(docId).map((s) => s.address).join(",");
-            if (configMap["SIGNERS"].value !== signers) {
-              await writeConfigValue({ docs, docId, configTable: tables.config.table, key: "SIGNERS", value: signers });
-            }
+            tables = await loadDocWalletTables({ docs, docId });
+            configMap = readConfig(tables.config.table);
           }
         } catch {
           // ignore
@@ -165,15 +154,10 @@ export class Engine {
             if (existing?.status === "PENDING_APPROVAL") {
               const cellStatus = row.status.toUpperCase().trim();
               if (cellStatus === "APPROVED") {
-                const quorum = repo.getDocQuorum(docId);
-                const signerCount = repo.listSigners(docId).length;
-                const allowCellApprovals = docCellApprovalsEnabled || quorum <= 1 || signerCount === 0;
-                // Allow cell-based approval for single-signer or no-signer (demo) docs or when config enabled
-                if (allowCellApprovals) {
-                  repo.setCommandStatus(row.id, "APPROVED");
-                  await this.audit(docId, `${row.id} APPROVED (cell-edit)`);
-                  continue;
-                }
+                // Single-user mode: always allow cell-based approval
+                repo.setCommandStatus(row.id, "APPROVED");
+                await this.audit(docId, `${row.id} APPROVED (cell-edit)`);
+                continue;
               }
               if (cellStatus === "REJECTED" || cellStatus === "REJECT") {
                 repo.setCommandStatus(row.id, "REJECTED", { errorText: "Rejected via cell edit" });
@@ -231,32 +215,9 @@ export class Engine {
               continue;
             }
 
-            const policyDecision = await this.checkPolicyIfPresent(ensName, parsed.value);
-            if (!policyDecision.ok) {
-              repo.upsertCommand({
-                cmd_id: cmdId,
-                doc_id: docId,
-                raw_command: row.command,
-                parsed_json: JSON.stringify(parsed.value),
-                status: "REJECTED_POLICY",
-                yellow_intent_id: null,
-                sui_tx_digest: null,
-                arc_tx_hash: null,
-                result_text: null,
-                error_text: policyDecision.reason
-              });
-              await updateCommandsRowCells({
-                docs,
-                docId,
-                commandsTable: (await loadDocWalletTables({ docs, docId })).commands.table,
-                rowIndex: row.rowIndex,
-                updates: { id: cmdId, status: "REJECTED_POLICY", error: policyDecision.reason, approvalUrl: "" }
-              });
-              await this.audit(docId, `${cmdId} REJECTED_POLICY (${policyDecision.reason})`);
-              continue;
-            }
-
-            const initialStatus = parsed.value.type === "SETUP" ? "APPROVED" : "PENDING_APPROVAL";
+            const AUTO_APPROVE_TYPES = new Set(["SETUP", "STATUS", "PRICE", "TRADE_HISTORY", "TREASURY", "SESSION_STATUS", "SWEEP_YIELD", "ALERT_THRESHOLD", "AUTO_REBALANCE", "DEPOSIT", "WITHDRAW", "SETTLE", "SESSION_CREATE", "SESSION_CLOSE"]);
+            const demoModeAutoApprove = config.DEMO_MODE || (configMap["DEMO_MODE"]?.value?.trim() === "1");
+            const initialStatus = (AUTO_APPROVE_TYPES.has(parsed.value.type) || demoModeAutoApprove) ? "APPROVED" : "PENDING_APPROVAL";
             repo.upsertCommand({
               cmd_id: cmdId,
               doc_id: docId,
@@ -317,8 +278,10 @@ export class Engine {
                   updates: { status: "INVALID", error: parsed.error }
                 });
               } else {
+                const AUTO_APPROVE_TYPES_EDIT = new Set(["SETUP", "STATUS", "PRICE", "TRADE_HISTORY", "TREASURY", "SESSION_STATUS", "SWEEP_YIELD", "ALERT_THRESHOLD", "AUTO_REBALANCE", "DEPOSIT", "WITHDRAW", "SETTLE", "SESSION_CREATE", "SESSION_CLOSE"]);
+                const demoModeEdit = config.DEMO_MODE || (configMap["DEMO_MODE"]?.value?.trim() === "1");
                 const newStatus =
-                  parsed.value.type === "SETUP" ? "APPROVED" : "PENDING_APPROVAL";
+                  (AUTO_APPROVE_TYPES_EDIT.has(parsed.value.type) || demoModeEdit) ? "APPROVED" : "PENDING_APPROVAL";
                 repo.upsertCommand({
                   cmd_id: existing.cmd_id,
                   doc_id: existing.doc_id,
@@ -368,11 +331,6 @@ export class Engine {
         }
 
         repo.setDocLastUserHash(docId, commandsHash);
-
-        // Best-effort ensure config points to ENS if set.
-        if (ensName && configMap["POLICY_SOURCE"]?.value !== "ENS") {
-          repo.setDocPolicy(docId, { policySource: "ENS", ensName });
-        }
       }
     } finally {
       this.pollRunning = false;
@@ -457,53 +415,79 @@ export class Engine {
         }
         if (!secrets) continue; // Not set up yet
 
-        const tables = await loadDocWalletTables({ docs, docId });
-        const configMap = readConfig(tables.config.table);
+        let tables, configMap;
+        try {
+          tables = await loadDocWalletTables({ docs, docId });
+          configMap = readConfig(tables.config.table);
+        } catch (err) {
+          console.error(`[balances] ${docId.slice(0, 8)}… skipped — ${(err as Error).message}`);
+          continue;
+        }
 
         const balanceEntries: Array<{ location: string; asset: string; balance: string }> = [];
 
-        // --- Sui balances ---
+        // --- Sui balances (human-friendly labels) ---
         if (deepbook && secrets.sui) {
           try {
             const bals = await deepbook.getWalletBalances({ address: secrets.sui.address });
-            balanceEntries.push({ location: "Sui", asset: "SUI", balance: bals.suiBalance });
-            balanceEntries.push({ location: "Sui", asset: "DBUSDC", balance: bals.dbUsdcBalance });
+            const suiBal = Number(bals.suiBalance);
+            const dbUsdcBal = Number(bals.dbUsdcBalance);
+            const cachedP = repo.getPrice("SUI/USDC");
+            const suiUsd = cachedP && cachedP.mid_price > 0 && Number.isFinite(suiBal) && suiBal > 0
+              ? ` ($${(suiBal * cachedP.mid_price).toFixed(2)})`
+              : "";
+            balanceEntries.push({ location: "Sui Network", asset: "SUI", balance: `${bals.suiBalance}${suiUsd}` });
+            balanceEntries.push({ location: "Sui DeepBook", asset: "USDC (DeepBook)", balance: bals.dbUsdcBalance });
           } catch {
-            balanceEntries.push({ location: "Sui", asset: "SUI", balance: "err" });
+            // Retry once after 2s
+            try {
+              await new Promise(r => setTimeout(r, 2000));
+              const bals = await deepbook.getWalletBalances({ address: secrets.sui.address });
+              balanceEntries.push({ location: "Sui Network", asset: "SUI", balance: bals.suiBalance });
+              balanceEntries.push({ location: "Sui DeepBook", asset: "USDC (DeepBook)", balance: bals.dbUsdcBalance });
+            } catch {
+              balanceEntries.push({ location: "Sui Network", asset: "SUI", balance: "Unavailable" });
+            }
           }
         }
 
-        // --- Arc balances (EVM wallet) ---
+        // --- Arc balances (EVM wallet, human-friendly labels) ---
         if (arc && secrets.evm) {
           try {
             const bals = await arc.getBalances(secrets.evm.address as `0x${string}`);
-            balanceEntries.push({ location: "Arc", asset: "Native", balance: bals.nativeBalance });
-            balanceEntries.push({ location: "Arc", asset: "USDC", balance: bals.usdcBalance });
+            balanceEntries.push({ location: "Arc Network", asset: "ETH (Arc)", balance: bals.nativeBalance });
+            balanceEntries.push({ location: "Arc Network", asset: "USDC (Arc)", balance: bals.usdcBalance });
           } catch {
-            balanceEntries.push({ location: "Arc", asset: "USDC", balance: "err" });
+            try {
+              await new Promise(r => setTimeout(r, 2000));
+              const bals = await arc.getBalances(secrets.evm.address as `0x${string}`);
+              balanceEntries.push({ location: "Arc Network", asset: "ETH (Arc)", balance: bals.nativeBalance });
+              balanceEntries.push({ location: "Arc Network", asset: "USDC (Arc)", balance: bals.usdcBalance });
+            } catch {
+              balanceEntries.push({ location: "Arc Network", asset: "USDC (Arc)", balance: "Unavailable" });
+            }
           }
         }
 
-        // --- Circle wallet balance ---
+        // --- Circle wallet balance (human-friendly) ---
         if (circle) {
           const circleWallet = repo.getCircleWallet(docId);
           if (circleWallet) {
             try {
               const bal = await circle.getWalletBalance(circleWallet.wallet_id);
-              balanceEntries.push({ location: "Circle/Arc", asset: "USDC", balance: bal.usdcBalance });
+              balanceEntries.push({ location: "Circle Account", asset: "USDC (Managed)", balance: bal.usdcBalance });
             } catch {
-              balanceEntries.push({ location: "Circle/Arc", asset: "USDC", balance: "err" });
+              balanceEntries.push({ location: "Circle Account", asset: "USDC (Managed)", balance: "Unable to fetch (retrying...)" });
             }
           }
         }
 
-        // --- Yellow state channel balance ---
+        // --- Yellow state channel balance (human-friendly) ---
         const yellowSession = repo.getYellowSession(docId);
         if (yellowSession && yellowSession.status === "OPEN") {
           const allocs: YellowAllocation[] = JSON.parse(yellowSession.allocations_json || "[]");
           const yellowTotal = allocs.reduce((sum, a) => sum + parseFloat(a.amount || "0"), 0);
-          const yellowAssetLabel = (config.YELLOW_ASSET ?? "ytest.usd").toUpperCase();
-          balanceEntries.push({ location: "Yellow", asset: yellowAssetLabel, balance: yellowTotal.toFixed(2) });
+          balanceEntries.push({ location: "Yellow Channel", asset: "USDC (Off-chain)", balance: yellowTotal.toFixed(2) });
         }
 
         // --- Portfolio Valuation (USD value using live prices) ---
@@ -523,7 +507,26 @@ export class Engine {
               // Arc native (ETH-equivalent) — approximate as 0 for now
             }
           }
-          balanceEntries.push({ location: "Portfolio", asset: "USD Value", balance: `$${totalUsdValue.toFixed(2)}` });
+          balanceEntries.push({ location: "Total Portfolio", asset: "USD Value", balance: `$${totalUsdValue.toFixed(2)}` });
+
+          // Add allocation percentages per chain
+          if (totalUsdValue > 0) {
+            const chainTotals: Record<string, number> = {};
+            for (const entry of balanceEntries) {
+              if (entry.location === "Updated" || entry.location === "Total Portfolio") continue;
+              const bal = Number(entry.balance.replace(/[^0-9.-]/g, ""));
+              if (!Number.isFinite(bal) || bal <= 0) continue;
+              const chain = entry.location.split(" ")[0]; // Sui, Arc, Circle, Yellow
+              chainTotals[chain] = (chainTotals[chain] ?? 0) + (entry.asset.includes("SUI") ? bal * (cachedPrice?.mid_price ?? 0) : bal);
+            }
+            const allocParts: string[] = [];
+            for (const [chain, total] of Object.entries(chainTotals)) {
+              if (total > 0) allocParts.push(`${chain} ${((total / totalUsdValue) * 100).toFixed(0)}%`);
+            }
+            if (allocParts.length > 0) {
+              balanceEntries.push({ location: "Allocation", asset: "By Chain", balance: allocParts.join(", ") });
+            }
+          }
 
           // Add P&L summary
           const stats = repo.getTradeStats(docId);
@@ -542,6 +545,66 @@ export class Engine {
 
         // Timestamp row
         balanceEntries.push({ location: "Updated", asset: "", balance: new Date().toISOString().slice(0, 19) });
+
+        // --- Treasury Health Metrics (Arc+Circle track highlight) ---
+        {
+          let arcUsdcAvail = 0;
+          let spentToday = 0;
+          let scheduledPayouts24h = 0;
+
+          // Arc USDC available (Circle wallet)
+          if (circle) {
+            const cw = repo.getCircleWallet(docId);
+            if (cw) {
+              try {
+                const bal = await circle.getWalletBalance(cw.wallet_id);
+                arcUsdcAvail = Number(bal?.usdcBalance ?? 0);
+              } catch { /* skip */ }
+            }
+          }
+          // Also add direct EVM USDC if available
+          if (arc && secrets.evm) {
+            try {
+              const arcBals = await arc.getBalances(secrets.evm.address as `0x${string}`);
+              arcUsdcAvail += Number(arcBals.usdcBalance ?? 0);
+            } catch { /* skip */ }
+          }
+
+          // Daily spend from commands
+          spentToday = repo.getDailySpendUsdc(docId);
+
+          // Scheduled payouts in next 24h (from payout rules)
+          try {
+            const prTable = await loadPayoutRulesTable({ docs, docId });
+            if (prTable) {
+              const rules = readPayoutRulesTable(prTable);
+              for (const rule of rules) {
+                if (rule.status === "PAUSED" || rule.status === "DONE") continue;
+                const amt = Number(rule.amountUsdc);
+                if (Number.isFinite(amt) && amt > 0) scheduledPayouts24h += amt;
+              }
+            }
+          } catch { /* no payout rules table — fine */ }
+
+          const runwayDays = arcUsdcAvail > 0 && scheduledPayouts24h > 0
+            ? Math.floor(arcUsdcAvail / scheduledPayouts24h)
+            : arcUsdcAvail > 0 ? 999 : 0;
+
+          const fundingStatus = runwayDays >= 30 ? "🟢 HEALTHY"
+            : runwayDays >= 7 ? "🟡 LOW"
+            : arcUsdcAvail > 0 ? "🔴 CRITICAL"
+            : "⚪ NO_FUNDS";
+
+          balanceEntries.push({ location: "Treasury", asset: "ARC_USDC", balance: `$${arcUsdcAvail.toFixed(2)}` });
+          if (spentToday > 0) {
+            balanceEntries.push({ location: "Treasury", asset: "SPENT_TODAY", balance: `$${spentToday.toFixed(2)}` });
+          }
+          if (scheduledPayouts24h > 0) {
+            balanceEntries.push({ location: "Treasury", asset: "SCHEDULED_24H", balance: `$${scheduledPayouts24h.toFixed(2)}` });
+          }
+          balanceEntries.push({ location: "Treasury", asset: "RUNWAY", balance: `${runwayDays} days` });
+          balanceEntries.push({ location: "Treasury", asset: "STATUS", balance: fundingStatus });
+        }
 
         await updateBalancesTable({ docs, docId, balancesTable: tables.balances.table, entries: balanceEntries });
 
@@ -682,6 +745,18 @@ export class Engine {
 
         repo.triggerConditionalOrder(order.order_id, cmdId);
         repo.insertAgentActivity(docId, order.type, `${order.type} triggered at ${priceData.mid.toFixed(4)}, sell ${order.qty} SUI -> ${cmdId}`);
+
+        // Attempt immediate execution for time-sensitive conditional orders (retry once on failure)
+        try {
+          const command: ParsedCommand = { type: "MARKET_SELL", base: "SUI", quote: "USDC", qty: order.qty };
+          const result = await this.execute(docId, cmdId, command);
+          repo.setCommandExecutionIds(cmdId, { suiTxDigest: result.suiTxDigest, arcTxHash: result.arcTxHash });
+          repo.setCommandStatus(cmdId, "EXECUTED", { resultText: result.resultText, errorText: null });
+          console.log(`[price] ${order.type} executed immediately: ${result.resultText}`);
+        } catch (execErr) {
+          console.warn(`[price] ${order.type} immediate exec failed, will retry via executorTick:`, (execErr as Error).message);
+          // Leave as APPROVED — executorTick will pick it up as a retry
+        }
 
         // Write to doc
         try {
@@ -920,22 +995,15 @@ export class Engine {
       const secrets = existing ?? createAndStoreDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
       repo.setDocAddresses(docId, { evmAddress: secrets.evm.address, suiAddress: secrets.sui.address });
 
-      let tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
-      await writeConfigValue({
-        docs: this.ctx.docs,
-        docId,
-        configTable: tables.config.table,
-        key: "EVM_ADDRESS",
-        value: secrets.evm.address
-      });
-      await writeConfigValue({
-        docs: this.ctx.docs,
-        docId,
-        configTable: tables.config.table,
-        key: "SUI_ADDRESS",
-        value: secrets.sui.address
-      });
-      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "STATUS", value: "READY" });
+      // Helper: write a config value then reload tables so indices stay fresh
+      const safeWriteConfig = async (key: string, value: string) => {
+        const t = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+        await writeConfigValue({ docs: this.ctx.docs, docId, configTable: t.config.table, key, value });
+      };
+
+      await safeWriteConfig("EVM_ADDRESS", secrets.evm.address);
+      await safeWriteConfig("SUI_ADDRESS", secrets.sui.address);
+      await safeWriteConfig("STATUS", "READY");
 
       // Circle/Arc dev-controlled wallet (track-winner path)
       let circleAddr = "";
@@ -943,26 +1011,14 @@ export class Engine {
         const existingCircle = repo.getCircleWallet(docId);
         if (existingCircle) {
           circleAddr = existingCircle.wallet_address;
-          await writeConfigValue({
-            docs: this.ctx.docs,
-            docId,
-            configTable: tables.config.table,
-            key: "ARC_WALLET_ADDRESS",
-            value: existingCircle.wallet_address
-          });
-          await writeConfigValue({
-            docs: this.ctx.docs,
-            docId,
-            configTable: tables.config.table,
-            key: "ARC_WALLET_ID",
-            value: existingCircle.wallet_id
-          });
+          await safeWriteConfig("ARC_WALLET_ADDRESS", existingCircle.wallet_address);
+          await safeWriteConfig("ARC_WALLET_ID", existingCircle.wallet_id);
         } else {
           const w = await circle.createArcWallet();
           repo.upsertCircleWallet({ docId, walletSetId: w.walletSetId, walletId: w.walletId, walletAddress: w.address });
           circleAddr = w.address;
-          await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "ARC_WALLET_ADDRESS", value: w.address });
-          await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "ARC_WALLET_ID", value: w.walletId });
+          await safeWriteConfig("ARC_WALLET_ADDRESS", w.address);
+          await safeWriteConfig("ARC_WALLET_ID", w.walletId);
         }
       }
 
@@ -970,42 +1026,25 @@ export class Engine {
       return { resultText: `EVM=${secrets.evm.address} SUI=${secrets.sui.address}${extra}` };
     }
 
-    if (command.type === "POLICY_ENS") {
-      repo.setDocPolicy(docId, { policySource: "ENS", ensName: command.ensName });
-      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
-      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "POLICY_SOURCE", value: "ENS" });
-      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "ENS_NAME", value: command.ensName });
-      return { resultText: `ENS=${command.ensName}` };
-    }
-
     if (command.type === "QUORUM") {
-      repo.setDocQuorum(docId, command.quorum);
-      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
-      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "QUORUM", value: String(command.quorum) });
-      return { resultText: `QUORUM=${command.quorum}` };
+      return { resultText: "Single-user mode — quorum is always 1 (owner only)." };
     }
 
     if (command.type === "SIGNER_ADD") {
-      repo.upsertSigner({ docId, address: command.address, weight: command.weight });
-      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
-      const signers = repo.listSigners(docId).map((s) => s.address).join(",");
-      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "SIGNERS", value: signers });
-      return { resultText: `SIGNER_ADDED=${command.address} WEIGHT=${command.weight}` };
+      return { resultText: "Single-user mode — external signers are not needed. You approve commands directly." };
     }
 
     if (command.type === "STATUS") {
-      const q = repo.getDocQuorum(docId);
-      const signerCount = repo.listSigners(docId).length;
       const y = repo.getYellowSession(docId);
-      let status = "YELLOW_SESSION=NONE";
+      let status = "MODE=SINGLE_USER YELLOW_SESSION=NONE";
       if (y) {
         const allocs: { participant: string; amount: string }[] = JSON.parse(y.allocations_json || "[]");
         const allocSummary = allocs.length > 0
           ? ` ALLOC=[${allocs.map(a => `${a.participant.slice(0,8)}..=${a.amount}`).join(",")}]`
           : "";
-        status = `YELLOW_SESSION=${y.app_session_id} v${y.version} ${y.status}${allocSummary}`;
+        status = `MODE=SINGLE_USER YELLOW_SESSION=${y.app_session_id} v${y.version} ${y.status}${allocSummary}`;
       }
-      return { resultText: `QUORUM=${q} SIGNERS=${signerCount} ${status}` };
+      return { resultText: status };
     }
 
     if (command.type === "PRICE") {
@@ -1079,54 +1118,19 @@ export class Engine {
 
     if (command.type === "SESSION_CREATE") {
       if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1 and YELLOW_RPC_URL)");
-      const signers = repo.listSigners(docId);
-      if (signers.length === 0) throw new Error("No signers registered. Use the /join page first.");
-      const quorum = repo.getDocQuorum(docId);
-      const keyRows = signers.map((s) => ({ signer: s, key: repo.getYellowSessionKey({ docId, signerAddress: s.address }) }));
-      const missing = keyRows.filter((r) => !r.key).map((r) => r.signer.address);
-      if (missing.length) throw new Error(`Missing Yellow session keys for: ${missing.join(", ")}. Re-join via /join/<docId>.`);
 
-      const now = Date.now();
-      const expired = keyRows.filter((r) => (r.key?.expires_at ?? 0) <= now).map((r) => r.signer.address);
-      if (expired.length) throw new Error(`Expired Yellow session keys for: ${expired.join(", ")}. Re-join via /join/<docId>.`);
+      // Idempotent: if session already exists and is OPEN, return it
+      const existingSession = repo.getYellowSession(docId);
+      if (existingSession && existingSession.status === "OPEN") {
+        const allocs: YellowAllocation[] = JSON.parse(existingSession.allocations_json || "[]");
+        const allocSummary = allocs.map(a => `${a.participant.slice(0,8)}..=${a.amount}`).join(", ");
+        return { resultText: `YELLOW_SESSION=${existingSession.app_session_id} (already open v${existingSession.version}) ALLOC=[${allocSummary}]` };
+      }
 
-      const definition = {
-        protocol: "NitroRPC/0.4",
-        // Participants are the delegated session keys so they can sign without repeated wallet prompts.
-        participants: keyRows.map((r) => r.key!.session_key_address),
-        weights: signers.map((s) => s.weight),
-        quorum,
-        challenge: 86400,
-        nonce: Date.now()
-      };
-      const definitionJson = JSON.stringify(definition);
-      const signerPrivateKeysHex = keyRows.map((r) => {
-        const plain = decryptWithMasterKey({ masterKey: config.DOCWALLET_MASTER_KEY, blob: r.key!.encrypted_session_key_private });
-        const parsed = JSON.parse(plain.toString("utf8")) as { privateKeyHex: `0x${string}` };
-        return parsed.privateKeyHex;
-      });
-
-      // Build initial allocations: each participant locks tokens from their unified balance.
-      // Yellow uses 'ytest.usd' in sandbox, 'usdc' in production.
-      const yellowAsset = config.YELLOW_ASSET ?? "ytest.usd";
-      const perParticipantAmount = "100.0";
-      const initialAllocations: YellowAllocation[] = keyRows.map((r) => ({
-        participant: r.key!.session_key_address,
-        asset: yellowAsset,
-        amount: perParticipantAmount
-      }));
-
-      const created = await yellow.createAppSession({ signerPrivateKeysHex, definition, sessionData: `DocWallet:${docId}`, allocations: initialAllocations });
-      const appSessionId = created.appSessionId as any;
-
-      repo.upsertYellowSession({ docId, appSessionId, definitionJson, version: 0, status: "OPEN", allocationsJson: JSON.stringify(initialAllocations) });
-
-      const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
-      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "YELLOW_SESSION_ID", value: appSessionId });
-      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "YELLOW_PROTOCOL", value: "NitroRPC/0.4" });
-
-      const allocSummary = initialAllocations.map(a => `${a.participant.slice(0,8)}..=${a.amount}`).join(", ");
-      return { resultText: `YELLOW_SESSION=${appSessionId} LOCKED=[${allocSummary}]` };
+      const session = await this.autoCreateYellowSession(docId);
+      const allocs: YellowAllocation[] = JSON.parse(session.allocations_json || "[]");
+      const allocSummary = allocs.map(a => `${a.participant.slice(0,8)}..=${a.amount}`).join(", ");
+      return { resultText: `YELLOW_SESSION=${session.app_session_id} LOCKED=[${allocSummary}]` };
     }
 
     if (command.type === "CONNECT") {
@@ -1171,14 +1175,71 @@ export class Engine {
       return { resultText: `AUTO_REBALANCE=${command.enabled ? "ON" : "OFF"}` };
     }
 
-    const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
-    if (!secrets) throw new Error("Missing wallets. Run DW /setup first.");
+    let secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+    if (!secrets) {
+      // === AUTO-SETUP: transparently create wallets on first real command ===
+      console.log(`[engine] Auto-setup wallets for ${docId.slice(0, 8)}…`);
+      secrets = createAndStoreDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+      repo.setDocAddresses(docId, { evmAddress: secrets.evm.address, suiAddress: secrets.sui.address });
+      try {
+        // Helper: write config then reload to keep indices fresh
+        const autoSetupWrite = async (key: string, value: string) => {
+          const t = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+          await writeConfigValue({ docs: this.ctx.docs, docId, configTable: t.config.table, key, value });
+        };
+        await autoSetupWrite("EVM_ADDRESS", secrets.evm.address);
+        await autoSetupWrite("SUI_ADDRESS", secrets.sui.address);
+        await autoSetupWrite("STATUS", `READY (${new Date().toISOString().slice(0, 19)})`);
+        // Auto-create Circle wallet too
+        if (circle) {
+          const existingCircle = repo.getCircleWallet(docId);
+          if (!existingCircle) {
+            const w = await circle.createArcWallet();
+            repo.upsertCircleWallet({ docId, walletSetId: w.walletSetId, walletId: w.walletId, walletAddress: w.address });
+            await autoSetupWrite("ARC_WALLET_ADDRESS", w.address);
+            await autoSetupWrite("ARC_WALLET_ID", w.walletId);
+          }
+        }
 
-    // Re-check policy at execution time (best effort).
-    const d = repo.getDoc(docId);
-    const ensName = d?.ens_name?.trim() ?? "";
-    const policyDecision = await this.checkPolicyIfPresent(ensName, command);
-    if (!policyDecision.ok) throw new Error(policyDecision.reason);
+        // === WELCOME MESSAGE: Write to Chat table for first-time users ===
+        try {
+          const freshTables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+          const chatRows = readChatTable(freshTables.chat.table);
+          const hasWelcome = chatRows.some(r => r.agent?.includes("Welcome to FrankyDocs"));
+          if (!hasWelcome) {
+            const emptyRow = chatRows.find(r => !r.user && !r.agent);
+            if (emptyRow) {
+              await updateChatRowCells({
+                docs: this.ctx.docs, docId,
+                chatTable: freshTables.chat.table,
+                rowIndex: emptyRow.rowIndex,
+                agent: "Welcome to FrankyDocs! Your treasury accounts are ready. Try typing 'buy 10 SUI' in the Commands table or ask me anything here. Your funds are secured by enterprise-grade managed accounts — no browser extensions or seed phrases needed."
+              });
+            }
+          }
+        } catch { /* best effort welcome message */ }
+
+        // === TESTNET AUTO-FUNDING: Fund Sui wallet in demo/testnet mode ===
+        const demoMode = config.DEMO_MODE;
+        if (demoMode && secrets.sui.address) {
+          try {
+            console.log(`[engine] Demo mode: auto-funding Sui wallet ${secrets.sui.address.slice(0, 10)}…`);
+            const faucetResult = await requestTestnetSui({ address: secrets.sui.address, faucetUrl: config.SUI_FAUCET_URL });
+            if (faucetResult.ok) {
+              await appendRecentActivityRow({
+                docs: this.ctx.docs, docId,
+                timestampIso: new Date().toISOString(),
+                type: "AUTO_FUND",
+                details: "Funded your Sui wallet with testnet SUI so you can start trading immediately.",
+                tx: ""
+              });
+            }
+            await this.audit(docId, `AUTO_FUND Sui ${faucetResult.ok ? "OK" : "FAILED"}: ${faucetResult.message}`);
+          } catch { /* best effort faucet */ }
+        }
+      } catch { /* best effort config writes */ }
+      await this.audit(docId, `AUTO_SETUP wallets created EVM=${secrets.evm.address} SUI=${secrets.sui.address}`);
+    }
 
     if (command.type === "WC_TX") {
       if (command.chainId !== 5042002) throw new Error(`Unsupported chainId ${command.chainId} (expected 5042002)`);
@@ -1211,8 +1272,16 @@ export class Engine {
 
     if (command.type === "PAYOUT") {
       if (circle) {
-        const w = repo.getCircleWallet(docId);
-        if (!w) throw new Error("Missing Circle Arc wallet. Run DW /setup first.");
+        let w = repo.getCircleWallet(docId);
+        if (!w) {
+          // === AUTO-CREATE Circle wallet for payout ===
+          console.log(`[engine] Auto-creating Circle wallet for PAYOUT on ${docId.slice(0, 8)}…`);
+          const created = await circle.createArcWallet();
+          repo.upsertCircleWallet({ docId, walletSetId: created.walletSetId, walletId: created.walletId, walletAddress: created.address });
+          w = repo.getCircleWallet(docId);
+          if (!w) throw new Error("Failed to auto-create Circle wallet");
+          await this.audit(docId, `AUTO_CREATE Circle wallet=${created.address}`);
+        }
         const out = await circle.payout({
           walletId: w.wallet_id,
           walletAddress: w.wallet_address as `0x${string}`,
@@ -1233,8 +1302,16 @@ export class Engine {
 
     if (command.type === "PAYOUT_SPLIT") {
       if (circle) {
-        const w = repo.getCircleWallet(docId);
-        if (!w) throw new Error("Missing Circle Arc wallet. Run DW /setup first.");
+        let w = repo.getCircleWallet(docId);
+        if (!w) {
+          // === AUTO-CREATE Circle wallet for payout split ===
+          console.log(`[engine] Auto-creating Circle wallet for PAYOUT_SPLIT on ${docId.slice(0, 8)}…`);
+          const created = await circle.createArcWallet();
+          repo.upsertCircleWallet({ docId, walletSetId: created.walletSetId, walletId: created.walletId, walletAddress: created.address });
+          w = repo.getCircleWallet(docId);
+          if (!w) throw new Error("Failed to auto-create Circle wallet");
+          await this.audit(docId, `AUTO_CREATE Circle wallet=${created.address}`);
+        }
         const txHashes: string[] = [];
         const circleTxIds: string[] = [];
         for (const r of command.recipients) {
@@ -1269,8 +1346,16 @@ export class Engine {
 
     if (command.type === "BRIDGE") {
       if (!circle) throw new Error("BRIDGE requires Circle (set CIRCLE_ENABLED=1)");
-      const w = repo.getCircleWallet(docId);
-      if (!w) throw new Error("Missing Circle Arc wallet. Run DW /setup first.");
+      let w = repo.getCircleWallet(docId);
+      if (!w) {
+        // === AUTO-CREATE Circle wallet for bridge ===
+        console.log(`[engine] Auto-creating Circle wallet for BRIDGE on ${docId.slice(0, 8)}…`);
+        const created = await circle.createArcWallet();
+        repo.upsertCircleWallet({ docId, walletSetId: created.walletSetId, walletId: created.walletId, walletAddress: created.address });
+        w = repo.getCircleWallet(docId);
+        if (!w) throw new Error("Failed to auto-create Circle wallet");
+        await this.audit(docId, `AUTO_CREATE Circle wallet=${created.address}`);
+      }
 
       // Determine destination address based on target chain
       let destinationAddress = "";
@@ -1303,15 +1388,10 @@ export class Engine {
       if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1)");
       const session = repo.getYellowSession(docId);
       if (!session) throw new Error("No Yellow session found. Create one with DW SESSION_CREATE.");
-      const signers = repo.listSigners(docId);
-      const keyRows = signers.map((s) => ({ signer: s, key: repo.getYellowSessionKey({ docId, signerAddress: s.address }) }));
-      const signerPrivateKeysHex = keyRows
-        .filter((r) => r.key)
-        .map((r) => {
-          const plain = decryptWithMasterKey({ masterKey: config.DOCWALLET_MASTER_KEY, blob: r.key!.encrypted_session_key_private });
-          const parsed = JSON.parse(plain.toString("utf8")) as { privateKeyHex: `0x${string}` };
-          return parsed.privateKeyHex;
-        });
+      // Single-user mode: use doc owner's EVM key
+      const closeSecrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+      if (!closeSecrets) throw new Error("No wallet secrets found.");
+      const signerPrivateKeysHex: `0x${string}`[] = [closeSecrets.evm.privateKeyHex as `0x${string}`];
 
       // Load final allocations for settlement — funds return to unified balances
       const finalAllocations: YellowAllocation[] = JSON.parse(session.allocations_json || "[]");
@@ -1331,7 +1411,7 @@ export class Engine {
     if (command.type === "SESSION_STATUS") {
       if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1)");
       const session = repo.getYellowSession(docId);
-      if (!session) return { resultText: "YELLOW_SESSION=NONE" };
+      if (!session) return { resultText: "YELLOW_SESSION=NONE (type any YELLOW_SEND command to auto-create)" };
       const status = await yellow.getSessionStatus({ appSessionId: session.app_session_id });
       const connInfo = yellow.getConnectionInfo();
       return {
@@ -1341,8 +1421,14 @@ export class Engine {
 
     if (command.type === "YELLOW_SEND") {
       if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1)");
-      const session = repo.getYellowSession(docId);
-      if (!session) throw new Error("No Yellow session found. Create one with DW SESSION_CREATE.");
+      let session = repo.getYellowSession(docId);
+
+      // === AUTO-CREATE SESSION if none exists (seamless UX) ===
+      if (!session || session.status !== "OPEN") {
+        console.log(`[Yellow] Auto-creating session for YELLOW_SEND on ${docId.slice(0, 8)}…`);
+        session = await this.autoCreateYellowSession(docId);
+      }
+
       if (session.status !== "OPEN") throw new Error(`Yellow session is ${session.status}. Only OPEN sessions can send.`);
 
       // Load current allocations from DB (FINAL state, not deltas)
@@ -1368,16 +1454,10 @@ export class Engine {
         newAllocations.push({ participant: command.to, asset: yellowAsset, amount: command.amountUsdc.toFixed(6) });
       }
 
-      // Get session signing keys
-      const signers = repo.listSigners(docId);
-      const keyRows = signers.map((s) => ({ signer: s, key: repo.getYellowSessionKey({ docId, signerAddress: s.address }) }));
-      const signerPrivateKeysHex = keyRows
-        .filter((r) => r.key)
-        .map((r) => {
-          const plain = decryptWithMasterKey({ masterKey: config.DOCWALLET_MASTER_KEY, blob: r.key!.encrypted_session_key_private });
-          const parsed = JSON.parse(plain.toString("utf8")) as { privateKeyHex: `0x${string}` };
-          return parsed.privateKeyHex;
-        });
+      // Single-user mode: use doc owner's EVM key for signing
+      const sendSecrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+      if (!sendSecrets) throw new Error("No wallet secrets found.");
+      const signerPrivateKeysHex: `0x${string}`[] = [sendSecrets.evm.privateKeyHex as `0x${string}`];
 
       const newVersion = session.version + 1;
       const cmdId = `ysend_${Date.now()}_${sha256Hex(`${docId}:${command.amountUsdc}:${command.to}`).slice(0, 8)}`;
@@ -1413,8 +1493,16 @@ export class Engine {
       const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
       const cfg = readConfig(tables.config.table);
       const poolKey = cfg["DEEPBOOK_POOL"]?.value?.trim() || "SUI_DBUSDC";
-      const managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
-      if (!managerId) throw new Error("No DeepBook manager. Place an order first or run DW /setup.");
+      let managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
+      if (!managerId) {
+        // Auto-create manager
+        const setupRes = await deepbook.execute({ docId, command: { type: "SETUP" } as any, wallet: secrets.sui, poolKey, managerId: undefined });
+        if (setupRes?.managerId) {
+          managerId = setupRes.managerId;
+          try { await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "DEEPBOOK_MANAGER", value: managerId }); } catch {}
+        }
+        if (!managerId) throw new Error("Failed to auto-create DeepBook manager");
+      }
       const res = await deepbook.deposit({ wallet: secrets.sui, poolKey, managerId, coinType: command.coinType, amount: command.amount });
       return { suiTxDigest: res.txDigest, resultText: `DEPOSITED ${command.amount} ${command.coinType} SuiTx=${res.txDigest}` };
     }
@@ -1424,8 +1512,16 @@ export class Engine {
       const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
       const cfg = readConfig(tables.config.table);
       const poolKey = cfg["DEEPBOOK_POOL"]?.value?.trim() || "SUI_DBUSDC";
-      const managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
-      if (!managerId) throw new Error("No DeepBook manager. Place an order first or run DW /setup.");
+      let managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
+      if (!managerId) {
+        // Auto-create manager
+        const setupRes = await deepbook.execute({ docId, command: { type: "SETUP" } as any, wallet: secrets.sui, poolKey, managerId: undefined });
+        if (setupRes?.managerId) {
+          managerId = setupRes.managerId;
+          try { await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "DEEPBOOK_MANAGER", value: managerId }); } catch {}
+        }
+        if (!managerId) throw new Error("Failed to auto-create DeepBook manager");
+      }
       const res = await deepbook.withdraw({ wallet: secrets.sui, poolKey, managerId, coinType: command.coinType, amount: command.amount });
       return { suiTxDigest: res.txDigest, resultText: `WITHDRAWN ${command.amount} ${command.coinType} SuiTx=${res.txDigest}` };
     }
@@ -1435,18 +1531,117 @@ export class Engine {
       const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
       const cfg = readConfig(tables.config.table);
       const poolKey = cfg["DEEPBOOK_POOL"]?.value?.trim() || "SUI_DBUSDC";
-      const managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
-      if (!managerId) throw new Error("No DeepBook manager. Place an order first or run DW /setup.");
+      let managerId = cfg["DEEPBOOK_MANAGER"]?.value?.trim();
+      const demoMode = config.DEMO_MODE || (cfg["DEMO_MODE"]?.value?.trim() === "1");
 
-      // Pre-flight gas check
+      // === AUTO-CREATE DeepBook manager if none exists ===
+      if (!managerId) {
+        console.log(`[engine] Auto-creating DeepBook manager for ${docId.slice(0, 8)}…`);
+        const setupRes = await deepbook.execute({ docId, command: { type: "SETUP" } as any, wallet: secrets.sui, poolKey, managerId: undefined });
+        if (setupRes?.managerId) {
+          managerId = setupRes.managerId;
+          try {
+            await writeConfigValue({ docs: this.ctx.docs, docId, configTable: tables.config.table, key: "DEEPBOOK_MANAGER", value: managerId });
+          } catch { /* best effort */ }
+          await this.audit(docId, `AUTO_CREATE DeepBook manager=${managerId}`);
+        }
+        if (!managerId) throw new Error("Failed to auto-create DeepBook manager");
+      }
+
+      // Pre-flight gas check — auto-faucet in demo mode
       const gasCheck = await deepbook.checkGas({ address: secrets.sui.address });
-      if (!gasCheck.ok) throw new Error(`Insufficient SUI gas: ${gasCheck.suiBalance} SUI < ${gasCheck.minRequired} SUI minimum`);
+      if (!gasCheck.ok) {
+        if (demoMode) {
+          console.log(`[engine] Demo mode: requesting SUI faucet for ${secrets.sui.address.slice(0, 10)}…`);
+          const faucetResult = await requestTestnetSui({ address: secrets.sui.address, faucetUrl: config.SUI_FAUCET_URL });
+          await this.audit(docId, `SUI_FAUCET ${faucetResult.ok ? "OK" : "FAILED"}: ${faucetResult.message}`);
+          if (!faucetResult.ok) {
+            throw new Error(`Insufficient SUI gas and faucet failed: ${faucetResult.message}`);
+          }
+          // Wait a moment for faucet tx to land
+          await new Promise(r => setTimeout(r, 2000));
+        } else {
+          throw new Error(`Insufficient SUI gas: ${gasCheck.suiBalance} SUI < ${gasCheck.minRequired} SUI minimum`);
+        }
+      }
 
+      // Route planning — check DBUSDC balance for buys, SUI balance for sells
       const side = command.type === "MARKET_BUY" ? "buy" as const : "sell" as const;
+      const midPrice = repo.getPrice("SUI/USDC")?.mid_price ?? 0;
+      let routeSummary = "";
+
+      // Pre-flight balance validation
+      if (midPrice > 0) {
+        try {
+          const preflight = await deepbook.getWalletBalances({ address: secrets.sui.address });
+          if (side === "buy") {
+            const usdcNeeded = command.qty * midPrice * 1.02; // 2% slippage buffer
+            const available = Number(preflight.dbUsdcBalance);
+            if (available < usdcNeeded && available < 0.01) {
+              throw new Error(`Insufficient USDC for buy: need ~${usdcNeeded.toFixed(2)} USDC, have ${preflight.dbUsdcBalance} USDC in DeepBook. Deposit USDC first.`);
+            }
+          } else {
+            const suiAvailable = Number(preflight.suiBalance);
+            if (suiAvailable < command.qty) {
+              throw new Error(`Insufficient SUI for sell: need ${command.qty} SUI, have ${suiAvailable.toFixed(4)} SUI.`);
+            }
+          }
+        } catch (balErr) {
+          if ((balErr as Error).message.includes("Insufficient")) throw balErr;
+          // Balance fetch failed — proceed anyway, DeepBook will reject if insufficient
+          console.warn(`[engine] Pre-flight balance check failed, proceeding:`, (balErr as Error).message);
+        }
+      }
+
+      if (midPrice > 0) {
+        try {
+          const walletBals = await deepbook.getWalletBalances({ address: secrets.sui.address });
+          // Fetch DEEP token balance for multi-pool routing with fee discounts
+          let deepBalance = 0;
+          try {
+            const allBals = await deepbook.getAllBalances({ address: secrets.sui.address });
+            const deepEntry = allBals.find(b => b.coinType.toLowerCase().includes("deep"));
+            if (deepEntry) {
+              deepBalance = Number(deepEntry.balance) / 1e9; // normalize from raw units
+            }
+          } catch { /* DEEP balance fetch is best-effort */ }
+          const balances = {
+            suiBalance: Number(walletBals.suiBalance),
+            dbUsdcBalance: Number(walletBals.dbUsdcBalance),
+            deepBalance,
+          };
+          const plan = side === "buy"
+            ? planMarketBuy({ qty: command.qty, midPrice, balances })
+            : planMarketSell({ qty: command.qty, midPrice, balances });
+
+          // Execute multi-step route if needed (e.g., sell DEEP for DBUSDC, then buy SUI)
+          if (plan.steps.length > 1 && plan.needsDbUsdcTopUp) {
+            for (let i = 0; i < plan.steps.length - 1; i++) {
+              const step = plan.steps[i];
+              try {
+                console.log(`[engine] Route step ${i + 1}: ${step.description}`);
+                await deepbook.placeMarketOrder({
+                  wallet: secrets.sui,
+                  poolKey: step.pool,
+                  managerId,
+                  side: step.side,
+                  qty: step.qty,
+                });
+                routeSummary += ` ROUTE_STEP${i + 1}=[${step.description}]`;
+              } catch (routeErr) {
+                console.warn(`[engine] Route step ${i + 1} failed:`, routeErr);
+                routeSummary += ` ROUTE_STEP${i + 1}=FAILED`;
+              }
+            }
+          }
+          const deepDiscount = deepBalance > 0 ? " (DEEP fee discount active)" : "";
+          routeSummary += ` ROUTE=[${plan.summary}${deepDiscount}]`;
+        } catch { /* route planning is best-effort */ }
+      }
+
       const res = await deepbook.placeMarketOrder({ wallet: secrets.sui, poolKey, managerId, side, qty: command.qty });
 
       // Record trade for P&L tracking
-      const midPrice = repo.getPrice("SUI/USDC")?.mid_price ?? 0;
       const notional = command.qty * midPrice;
       repo.insertTrade({
         tradeId: `trade_${res.txDigest.slice(0, 16)}`,
@@ -1461,10 +1656,27 @@ export class Engine {
         txDigest: res.txDigest
       });
 
+      // === DEMO MODE: auto-settle after trade ===
+      let settleInfo = "";
+      if (demoMode) {
+        try {
+          const settleRes = await deepbook.execute({
+            docId,
+            command: { type: "SETTLE" },
+            wallet: secrets.sui,
+            poolKey,
+            managerId
+          });
+          if (settleRes?.txDigest) {
+            settleInfo = ` SETTLED=${settleRes.txDigest.slice(0, 12)}…`;
+          }
+        } catch { /* settle is best-effort */ }
+      }
+
       const explorer = `https://suiscan.xyz/testnet/tx/${res.txDigest}`;
       return {
         suiTxDigest: res.txDigest,
-        resultText: `MARKET_${side.toUpperCase()} ${command.qty} SUI @~${midPrice.toFixed(4)} SuiTx=${res.txDigest} Explorer=${explorer}`
+        resultText: `MARKET_${side.toUpperCase()} ${command.qty} SUI @~${midPrice.toFixed(4)} SuiTx=${res.txDigest} Explorer=${explorer}${settleInfo}${routeSummary}`
       };
     }
 
@@ -1560,8 +1772,14 @@ export class Engine {
       // Arc → Sui: Use Circle CCTP bridge
       if (fromChain === "arc" && toChain === "sui") {
         if (!circle) throw new Error("REBALANCE arc→sui requires Circle (CIRCLE_ENABLED=1)");
-        const w = repo.getCircleWallet(docId);
-        if (!w) throw new Error("Missing Circle wallet. Run DW /setup first.");
+        let w = repo.getCircleWallet(docId);
+        if (!w) {
+          const created = await circle.createArcWallet();
+          repo.upsertCircleWallet({ docId, walletSetId: created.walletSetId, walletId: created.walletId, walletAddress: created.address });
+          w = repo.getCircleWallet(docId);
+          if (!w) throw new Error("Failed to auto-create Circle wallet");
+          await this.audit(docId, `AUTO_CREATE Circle wallet=${created.address}`);
+        }
         const bridgeResult = await circle.bridgeUsdc({
           walletId: w.wallet_id,
           walletAddress: w.wallet_address as `0x${string}`,
@@ -1578,8 +1796,14 @@ export class Engine {
       // Sui → Arc: Use Circle CCTP bridge (reverse direction)
       if (fromChain === "sui" && toChain === "arc") {
         if (!circle) throw new Error("REBALANCE sui→arc requires Circle (CIRCLE_ENABLED=1)");
-        const w = repo.getCircleWallet(docId);
-        if (!w) throw new Error("Missing Circle wallet. Run DW /setup first.");
+        let w = repo.getCircleWallet(docId);
+        if (!w) {
+          const created = await circle.createArcWallet();
+          repo.upsertCircleWallet({ docId, walletSetId: created.walletSetId, walletId: created.walletId, walletAddress: created.address });
+          w = repo.getCircleWallet(docId);
+          if (!w) throw new Error("Failed to auto-create Circle wallet");
+          await this.audit(docId, `AUTO_CREATE Circle wallet=${created.address}`);
+        }
         const bridgeResult = await circle.bridgeUsdc({
           walletId: w.wallet_id,
           walletAddress: w.wallet_address as `0x${string}`,
@@ -1596,8 +1820,11 @@ export class Engine {
       // Arc → Yellow: Transfer USDC from Arc to Yellow state channel (fund channel)
       if (fromChain === "arc" && toChain === "yellow") {
         if (!yellow) throw new Error("REBALANCE arc→yellow requires Yellow (YELLOW_ENABLED=1)");
-        const session = repo.getYellowSession(docId);
-        if (!session || session.status !== "OPEN") throw new Error("No open Yellow session. Run DW SESSION_CREATE first.");
+        let session = repo.getYellowSession(docId);
+        if (!session || session.status !== "OPEN") {
+          // Auto-create session
+          session = await this.autoCreateYellowSession(docId);
+        }
 
         // Update Yellow allocations: increase our allocation by the funded amount
         const currentAllocations: YellowAllocation[] = JSON.parse(session.allocations_json || "[]");
@@ -1638,8 +1865,10 @@ export class Engine {
       // Yellow → Arc: Withdraw from Yellow channel back to Arc
       if (fromChain === "yellow" && toChain === "arc") {
         if (!yellow) throw new Error("REBALANCE yellow→arc requires Yellow (YELLOW_ENABLED=1)");
-        const session = repo.getYellowSession(docId);
-        if (!session || session.status !== "OPEN") throw new Error("No open Yellow session.");
+        let session = repo.getYellowSession(docId);
+        if (!session || session.status !== "OPEN") {
+          session = await this.autoCreateYellowSession(docId);
+        }
 
         const currentAllocations: YellowAllocation[] = JSON.parse(session.allocations_json || "[]");
         const ourAddr = secrets.evm.address.toLowerCase();
@@ -1815,24 +2044,57 @@ export class Engine {
     };
   }
 
-  private async checkPolicyIfPresent(ensName: string, command: ParsedCommand) {
-    const { ens, repo } = this.ctx;
-    if (!ens || !ensName) return { ok: true as const };
-    const policy = await ens.getPolicy(ensName);
-    if (!policy) return { ok: true as const };
+  /**
+   * Auto-create a Yellow session for a doc. Called transparently when a Yellow-dependent
+   * command is executed but no session exists. This is the key UX improvement:
+   * users never need to manually run SESSION_CREATE.
+   */
+  private async autoCreateYellowSession(docId: string): Promise<YellowSessionRow> {
+    const { repo, config } = this.ctx;
+    const yellow = this.ctx.yellow;
+    if (!yellow) throw new Error("Yellow disabled (set YELLOW_ENABLED=1)");
 
-    // Build context for daily spend checking
-    let dailySpendUsdc: number | undefined;
-    if (policy.dailyLimitUsdc !== undefined) {
-      // We need a docId to compute daily spend — find it from tracked docs
-      const docs = repo.listDocs();
-      const doc = docs.find((d) => d.ens_name === ensName);
-      if (doc) {
-        dailySpendUsdc = repo.getDailySpendUsdc(doc.doc_id);
-      }
-    }
+    // Single-user mode: generate an ephemeral session key for the doc owner
+    const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+    if (!secrets) throw new Error("No wallet secrets found. Run SETUP first.");
 
-    return evaluatePolicy(policy, command, { dailySpendUsdc });
+    // Use the doc's EVM key as the session participant
+    const ownerAddress = secrets.evm.address;
+    const ownerPrivateKeyHex = secrets.evm.privateKeyHex as `0x${string}`;
+
+    const definition = {
+      protocol: "NitroRPC/0.4",
+      participants: [ownerAddress],
+      weights: [1],
+      quorum: 1,
+      challenge: 86400,
+      nonce: Date.now()
+    };
+    const definitionJson = JSON.stringify(definition);
+    const signerPrivateKeysHex: `0x${string}`[] = [ownerPrivateKeyHex];
+
+    const yellowAsset = config.YELLOW_ASSET ?? "ytest.usd";
+    const perParticipantAmount = "100.0";
+    const initialAllocations: YellowAllocation[] = [{
+      participant: ownerAddress,
+      asset: yellowAsset,
+      amount: perParticipantAmount
+    }];
+
+    const created = await yellow.createAppSession({ signerPrivateKeysHex, definition, sessionData: `DocWallet:${docId}`, allocations: initialAllocations });
+    repo.upsertYellowSession({ docId, appSessionId: created.appSessionId, definitionJson, version: 0, status: "OPEN", allocationsJson: JSON.stringify(initialAllocations) });
+
+    try {
+      let t = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: t.config.table, key: "YELLOW_SESSION_ID", value: created.appSessionId });
+      t = await loadDocWalletTables({ docs: this.ctx.docs, docId });
+      await writeConfigValue({ docs: this.ctx.docs, docId, configTable: t.config.table, key: "YELLOW_PROTOCOL", value: "NitroRPC/0.4" });
+    } catch { /* best effort */ }
+
+    console.log(`[Yellow] Auto-created session ${created.appSessionId} for ${docId.slice(0, 8)}…`);
+    await this.audit(docId, `YELLOW_SESSION auto-created ${created.appSessionId}`);
+
+    return repo.getYellowSession(docId)!;
   }
 
   private async updateDocRow(docId: string, cmdId: string, updates: { status?: string; result?: string; error?: string }) {
@@ -2046,6 +2308,41 @@ export class Engine {
           } catch { /* ignore cross-chain balance check failure */ }
         }
 
+        // === ONBOARDING PROPOSALS: For new docs with no trades, suggest getting started ===
+        if (autoPropEnabled) {
+          const stats = repo.getTradeStats(docId);
+          const isNewDoc = stats.totalBuys === 0 && stats.totalSells === 0;
+          if (isNewDoc) {
+            const lastOnboard = Number(repo.getDocConfig(docId, "proposal_onboard_last_ms") ?? "0");
+            const now = Date.now();
+            if (!Number.isFinite(lastOnboard) || now - lastOnboard > 24 * 60 * 60 * 1000) {
+              decisions.push("Welcome! Here are some suggestions to get started:");
+              decisions.push("1. Try your first trade (buy 10 SUI)");
+              decisions.push("2. Check your balances (treasury)");
+              repo.setDocConfig(docId, "proposal_onboard_last_ms", String(now));
+              repo.insertAgentActivity(docId, "ONBOARD", "New treasury — suggested setup steps: try first trade, check balances");
+            }
+          }
+
+          // === DCA RECOMMENDATION: Detect repeated manual buys ===
+          const recentCmds = repo.listRecentCommands(docId, 50);
+          const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+          const recentBuys = recentCmds.filter(c =>
+            c.status === "EXECUTED" &&
+            c.raw_command.includes("MARKET_BUY") &&
+            c.raw_command.includes("SUI") &&
+            new Date(c.updated_at).getTime() > sevenDaysAgo
+          );
+          if (recentBuys.length >= 3) {
+            const lastDcaSuggestion = Number(repo.getDocConfig(docId, "proposal_dca_suggest_ms") ?? "0");
+            if (!Number.isFinite(lastDcaSuggestion) || Date.now() - lastDcaSuggestion > 7 * 24 * 60 * 60 * 1000) {
+              decisions.push(`You've been buying SUI regularly (${recentBuys.length} buys in 7 days). Want to automate this? Try: DCA 5 SUI daily`);
+              repo.setDocConfig(docId, "proposal_dca_suggest_ms", String(Date.now()));
+              repo.insertAgentActivity(docId, "DCA_SUGGEST", `${recentBuys.length} manual SUI buys in 7 days — suggested DCA automation`);
+            }
+          }
+        }
+
         // Auto-proposals (agent suggestions inserted into Commands table)
         if (autoPropEnabled) {
           const now = Date.now();
@@ -2106,16 +2403,9 @@ export class Engine {
 
           if (this.ctx.yellow) {
             const hasSession = Boolean(repo.getYellowSession(docId));
-            const signerCount = repo.listSigners(docId).length;
-            if (!hasSession && signerCount > 0) {
+            if (!hasSession) {
               await propose("DW SESSION_CREATE", "Yellow enabled, no session", "proposal_session_create_last_ms");
             }
-          }
-
-          const ensNameCfg = repo.getDocConfig(docId, "ens_name") || doc.ens_name || "";
-          const policySourceCfg = repo.getDocConfig(docId, "policy_source") || doc.policy_source || "NONE";
-          if (ensNameCfg && policySourceCfg !== "ENS") {
-            await propose(`DW POLICY ENS ${ensNameCfg}`, "Policy not set", "proposal_policy_last_ms");
           }
 
           // Auto-propose SWEEP_YIELD when idle capital detected on any chain
@@ -2144,9 +2434,10 @@ export class Engine {
                   const slPrice = (cachedPrice.mid_price * 0.85).toFixed(4);
                   const slQty = Math.floor(suiBalance * 0.5); // protect 50% of position
                   if (slQty > 0) {
+                    const maxLoss = (slQty * (cachedPrice.mid_price - Number(slPrice))).toFixed(2);
                     await propose(
                       `DW STOP_LOSS SUI ${slQty} @ ${slPrice}`,
-                      `No stop-loss on ${suiBalance.toFixed(1)} SUI position`,
+                      `Protect your ${suiBalance.toFixed(1)} SUI position by auto-selling ${slQty} SUI if the price drops 15% below $${cachedPrice.mid_price.toFixed(2)}. This limits your downside risk to ~$${maxLoss}.`,
                       "proposal_stop_loss_last_ms"
                     );
                   }
@@ -2211,6 +2502,158 @@ export class Engine {
       this.agentDecisionRunning = false;
     }
   }
+
+  // ═══ Payout Rules Tick — spreadsheet-driven payroll (Arc+Circle track wow moment) ═══
+
+  async payoutRulesTick() {
+    if (this.payoutRulesRunning) return;
+    this.payoutRulesRunning = true;
+    try {
+      const { repo, config, docs, circle, arc } = this.ctx;
+      if (!circle && !arc) return; // need at least one payout mechanism
+
+      const trackedDocs = repo.listDocs();
+      for (const doc of trackedDocs) {
+        const docId = doc.doc_id;
+        try {
+          const prTable = await loadPayoutRulesTable({ docs, docId });
+          if (!prTable) continue;
+
+          const rules = readPayoutRulesTable(prTable);
+          if (rules.length === 0) continue;
+
+          const now = Date.now();
+
+          for (const rule of rules) {
+            if (rule.status === "PAUSED" || rule.status === "DONE") continue;
+            const amt = Number(rule.amountUsdc);
+            if (!Number.isFinite(amt) || amt <= 0) {
+              // Validation feedback: invalid amount
+              if (rule.amountUsdc && rule.amountUsdc.trim()) {
+                await updatePayoutRulesRowCells({
+                  docs, docId, payoutRulesTable: prTable, rowIndex: rule.rowIndex,
+                  updates: { status: "Invalid amount" }
+                });
+              }
+              continue;
+            }
+            if (!rule.recipient || !rule.recipient.startsWith("0x") || !/^0x[0-9a-fA-F]{40}$/.test(rule.recipient)) {
+              // Validation feedback: invalid address
+              if (rule.recipient && rule.recipient.trim()) {
+                await updatePayoutRulesRowCells({
+                  docs, docId, payoutRulesTable: prTable, rowIndex: rule.rowIndex,
+                  updates: { status: "Invalid address" }
+                });
+              }
+              continue;
+            }
+
+            // Parse frequency → interval ms
+            const intervalMs = parsePayoutFrequency(rule.frequency);
+            if (intervalMs === null) continue;
+
+            // Check if it's time to run
+            const nextRunMs = rule.nextRun ? new Date(rule.nextRun).getTime() : 0;
+            if (nextRunMs > now) continue; // not due yet
+
+            // Execute payout via Circle-first, then Arc fallback
+            console.log(`[payoutRules] Executing payout: ${rule.label} → ${rule.recipient.slice(0, 10)}… $${amt}`);
+            let txResult = "";
+            let payoutSuccess = false;
+
+            try {
+              if (circle) {
+                let w = repo.getCircleWallet(docId);
+                if (!w) {
+                  const created = await circle.createArcWallet();
+                  repo.upsertCircleWallet({ docId, walletSetId: created.walletSetId, walletId: created.walletId, walletAddress: created.address });
+                  w = repo.getCircleWallet(docId);
+                }
+                if (w) {
+                  const out = await circle.payout({
+                    walletId: w.wallet_id,
+                    walletAddress: w.wallet_address as `0x${string}`,
+                    destinationAddress: rule.recipient as `0x${string}`,
+                    amountUsdc: amt
+                  });
+                  txResult = out.txHash ? `ArcTx=${out.txHash}` : `Circle=${out.circleTxId}`;
+                  payoutSuccess = true;
+                }
+              }
+
+              // Arc fallback if Circle didn't work
+              if (!payoutSuccess && arc) {
+                const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
+                if (secrets) {
+                  const tx = await arc.transferUsdc({
+                    privateKeyHex: secrets.evm.privateKeyHex,
+                    to: rule.recipient as `0x${string}`,
+                    amountUsdc: amt
+                  });
+                  txResult = `ArcTx=${tx.txHash}`;
+                  payoutSuccess = true;
+                }
+              }
+            } catch (err) {
+              const e = err instanceof Error ? err.message : String(err);
+              txResult = `ERR: ${e.slice(0, 60)}`;
+              console.error(`[payoutRules] Payout failed: ${rule.label}`, e);
+            }
+
+            // Compute next run time
+            const nextRunIso = new Date(now + intervalMs).toISOString().slice(0, 19);
+
+            // Update the doc table
+            await updatePayoutRulesRowCells({
+              docs, docId,
+              payoutRulesTable: prTable,
+              rowIndex: rule.rowIndex,
+              updates: {
+                nextRun: nextRunIso,
+                lastTx: txResult,
+                status: payoutSuccess ? "✅ PAID" : "❌ FAILED",
+              }
+            });
+
+            // Log to audit
+            await this.audit(docId, `PAYOUT_RULE ${rule.label} $${amt} → ${rule.recipient.slice(0, 10)}… ${payoutSuccess ? "OK" : "FAILED"} ${txResult}`);
+
+            // Activity feed
+            await appendRecentActivityRow({
+              docs, docId,
+              timestampIso: new Date().toISOString(),
+              type: "PAYOUT_RULE",
+              details: `${rule.label}: $${amt} USDC → ${rule.recipient.slice(0, 10)}…`,
+              tx: txResult.replace(/^(ArcTx=|Circle=|ERR: )/, ""),
+            });
+          }
+        } catch (err) {
+          console.error(`[payoutRules] Error for doc ${docId.slice(0, 8)}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error("payoutRulesTick error:", err);
+    } finally {
+      this.payoutRulesRunning = false;
+    }
+  }
+}
+
+/** Parse human-readable frequency strings → interval in ms. */
+function parsePayoutFrequency(freq: string): number | null {
+  if (!freq) return null;
+  const lower = freq.toLowerCase().trim();
+  if (lower === "daily" || lower === "1d" || lower === "every day") return 24 * 60 * 60_000;
+  if (lower === "weekly" || lower === "7d" || lower === "every week") return 7 * 24 * 60 * 60_000;
+  if (lower === "biweekly" || lower === "14d" || lower === "every 2 weeks") return 14 * 24 * 60 * 60_000;
+  if (lower === "monthly" || lower === "30d" || lower === "every month") return 30 * 24 * 60 * 60_000;
+  // "every Nh" format
+  const hourMatch = lower.match(/^(?:every\s+)?(\d+)\s*h(?:ours?)?$/);
+  if (hourMatch) return Number(hourMatch[1]) * 60 * 60_000;
+  // "every Nd" format
+  const dayMatch = lower.match(/^(?:every\s+)?(\d+)\s*d(?:ays?)?$/);
+  if (dayMatch) return Number(dayMatch[1]) * 24 * 60 * 60_000;
+  return null;
 }
 
 function generateCmdId(docId: string, raw: string): string {
@@ -2257,7 +2700,6 @@ function reconstructDwCommand(cmd: ParsedCommand): string | null {
     case "CANCEL_SCHEDULE": return `DW CANCEL_SCHEDULE ${cmd.scheduleId}`;
     case "QUORUM": return `DW QUORUM ${cmd.quorum}`;
     case "SIGNER_ADD": return `DW SIGNER_ADD ${cmd.address} WEIGHT ${cmd.weight}`;
-    case "POLICY_ENS": return `DW POLICY ENS ${cmd.ensName}`;
     case "SCHEDULE": return `DW SCHEDULE EVERY ${cmd.intervalHours}h: ${cmd.innerCommand.replace(/^DW\s+/i, "")}`;
     case "ALERT_THRESHOLD": return `DW ALERT_THRESHOLD ${cmd.coinType} ${cmd.below}`;
     case "AUTO_REBALANCE": return `DW AUTO_REBALANCE ${cmd.enabled ? "ON" : "OFF"}`;
@@ -2276,52 +2718,68 @@ function reconstructDwCommand(cmd: ParsedCommand): string | null {
 
 export function suggestCommandFromChat(input: string, context?: { repo: Repo; docId: string }): string {
   const text = input.trim();
-  if (!text) return "Type a command or ask a question. Prefix with !execute to insert into the Commands table.";
-  if (text.toUpperCase().startsWith("DW ")) return `Command detected. Paste into Commands table: ${text}`;
+  if (!text) return "Type a command or ask a question. Prefix with !execute to auto-submit it.";
+  if (text.toUpperCase().startsWith("DW ")) return `Got it! I'll run that for you. Paste into the Commands table: ${text}`;
 
   const lower = text.toLowerCase();
 
-  // --- Context-aware queries ---
+  // --- Context-aware queries with humanized responses ---
   if (context) {
     const { repo, docId } = context;
 
-    if (lower.includes("balance") || lower.includes("how much") || lower.includes("portfolio")) {
+    if (lower.includes("balance") || lower.includes("how much") || lower.includes("portfolio") || lower.includes("what do i have") || lower.includes("my funds")) {
       const doc = repo.getDoc(docId);
-      const evmAddr = doc?.evm_address ?? "not set";
-      const suiAddr = doc?.sui_address ?? "not set";
-      const circleW = repo.getCircleWallet(docId);
-      const lines = [`Wallets:`, `EVM: ${evmAddr}`, `SUI: ${suiAddr}`];
-      if (circleW) lines.push(`Circle/Arc: ${circleW.wallet_address}`);
       const cached = repo.getPrice("SUI/USDC");
-      if (cached && cached.mid_price > 0) lines.push(`SUI/USDC: $${cached.mid_price.toFixed(4)}`);
+      const circleW = repo.getCircleWallet(docId);
       const stats = repo.getTradeStats(docId);
-      if (stats.totalBuyUsdc > 0 || stats.totalSellUsdc > 0) {
-        lines.push(`Trading P&L: ${stats.netPnl >= 0 ? "+" : ""}$${stats.netPnl.toFixed(2)}`);
+
+      // Build a human-friendly portfolio summary
+      const lines: string[] = [];
+      lines.push("Here's your treasury overview:");
+      lines.push("");
+
+      // Gather approximate balances from trade stats
+      if (doc?.sui_address) lines.push(`Sui Wallet: ${doc.sui_address.slice(0, 8)}...${doc.sui_address.slice(-4)}`);
+      if (doc?.evm_address) lines.push(`Arc Wallet: ${doc.evm_address.slice(0, 6)}...${doc.evm_address.slice(-4)}`);
+      if (circleW) lines.push(`Circle Account: ${circleW.wallet_address.slice(0, 6)}...${circleW.wallet_address.slice(-4)} (managed — no browser extension needed)`);
+
+      if (cached && cached.mid_price > 0) {
+        lines.push("");
+        lines.push(`Current SUI price: $${cached.mid_price.toFixed(4)}`);
       }
-      lines.push("Balances auto-update in the BALANCES table above.");
+      if (stats.totalBuyUsdc > 0 || stats.totalSellUsdc > 0) {
+        const pnlSign = stats.netPnl >= 0 ? "+" : "";
+        lines.push(`Trading P&L: ${pnlSign}$${stats.netPnl.toFixed(2)}`);
+      }
+      lines.push("");
+      lines.push("Check the Portfolio table above for live balances, or type 'treasury' for a full cross-chain view.");
       return lines.join("\n");
     }
 
-    if (lower.includes("price") || lower.includes("sui price") || lower.includes("market")) {
+    if (lower.includes("price") || lower.includes("sui price") || lower.includes("market") || lower.includes("how much is sui")) {
       const cached = repo.getPrice("SUI/USDC");
       if (cached && cached.mid_price > 0) {
         const age = Math.floor((Date.now() - cached.updated_at) / 1000);
-        return `SUI/USDC: $${cached.mid_price.toFixed(6)} (bid=${cached.bid.toFixed(6)}, ask=${cached.ask.toFixed(6)}, ${age}s ago)\nUse: DW PRICE for fresh quote`;
+        const spread = cached.ask > 0 && cached.bid > 0 ? ((cached.ask - cached.bid) / cached.mid_price * 100).toFixed(2) : "?";
+        return `SUI is trading at $${cached.mid_price.toFixed(4)} (bid: $${cached.bid.toFixed(4)}, ask: $${cached.ask.toFixed(4)}, spread: ${spread}%, updated ${age}s ago).\nWant to buy? Just type: buy 10 SUI`;
       }
-      return "Price not available yet. Use: DW PRICE to fetch live";
+      return "Price data isn't available yet. Type 'price' to fetch the latest from DeepBook.";
     }
 
-    if (lower.includes("pnl") || lower.includes("p&l") || lower.includes("profit") || lower.includes("loss") || lower.includes("trade")) {
+    if (lower.includes("pnl") || lower.includes("p&l") || lower.includes("profit") || lower.includes("loss") || lower.includes("trade") || lower.includes("performance")) {
       const stats = repo.getTradeStats(docId);
       const trades = repo.listTrades(docId, 5);
+      const pnlSign = stats.netPnl >= 0 ? "+" : "";
       const lines = [
-        `Trading P&L: ${stats.netPnl >= 0 ? "+" : ""}$${stats.netPnl.toFixed(2)}`,
-        `Buys: ${stats.totalBuys.toFixed(2)} SUI ($${stats.totalBuyUsdc.toFixed(2)})`,
-        `Sells: ${stats.totalSells.toFixed(2)} SUI ($${stats.totalSellUsdc.toFixed(2)})`,
-        `Fees: $${stats.totalFees.toFixed(2)}`
+        `Your trading performance:`,
+        ``,
+        `P&L: ${pnlSign}$${stats.netPnl.toFixed(2)}`,
+        `Total bought: ${stats.totalBuys.toFixed(2)} SUI ($${stats.totalBuyUsdc.toFixed(2)})`,
+        `Total sold: ${stats.totalSells.toFixed(2)} SUI ($${stats.totalSellUsdc.toFixed(2)})`,
+        `Fees paid: $${stats.totalFees.toFixed(2)}`
       ];
       if (trades.length > 0) {
-        lines.push(`Recent: ${trades.map(t => `${t.side} ${t.qty}@${t.price}`).join(", ")}`);
+        lines.push(``, `Recent trades: ${trades.map(t => `${t.side === "BUY" ? "Bought" : "Sold"} ${t.qty} SUI at $${t.price}`).join(", ")}`);
       }
       return lines.join("\n");
     }
@@ -2336,11 +2794,7 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
     }
 
     if (lower.includes("signer") && (lower.includes("list") || lower.includes("who"))) {
-      const signers = repo.listSigners(docId);
-      const quorum = repo.getDocQuorum(docId);
-      if (signers.length === 0) return `No signers yet. Quorum=${quorum}. Join via the /join page.`;
-      const list = signers.map((s) => `${s.address} (weight=${s.weight})`).join(", ");
-      return `Signers (${signers.length}): ${list}. Quorum=${quorum}`;
+      return "FrankyDocs runs in single-user mode. You are the owner — all commands are approved by you directly in the Doc or via the web dashboard.";
     }
 
     if (lower.includes("schedule") && (lower.includes("list") || lower.includes("active") || lower.includes("show"))) {
@@ -2352,63 +2806,65 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
     }
 
     if (lower.includes("status") || lower.includes("overview")) {
-      const doc = repo.getDoc(docId);
-      const q = repo.getDocQuorum(docId);
-      const signerCount = repo.listSigners(docId).length;
       const y = repo.getYellowSession(docId);
       const schedules = repo.listSchedules(docId).filter((s) => s.status === "ACTIVE");
-      const parts = [`Quorum=${q}, Signers=${signerCount}`];
+      const parts = ["Single-user mode"];
       if (y) parts.push(`Yellow Session=${y.app_session_id}`);
-      if (doc?.ens_name) parts.push(`ENS Policy=${doc.ens_name}`);
       if (schedules.length > 0) parts.push(`Active Schedules=${schedules.length}`);
       return parts.join(", ") + "\nUse: DW STATUS for full details.";
     }
   }
 
-  // --- Natural language to command mapping ---
+  // --- Natural language to command mapping (humanized) ---
 
   // Setup
   if (lower.includes("setup") || lower.includes("initialize") || lower.includes("get started")) {
-    return "Use: DW /setup";
+    return "Your wallets are created automatically on your first command — no setup needed! Just type 'buy 10 SUI' to get started.";
   }
   if (lower.includes("status") || lower.includes("info")) {
-    return "Use: DW STATUS";
+    return "Here's a quick check on your treasury. Type 'treasury' for a full view, or use: DW STATUS";
   }
 
-  // Session
-  if (lower.includes("session") && lower.includes("create")) return "Use: DW SESSION_CREATE";
-  if (lower.includes("settle")) return "Use: DW SETTLE";
+  // Session — auto-created on demand, but still available if needed
+  if (lower.includes("session") && lower.includes("create")) return "Sessions are created automatically when needed — no manual step required! Just start using commands.";
+  if (lower.includes("settle")) return "Settle happens automatically after trades! To collect all idle funds across chains, type: sweep";
 
-  // Quorum
-  const quorumMatch = lower.match(/quorum\s+(\d+)/);
-  if (quorumMatch) return `Use: DW QUORUM ${quorumMatch[1]}`;
-
-  // Signer add
-  const signerMatch = lower.match(/(?:signer\s+add|add\s+signer)\s+(0x[a-f0-9]{40})\s*(?:weight\s+)?(\d+)?/i);
-  if (signerMatch) {
-    const weight = signerMatch[2] ?? "1";
-    return `Use: DW SIGNER_ADD ${signerMatch[1]} WEIGHT ${weight}`;
+  // Quorum / Signer — single-user mode
+  if (lower.includes("quorum") || lower.includes("signer") || lower.includes("add signer")) {
+    return "FrankyDocs runs in single-user mode — no quorum or external signers needed. Your commands are approved directly.";
   }
 
-  // Buy — supports natural language
+  // Buy — supports natural language with price context
   const buyMatch = lower.match(/buy\s+([\d.]+)\s*(?:sui|SUI)\s*(?:at|@)\s*([\d.]+)/);
   const buyNatural = lower.match(/buy\s+sui\s+([\d.]+)\s*(?:usdc)?\s*(?:@|at)\s*([\d.]+)/);
-  if (buyMatch) return `Use: DW LIMIT_BUY SUI ${buyMatch[1]} USDC @ ${buyMatch[2]}`;
-  if (buyNatural) return `Use: DW LIMIT_BUY SUI ${buyNatural[1]} USDC @ ${buyNatural[2]}`;
+  if (buyMatch) {
+    const cost = (Number(buyMatch[1]) * Number(buyMatch[2])).toFixed(2);
+    return `Sure! I'll set a limit order to buy ${buyMatch[1]} SUI at $${buyMatch[2]} each (total ~$${cost} USDC). Paste: DW LIMIT_BUY SUI ${buyMatch[1]} USDC @ ${buyMatch[2]}`;
+  }
+  if (buyNatural) {
+    const cost = (Number(buyNatural[1]) * Number(buyNatural[2])).toFixed(2);
+    return `Sure! I'll set a limit order to buy ${buyNatural[1]} SUI at $${buyNatural[2]} each (total ~$${cost} USDC). Paste: DW LIMIT_BUY SUI ${buyNatural[1]} USDC @ ${buyNatural[2]}`;
+  }
 
-  // Sell
+  // Sell with price context
   const sellMatch = lower.match(/sell\s+([\d.]+)\s*(?:sui|SUI)\s*(?:at|@)\s*([\d.]+)/);
   const sellNatural = lower.match(/sell\s+sui\s+([\d.]+)\s*(?:usdc)?\s*(?:@|at)\s*([\d.]+)/);
-  if (sellMatch) return `Use: DW LIMIT_SELL SUI ${sellMatch[1]} USDC @ ${sellMatch[2]}`;
-  if (sellNatural) return `Use: DW LIMIT_SELL SUI ${sellNatural[1]} USDC @ ${sellNatural[2]}`;
+  if (sellMatch) {
+    const proceeds = (Number(sellMatch[1]) * Number(sellMatch[2])).toFixed(2);
+    return `Sure! I'll set a limit order to sell ${sellMatch[1]} SUI at $${sellMatch[2]} each (you'll receive ~$${proceeds} USDC). Paste: DW LIMIT_SELL SUI ${sellMatch[1]} USDC @ ${sellMatch[2]}`;
+  }
+  if (sellNatural) {
+    const proceeds = (Number(sellNatural[1]) * Number(sellNatural[2])).toFixed(2);
+    return `Sure! I'll set a limit order to sell ${sellNatural[1]} SUI at $${sellNatural[2]} each (you'll receive ~$${proceeds} USDC). Paste: DW LIMIT_SELL SUI ${sellNatural[1]} USDC @ ${sellNatural[2]}`;
+  }
 
   // Cancel order
   const cancelMatch = lower.match(/cancel\s+([\w-]+)/);
   if (cancelMatch) return `Use: DW CANCEL ${cancelMatch[1]}`;
 
-  // Payout — enhanced NLP
+  // Payout — enhanced NLP with humanized response
   const payoutMatch = lower.match(/(?:send|payout|transfer|pay)\s+([\d.]+)\s*usdc\s+(?:to\s+)?(0x[a-f0-9]{40})/i);
-  if (payoutMatch) return `Use: DW PAYOUT ${payoutMatch[1]} USDC TO ${payoutMatch[2]}`;
+  if (payoutMatch) return `Sure! I'll send $${payoutMatch[1]} USDC to ${payoutMatch[2].slice(0, 6)}...${payoutMatch[2].slice(-4)}. This uses your built-in Circle account — no gas fees for you. Paste: DW PAYOUT ${payoutMatch[1]} USDC TO ${payoutMatch[2]}`;
 
   // Yellow off-chain send
   const yellowSendMatch = lower.match(/(?:yellow.?send|off.?chain.?send|state.?channel.?send)\s+([\d.]+)\s*usdc\s+(?:to\s+)?(0x[a-f0-9]{40})/i);
@@ -2468,10 +2924,6 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
   const cancelSchedMatch = lower.match(/cancel\s+schedule\s+(sched_\w+)/i);
   if (cancelSchedMatch) return `Use: DW UNSCHEDULE ${cancelSchedMatch[1]}`;
 
-  // ENS Policy
-  const policyMatch = lower.match(/policy\s+(?:ens\s+)?([a-z0-9-]+\.eth)/i);
-  if (policyMatch) return `Use: DW POLICY ENS ${policyMatch[1]}`;
-
   // WalletConnect
   if (lower.includes("walletconnect") || lower.includes("wc:")) {
     const uriMatch = text.match(/(wc:[^\s]+)/i);
@@ -2482,40 +2934,46 @@ export function suggestCommandFromChat(input: string, context?: { repo: Repo; do
   // Help
   if (lower.includes("help") || lower.includes("commands") || lower.includes("what can")) {
     return [
-      "Available commands:",
-      "• DW /setup — Initialize wallets",
-      "• DW STATUS — Show status",
-      "• DW PRICE — Live SUI/USDC price",
+      "Available commands (wallets & sessions auto-created on demand):",
+      "",
+      "📊 Trading (Sui DeepBook — auto-deposits, auto-settles):",
       "• DW LIMIT_BUY SUI <qty> USDC @ <price>",
       "• DW LIMIT_SELL SUI <qty> USDC @ <price>",
-      "• DW MARKET_BUY SUI <qty> — Market buy",
-      "• DW MARKET_SELL SUI <qty> — Market sell",
+      "• DW MARKET_BUY SUI <qty> — Instant market buy",
+      "• DW MARKET_SELL SUI <qty> — Instant market sell",
+      "• DW CANCEL <orderId>",
       "• DW STOP_LOSS SUI <qty> @ <price> — Auto-sell if price drops",
       "• DW TAKE_PROFIT SUI <qty> @ <price> — Auto-sell if price rises",
-      "• DW DEPOSIT <coin> <amount> — Deposit to DeepBook",
-      "• DW WITHDRAW <coin> <amount> — Withdraw from DeepBook",
-      "• DW CANCEL <orderId>",
       "• DW CANCEL_ORDER <orderId> — Cancel stop-loss/take-profit",
-      "• DW SETTLE — Withdraw filled orders",
-      "• DW SWEEP_YIELD — Settle + sweep idle capital",
-      "• DW TRADE_HISTORY — P&L and recent trades",
-      "• DW PAYOUT <amt> USDC TO <addr>",
-      "• DW BRIDGE <amt> USDC FROM <chain> TO <chain>",
-      "• DW SCHEDULE EVERY <N>h: <command>",
-      "• DW UNSCHEDULE <schedId> (alias: CANCEL_SCHEDULE)",
-      "• DW SESSION_CREATE — Yellow state channel",
-      "• DW SESSION_CLOSE — Close Yellow session",
-      "• DW SESSION_STATUS — Yellow session info",
+      "",
+      "💰 Payments & Transfers (Arc/Circle — auto-creates wallets):",
+      "• DW PAYOUT <amt> USDC TO <addr> — Send USDC on Arc",
       "• DW YELLOW_SEND <amt> USDC TO <addr> — Off-chain instant transfer (gasless)",
-      "• DW TREASURY — Unified cross-chain balance (Sui + Arc + Yellow)",
+      "• DW BRIDGE <amt> USDC FROM <chain> TO <chain> — Cross-chain via CCTP",
       "• DW REBALANCE <amt> FROM <chain> TO <chain> — Move capital between chains",
-      "• DW ALERT <coin> BELOW <amount> (alias: ALERT_THRESHOLD)",
+      "",
+      "📈 Info & Monitoring:",
+      "• DW PRICE — Live SUI/USDC price",
+      "• DW STATUS — Show status",
+      "• DW TREASURY — Unified cross-chain balance (Sui + Arc + Yellow)",
+      "• DW TRADE_HISTORY — P&L and recent trades",
+      "• DW SWEEP_YIELD — Settle + sweep idle capital",
+      "",
+      "⚙️ Automation & Config:",
+      "• DW SCHEDULE EVERY <N>h: <command> — DCA / recurring",
+      "• DW CANCEL_SCHEDULE <schedId>",
+      "• DW ALERT_THRESHOLD <coin> <amount>",
       "• DW AUTO_REBALANCE ON|OFF",
-      "• DW POLICY ENS <name.eth>",
-      "• DW CONNECT <wc:uri>",
+      "• DW CONNECT <wc:uri> — WalletConnect",
+      "",
       "Prefix with !execute to insert into Commands table."
     ].join("\n");
   }
 
-  return "I can help! Try: 'buy 10 SUI at 1.5', 'send 50 USDC to 0x...', 'bridge 100 USDC from arc to sui', 'stop loss 50 SUI at 0.80', 'take profit 50 SUI at 2.50', 'treasury', 'rebalance 50 from arc to sui', 'price', 'pnl', 'sweep', or type 'help'.";
+  return "I can help with that! Here are some things you can ask me:\n\n" +
+    "Trading: 'buy 10 SUI', 'sell 5 SUI at 2.00', 'stop loss 50 SUI at 0.80'\n" +
+    "Payments: 'send $50 to 0x...', 'bridge 100 USDC from arc to sui'\n" +
+    "Info: 'check balance', 'price', 'trades', 'treasury'\n" +
+    "Automation: 'DCA 5 SUI daily'\n\n" +
+    "Everything is set up automatically — just ask!";
 }

@@ -39,6 +39,7 @@ coverage
 Thumbs.db
 .idea
 .vscode
+.cursor
 *.swp
 *.swo
 *~

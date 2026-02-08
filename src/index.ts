@@ -5,7 +5,6 @@ import { Repo } from "./db/repo.js";
 import { Engine } from "./engine.js";
 import { ArcClient } from "./integrations/arc.js";
 import { CircleArcClient } from "./integrations/circle.js";
-import { EnsPolicyClient } from "./integrations/ens.js";
 import { NitroRpcYellowClient } from "./integrations/yellow.js";
 import { DeepBookV3Client } from "./integrations/deepbook.js";
 import { startServer } from "./server.js";
@@ -22,30 +21,51 @@ async function main() {
   const drive = createDriveClient(auth);
   const repo = new Repo("data/docwallet.db");
 
-  const yellow = config.YELLOW_ENABLED ? new NitroRpcYellowClient(config.YELLOW_RPC_URL!, { defaultApplication: config.YELLOW_APP_NAME }) : undefined;
+  let yellow: NitroRpcYellowClient | undefined;
+  if (config.YELLOW_ENABLED) {
+    try {
+      yellow = new NitroRpcYellowClient(config.YELLOW_RPC_URL!, { defaultApplication: config.YELLOW_APP_NAME });
+    } catch (e) {
+      console.error("[startup] Yellow client init failed (continuing without Yellow):", (e as Error).message);
+    }
+  }
 
-  const deepbook = config.DEEPBOOK_ENABLED ? new DeepBookV3Client({ rpcUrl: config.SUI_RPC_URL! }) : undefined;
+  let deepbook: DeepBookV3Client | undefined;
+  if (config.DEEPBOOK_ENABLED) {
+    try {
+      deepbook = new DeepBookV3Client({ rpcUrl: config.SUI_RPC_URL! });
+    } catch (e) {
+      console.error("[startup] DeepBook client init failed (continuing without DeepBook):", (e as Error).message);
+    }
+  }
 
-  const arc = config.ARC_ENABLED
-    ? new ArcClient({
+  let arc: ArcClient | undefined;
+  if (config.ARC_ENABLED) {
+    try {
+      arc = new ArcClient({
         rpcUrl: config.ARC_RPC_URL,
         usdcAddress: config.ARC_USDC_ADDRESS as `0x${string}`
-      })
-    : undefined;
+      });
+    } catch (e) {
+      console.error("[startup] Arc client init failed (continuing without Arc):", (e as Error).message);
+    }
+  }
 
-  const circle =
-    config.CIRCLE_ENABLED && config.CIRCLE_API_KEY && config.CIRCLE_ENTITY_SECRET
-      ? new CircleArcClient({
-          apiKey: config.CIRCLE_API_KEY,
-          entitySecret: config.CIRCLE_ENTITY_SECRET,
-          walletSetId: config.CIRCLE_WALLET_SET_ID,
-          blockchain: config.CIRCLE_BLOCKCHAIN,
-          usdcTokenAddress: config.ARC_USDC_ADDRESS as `0x${string}`,
-          accountType: config.CIRCLE_ACCOUNT_TYPE
-        })
-      : undefined;
-
-  const ens = config.ENS_RPC_URL ? new EnsPolicyClient(config.ENS_RPC_URL) : undefined;
+  let circle: CircleArcClient | undefined;
+  if (config.CIRCLE_ENABLED && config.CIRCLE_API_KEY && config.CIRCLE_ENTITY_SECRET) {
+    try {
+      circle = new CircleArcClient({
+        apiKey: config.CIRCLE_API_KEY,
+        entitySecret: config.CIRCLE_ENTITY_SECRET,
+        walletSetId: config.CIRCLE_WALLET_SET_ID,
+        blockchain: config.CIRCLE_BLOCKCHAIN,
+        usdcTokenAddress: config.ARC_USDC_ADDRESS as `0x${string}`,
+        accountType: config.CIRCLE_ACCOUNT_TYPE
+      });
+    } catch (e) {
+      console.error("[startup] Circle client init failed (continuing without Circle):", (e as Error).message);
+    }
+  }
 
   let engine: Engine;
   const walletconnect = config.WALLETCONNECT_ENABLED
@@ -64,7 +84,7 @@ async function main() {
       })
     : undefined;
 
-  engine = new Engine({ config, docs, drive, repo, yellow, deepbook, arc, circle, ens, walletconnect });
+  engine = new Engine({ config, docs, drive, repo, yellow, deepbook, arc, circle, walletconnect });
 
   const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
   startServer({
@@ -76,28 +96,50 @@ async function main() {
     yellow,
     yellowApplicationName: config.YELLOW_APP_NAME ?? "DocWallet",
     yellowAsset: config.YELLOW_ASSET,
-    walletconnect
+    walletconnect,
+    demoMode: config.DEMO_MODE
   });
 
   if (walletconnect) await walletconnect.init();
 
-  await engine.discoveryTick();
-  await engine.pollTick();
-
   console.log(`[engine] started — polling every ${config.POLL_INTERVAL_MS}ms, ${repo.listDocs().length} tracked docs`);
 
-  setInterval(() => engine.discoveryTick().catch((e) => console.error("discoveryTick", e)), config.DISCOVERY_INTERVAL_MS);
-  setInterval(() => engine.pollTick().catch((e) => console.error("pollTick", e)), config.POLL_INTERVAL_MS);
-  setInterval(() => engine.executorTick().catch((e) => console.error("executorTick", e)), 5_000);
-  setInterval(() => engine.chatTick().catch((e) => console.error("chatTick", e)), Math.max(15_000, config.POLL_INTERVAL_MS));
-  setInterval(() => engine.balancesTick().catch((e) => console.error("balancesTick", e)), config.BALANCE_POLL_INTERVAL_MS);
-  setInterval(() => engine.schedulerTick().catch((e) => console.error("schedulerTick", e)), config.SCHEDULER_INTERVAL_MS);
+  // Best-effort initial ticks — fire-and-forget with timeout so they never block startup
+  const withTimeout = (p: Promise<void>, label: string, ms = 30_000) =>
+    Promise.race([p, new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))])
+      .catch((e) => console.error(`[startup] ${label} failed (will retry on schedule):`, (e as Error).message));
 
-  // Autonomous agent decision engine — monitors balances, gas, stale commands, thresholds
-  setInterval(() => engine.agentDecisionTick().catch((e) => console.error("agentDecisionTick", e)), 60_000);
+  withTimeout(engine.discoveryTick(), "discoveryTick");
+  withTimeout(engine.pollTick(), "pollTick");
 
-  // Price oracle + conditional order monitor (stop-loss, take-profit)
-  setInterval(() => engine.priceTick().catch((e) => console.error("priceTick", e)), 30_000);
+  // Tick error tracking — log warnings for persistent failures
+  const tickErrors: Record<string, number> = {};
+  function trackedTick(name: string, fn: () => Promise<void>) {
+    return async () => {
+      try {
+        await fn();
+        tickErrors[name] = 0; // reset on success
+      } catch (e) {
+        tickErrors[name] = (tickErrors[name] ?? 0) + 1;
+        const count = tickErrors[name];
+        if (count >= 3) {
+          console.error(`[${name}] FAILED ${count} times consecutively — check configuration`, (e as Error).message);
+        } else {
+          console.error(`[${name}]`, (e as Error).message);
+        }
+      }
+    };
+  }
+
+  setInterval(trackedTick("discoveryTick", () => engine.discoveryTick()), config.DISCOVERY_INTERVAL_MS);
+  setInterval(trackedTick("pollTick", () => engine.pollTick()), config.POLL_INTERVAL_MS);
+  setInterval(trackedTick("executorTick", () => engine.executorTick()), 5_000);
+  setInterval(trackedTick("chatTick", () => engine.chatTick()), Math.max(15_000, config.POLL_INTERVAL_MS));
+  setInterval(trackedTick("balancesTick", () => engine.balancesTick()), config.BALANCE_POLL_INTERVAL_MS);
+  setInterval(trackedTick("schedulerTick", () => engine.schedulerTick()), config.SCHEDULER_INTERVAL_MS);
+  setInterval(trackedTick("agentDecisionTick", () => engine.agentDecisionTick()), 60_000);
+  setInterval(trackedTick("priceTick", () => engine.priceTick()), 30_000);
+  setInterval(trackedTick("payoutRulesTick", () => engine.payoutRulesTick()), 60_000);
 
   process.on("SIGINT", () => {
     repo.close();

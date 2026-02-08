@@ -270,25 +270,7 @@ describe("parseCommand — every command type", () => {
   });
 
   // ============================================================
-  // 15. DW POLICY ENS
-  // ============================================================
-  describe("POLICY_ENS", () => {
-    it("parses DW POLICY ENS treasury.eth", () => {
-      const r = parseCommand("DW POLICY ENS treasury.eth");
-      expect(r).toEqual({ ok: true, value: { type: "POLICY_ENS", ensName: "treasury.eth" } });
-    });
-    it("rejects non-ENS subcommand", () => {
-      const r = parseCommand("DW POLICY FOO bar");
-      expect(r.ok).toBe(false);
-    });
-    it("rejects missing name", () => {
-      const r = parseCommand("DW POLICY ENS");
-      expect(r.ok).toBe(false);
-    });
-  });
-
-  // ============================================================
-  // 16. DW SCHEDULE
+  // 15. DW SCHEDULE
   // ============================================================
   describe("SCHEDULE", () => {
     it("parses DW SCHEDULE EVERY 4h: LIMIT_BUY SUI 10 USDC @ 1.02", () => {
