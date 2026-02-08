@@ -573,58 +573,11 @@ npm run test:watch   # Watch mode
 - ✅ BRIDGE chain validation (arc, sui, ethereum, arbitrum, polygon)
 - ✅ State machine transitions (PENDING_APPROVAL → APPROVED → EXECUTING → EXECUTED/FAILED)
 
----
-
-## 🎬 Quick Demo Script (2–3 minutes)
-
 ### 1. Setup
 ```bash
 # Configure .env (see Configuration Reference above)
 npm install && npm run dev
 ```
-Create a Google Doc named `[DocWallet] My Treasury`, share with service account (Editor).
-
-### 2. Initialize (30s)
-```
-DW /setup          → Creates EVM wallet, Sui wallet, Circle wallet
-```
-Open the join URL → add 2 signers via MetaMask → `DW QUORUM 2`
-
-### 3. Yellow Flow — Gasless (30s)
-```
-DW SESSION_CREATE                    → Opens NitroRPC state channel
-DW YELLOW_SEND 5 USDC TO 0x...      → Instant off-chain transfer, zero gas
-```
-Approve via web UI — approval recorded on Yellow state channel (no on-chain tx!).
-
-### 4. Trading Flow — DeepBook V3 (30s)
-```
-DW LIMIT_BUY SUI 5 USDC @ 1.02     → PTB order on DeepBook
-DW STOP_LOSS SUI 5 @ 0.80           → Agent auto-sells if price drops
-DW PRICE                             → Live SUI/USDC from orderbook
-DW TRADE_HISTORY                     → P&L tracking
-```
-
-### 5. Treasury Flow — Arc + Circle (30s)
-```
-DW PAYOUT 10 USDC TO 0x...          → Circle dev wallet payout
-DW BRIDGE 50 USDC FROM arc TO sui   → CCTP cross-chain bridge
-DW TREASURY                          → Unified 3-chain view
-DW REBALANCE 100 FROM arc TO sui    → Cross-chain capital movement
-DW SWEEP_YIELD                       → Consolidate idle capital
-```
-
-### 6. Agent Features (30s)
-```
-DW AUTO_REBALANCE ON                 → Agent auto-proposes orders
-DW ALERT USDC BELOW 10              → Balance threshold monitoring
-DW SCHEDULE EVERY 4h: LIMIT_BUY SUI 2 USDC @ 999999  → DCA
-```
-
-### 7. Dashboard
-Open `http://localhost:8787` — integration cards, treasury flow diagram, approval progress.
-
----
 
 ## 🛠️ Development & Setup
 
@@ -648,7 +601,7 @@ npm run test         # Run test suite (vitest)
 
 1. Copy `.env.example` to `.env` and set `GOOGLE_SERVICE_ACCOUNT_JSON`, `DOCWALLET_MASTER_KEY`; add Arc/Sui/Circle/Yellow keys if you want full flows.
 2. `npm install && npm run dev`
-3. Create a Google Doc titled `[DocWallet] <name>`, share it with the service account email (Editor).
+3. Create a Google Doc titled `[FrankyDocs] <name>`, share it with the service account email (Editor).
 
 ---
 
