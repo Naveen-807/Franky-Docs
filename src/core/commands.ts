@@ -26,6 +26,7 @@ export type ParsedCommand =
   | { type: "CANCEL"; orderId: string }
   | { type: "SETTLE" }
   | { type: "PAYOUT"; amountUsdc: number; to: `0x${string}` }
+  | { type: "PAYOUT_SUI"; amountSui: number; to: `0x${string}` }
   | { type: "PAYOUT_SPLIT"; amountUsdc: number; recipients: Array<{ to: `0x${string}`; pct: number }> }
   | { type: "SCHEDULE"; intervalHours: number; innerCommand: string }
   | { type: "CANCEL_SCHEDULE"; scheduleId: string }
@@ -39,6 +40,12 @@ export type ParsedCommand =
   | { type: "ALERT_THRESHOLD"; coinType: string; below: number }
   | { type: "AUTO_REBALANCE"; enabled: boolean }
   | { type: "YELLOW_SEND"; amountUsdc: number; to: `0x${string}` }
+  | { type: "YELLOW_DEPOSIT"; amountUsdc: number }
+  | { type: "YELLOW_WITHDRAW"; amountUsdc: number }
+  | { type: "YELLOW_BALANCE" }
+  | { type: "YELLOW_SWAP"; amountFrom: number; fromAsset: string; toAsset: string }
+  | { type: "CHANNEL_RESIZE"; newCapacity: number }
+  | { type: "CHANNEL_HISTORY" }
   | { type: "STOP_LOSS"; base: "SUI"; quote: "USDC"; qty: number; triggerPrice: number }
   | { type: "TAKE_PROFIT"; base: "SUI"; quote: "USDC"; qty: number; triggerPrice: number }
   | { type: "SWEEP_YIELD" }
@@ -103,6 +110,11 @@ export const ParsedCommandSchema: z.ZodType<ParsedCommand, z.ZodTypeDef, unknown
   z.object({
     type: z.literal("PAYOUT"),
     amountUsdc: z.number().positive(),
+    to: AddressString
+  }),
+  z.object({
+    type: z.literal("PAYOUT_SUI"),
+    amountSui: z.number().positive(),
     to: AddressString
   }),
   z.object({
@@ -221,15 +233,21 @@ export function tryAutoDetect(raw: string): ParseResult | null {
 
   // --- Web2-friendly patterns: strip $ currency prefix ---
   // "send $50 to 0x..." / "pay $100 to 0x..."
-  const dollarSendMatch = trimmed.match(/^(?:send|pay|transfer)\s+\$([\d.]+)\s+to\s+(0x[0-9a-fA-F]{40})$/i);
+  const dollarSendMatch = trimmed.match(/^(?:send|pay|transfer)\s+\$([\d.]+)\s+to\s+(0x[0-9a-fA-F]{40,64})$/i);
   if (dollarSendMatch) {
     return parseCommand(`DW PAYOUT ${dollarSendMatch[1]} USDC TO ${dollarSendMatch[2]}`);
   }
 
   // "send 10 USDC to 0x..." / "pay 10 USDC to 0x..." / "transfer 10 USDC to 0x..."
-  const sendMatch = trimmed.match(/^(?:send|pay|transfer)\s+([\d.]+)\s*USDC\s+to\s+(0x[0-9a-fA-F]{40})$/i);
+  const sendMatch = trimmed.match(/^(?:send|pay|transfer)\s+([\d.]+)\s*USDC\s+to\s+(0x[0-9a-fA-F]{40,64})$/i);
   if (sendMatch) {
     return parseCommand(`DW PAYOUT ${sendMatch[1]} USDC TO ${sendMatch[2]}`);
+  }
+
+  // "send 1 SUI to 0x..." / "pay 0.5 SUI to 0x..." / "transfer 2 SUI to 0x..."
+  const sendSuiMatch = trimmed.match(/^(?:send|pay|transfer)\s+([\d.]+)\s*SUI\s+to\s+(0x[0-9a-fA-F]{40,64})$/i);
+  if (sendSuiMatch) {
+    return parseCommand(`DW PAYOUT ${sendSuiMatch[1]} SUI TO ${sendSuiMatch[2]}`);
   }
 
   // "swap 10 SUI for USDC" → MARKET_SELL
@@ -524,16 +542,21 @@ export function parseCommand(raw: string): ParseResult {
   }
 
   if (op === "PAYOUT") {
-    // DW PAYOUT 1 USDC TO 0x...
+    // DW PAYOUT 1 USDC TO 0x...  OR  DW PAYOUT 0.5 SUI TO 0x...
     const amountStr = parts[2] ?? "";
     const unit = (parts[3] ?? "").toUpperCase();
     const toKw = (parts[4] ?? "").toUpperCase();
     const to = parts[5] ?? "";
-    if (unit !== "USDC") return { ok: false, error: "PAYOUT expects USDC" };
+    if (unit !== "USDC" && unit !== "SUI") return { ok: false, error: "PAYOUT expects USDC or SUI" };
     if (toKw !== "TO") return { ok: false, error: "PAYOUT expects TO <address>" };
-    const amountUsdc = parseNumber(amountStr);
-    if (amountUsdc === null || amountUsdc <= 0) return { ok: false, error: "Invalid payout amount" };
-    const parsed = ParsedCommandSchema.safeParse({ type: "PAYOUT", amountUsdc, to });
+    const amount = parseNumber(amountStr);
+    if (amount === null || amount <= 0) return { ok: false, error: "Invalid payout amount" };
+    if (unit === "SUI") {
+      const parsed = ParsedCommandSchema.safeParse({ type: "PAYOUT_SUI", amountSui: amount, to });
+      if (!parsed.success) return { ok: false, error: "Invalid payout address" };
+      return { ok: true, value: parsed.data };
+    }
+    const parsed = ParsedCommandSchema.safeParse({ type: "PAYOUT", amountUsdc: amount, to });
     if (!parsed.success) return { ok: false, error: "Invalid payout address" };
     return { ok: true, value: parsed.data };
   }
@@ -704,6 +727,57 @@ export function parseCommand(raw: string): ParseResult {
     const parsed = ParsedCommandSchema.safeParse({ type: "YELLOW_SEND", amountUsdc, to });
     if (!parsed.success) return { ok: false, error: "Invalid address" };
     return { ok: true, value: parsed.data };
+  }
+
+  if (op === "YELLOW_DEPOSIT") {
+    // DW YELLOW_DEPOSIT 50 USDC  — Lock USDC into state channel
+    const amountStr = parts[2] ?? "";
+    const unit = (parts[3] ?? "").toUpperCase();
+    if (unit && !["USDC", "YTEST.USD", "USD"].includes(unit)) return { ok: false, error: "YELLOW_DEPOSIT supports USDC" };
+    const amountUsdc = parseNumber(amountStr);
+    if (amountUsdc === null || amountUsdc <= 0) return { ok: false, error: "Invalid deposit amount" };
+    return { ok: true, value: { type: "YELLOW_DEPOSIT", amountUsdc } };
+  }
+
+  if (op === "YELLOW_WITHDRAW") {
+    // DW YELLOW_WITHDRAW 25 USDC  — Withdraw from channel to on-chain
+    const amountStr = parts[2] ?? "";
+    const unit = (parts[3] ?? "").toUpperCase();
+    if (unit && !["USDC", "YTEST.USD", "USD"].includes(unit)) return { ok: false, error: "YELLOW_WITHDRAW supports USDC" };
+    const amountUsdc = parseNumber(amountStr);
+    if (amountUsdc === null || amountUsdc <= 0) return { ok: false, error: "Invalid withdraw amount" };
+    return { ok: true, value: { type: "YELLOW_WITHDRAW", amountUsdc } };
+  }
+
+  if (op === "YELLOW_BALANCE") {
+    // DW YELLOW_BALANCE — Show channel vs on-chain balances + gas savings
+    return { ok: true, value: { type: "YELLOW_BALANCE" } };
+  }
+
+  if (op === "YELLOW_SWAP") {
+    // DW YELLOW_SWAP 10 USDC TO ETH  — Off-chain atomic swap within channel
+    const amountStr = parts[2] ?? "";
+    const fromAsset = (parts[3] ?? "").toUpperCase();
+    const toKw = (parts[4] ?? "").toUpperCase();
+    const toAsset = (parts[5] ?? "").toUpperCase();
+    if (toKw !== "TO") return { ok: false, error: "YELLOW_SWAP expects: <amount> <from_asset> TO <to_asset>" };
+    const amountFrom = parseNumber(amountStr);
+    if (amountFrom === null || amountFrom <= 0) return { ok: false, error: "Invalid swap amount" };
+    if (!fromAsset || !toAsset) return { ok: false, error: "Specify both source and destination assets" };
+    return { ok: true, value: { type: "YELLOW_SWAP", amountFrom, fromAsset, toAsset } };
+  }
+
+  if (op === "CHANNEL_RESIZE") {
+    // DW CHANNEL_RESIZE 500  — Resize state channel capacity
+    const newCapStr = parts[2] ?? "";
+    const newCapacity = parseNumber(newCapStr);
+    if (newCapacity === null || newCapacity <= 0) return { ok: false, error: "CHANNEL_RESIZE expects <new_capacity>" };
+    return { ok: true, value: { type: "CHANNEL_RESIZE", newCapacity } };
+  }
+
+  if (op === "CHANNEL_HISTORY") {
+    // DW CHANNEL_HISTORY — Show state transition audit trail
+    return { ok: true, value: { type: "CHANNEL_HISTORY" } };
   }
 
   if (op === "STOP_LOSS") {

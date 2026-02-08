@@ -185,6 +185,31 @@ export class Repo {
     fs.mkdirSync(dir, { recursive: true });
     this.db = new Database(dbFile);
     this.db.exec(SCHEMA_SQL);
+
+    // --- Migrations for existing DBs ---
+    try {
+      this.db.exec(`ALTER TABLE yellow_sessions ADD COLUMN allocations_json TEXT DEFAULT '[]'`);
+    } catch { /* column already exists */ }
+    // channel_events table (added for Yellow channel history)
+    try {
+      this.db.exec(`CREATE TABLE IF NOT EXISTS channel_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id TEXT NOT NULL,
+        app_session_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        amount REAL,
+        asset TEXT,
+        from_addr TEXT,
+        to_addr TEXT,
+        state_hash TEXT,
+        settlement_tx TEXT,
+        details TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+      )`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_channel_events_doc ON channel_events(doc_id, created_at)`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_channel_events_session ON channel_events(app_session_id, version)`);
+    } catch { /* already exists */ }
   }
 
   close() {
@@ -383,6 +408,70 @@ export class Repo {
     return this.db
       .prepare(`SELECT * FROM yellow_session_keys WHERE doc_id=? ORDER BY updated_at DESC`)
       .all(docId) as YellowSessionKeyRow[];
+  }
+
+  // --- Channel Events (audit trail for state transitions) ---
+
+  insertChannelEvent(params: {
+    docId: string;
+    appSessionId: string;
+    eventType: string;
+    version: number;
+    amount?: number;
+    asset?: string;
+    fromAddr?: string;
+    toAddr?: string;
+    stateHash?: string;
+    settlementTx?: string;
+    details?: string;
+  }) {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO channel_events(doc_id,app_session_id,event_type,version,amount,asset,from_addr,to_addr,state_hash,settlement_tx,details,created_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`
+      )
+      .run(
+        params.docId,
+        params.appSessionId,
+        params.eventType,
+        params.version,
+        params.amount ?? null,
+        params.asset ?? null,
+        params.fromAddr ?? null,
+        params.toAddr ?? null,
+        params.stateHash ?? null,
+        params.settlementTx ?? null,
+        params.details ?? "",
+        now
+      );
+  }
+
+  listChannelEvents(docId: string, limit = 20): Array<{
+    id: number;
+    doc_id: string;
+    app_session_id: string;
+    event_type: string;
+    version: number;
+    amount: number | null;
+    asset: string | null;
+    from_addr: string | null;
+    to_addr: string | null;
+    state_hash: string | null;
+    settlement_tx: string | null;
+    details: string;
+    created_at: number;
+  }> {
+    return this.db
+      .prepare(`SELECT * FROM channel_events WHERE doc_id=? ORDER BY created_at DESC LIMIT ?`)
+      .all(docId, limit) as any[];
+  }
+
+  countChannelEvents(docId: string): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) as cnt FROM channel_events WHERE doc_id=?`)
+      .get(docId) as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
   }
 
   upsertCircleWallet(params: { docId: string; walletSetId?: string | null; walletId: string; walletAddress: string }) {
@@ -588,6 +677,14 @@ export class Repo {
     return this.db
       .prepare(`SELECT * FROM commands WHERE status='APPROVED' ORDER BY created_at ASC LIMIT 1`)
       .get() as CommandRow | undefined;
+  }
+
+  /** Auto-fail APPROVED/PENDING_APPROVAL commands whose created_at is older than the given threshold (epoch ms). Returns count. */
+  failStaleApprovedCommands(thresholdMs: number): number {
+    const result = this.db
+      .prepare(`UPDATE commands SET status='FAILED', error_text='Auto-failed: stale command (>1h)', updated_at=? WHERE status IN ('APPROVED','PENDING_APPROVAL') AND created_at < ?`)
+      .run(Date.now(), thresholdMs);
+    return result.changes;
   }
 
   listRecentCommands(docId: string, limit = 20): CommandRow[] {

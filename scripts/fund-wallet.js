@@ -5,7 +5,7 @@ const walletAddress = '0x2de0a089dc4ad5733df1103c1af6214973a89a36';
 
 async function tryConsoleFaucet() {
   console.log('--- Trying Console faucet API ---');
-  const res = await axios.post('https://api.circle.com/v1/w3s/faucet/drips', {
+  const res = await axios.post('https://api.circle.com/v1/faucet/drips', {
     blockchain: 'ARC-TESTNET',
     address: walletAddress,
     native: false,

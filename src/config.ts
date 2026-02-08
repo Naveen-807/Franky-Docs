@@ -53,7 +53,7 @@ const EnvSchema = z.object({
   BALANCE_POLL_INTERVAL_MS: z.string().optional().default("60000").pipe(NumberString),
   SCHEDULER_INTERVAL_MS: z.string().optional().default("30000").pipe(NumberString),
   DEMO_MODE: z.string().optional().default("1").pipe(BoolString),
-  SUI_FAUCET_URL: z.string().optional().default("https://faucet.testnet.sui.io/v1/gas"),
+  SUI_FAUCET_URL: z.string().optional().default("https://faucet.testnet.sui.io/v2/gas"),
 }).superRefine((env, ctx) => {
   if (env.YELLOW_ENABLED && !env.YELLOW_RPC_URL) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["YELLOW_RPC_URL"], message: "Required when YELLOW_ENABLED=1" });

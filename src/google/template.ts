@@ -110,10 +110,12 @@ async function removeDuplicateTemplateBlocks(params: { docs: docs_v1.Docs; docId
 
   const docEnd = content.at(-1)?.endIndex;
   if (typeof docEnd !== "number" || deleteFrom >= docEnd - 1) return;
+  const safeEnd = docEnd - 1;
+  if (safeEnd <= deleteFrom) return;
 
   await batchUpdateDoc({
     docs, docId,
-    requests: [{ deleteContentRange: { range: { startIndex: deleteFrom, endIndex: docEnd - 1 } } }]
+    requests: [{ deleteContentRange: { range: { startIndex: deleteFrom, endIndex: safeEnd } } }]
   });
 }
 
@@ -155,16 +157,20 @@ async function upgradeOldHeadings(params: { docs: docs_v1.Docs; docId: string })
 
     // Check section headings
     const newHeading = renames[text];
-    if (newHeading) {
+    if (newHeading && newHeading !== text) {
       const textEnd = el.endIndex - 1;
-      ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: newHeading });
+      if (textEnd > el.startIndex) {
+        ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: newHeading });
+      }
       continue;
     }
 
     // Check title (exact match only — not already prefixed with DocWallet)
-    if (text === titleRename.old || text === "🟢 FrankyDocs" || text === "🟢 FrankyDocs — DocWallet") {
+    if (text === titleRename.old || text === "🟢 FrankyDocs — DocWallet") {
       const textEnd = el.endIndex - 1;
-      ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: titleRename.new });
+      if (textEnd > el.startIndex) {
+        ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: titleRename.new });
+      }
     }
   }
 
@@ -175,9 +181,11 @@ async function upgradeOldHeadings(params: { docs: docs_v1.Docs; docId: string })
 
   const requests: docs_v1.Schema$Request[] = [];
   for (const op of ops) {
+    if (op.endIndex <= op.startIndex) continue; // skip invalid range
     requests.push({ deleteContentRange: { range: { startIndex: op.startIndex, endIndex: op.endIndex } } });
     requests.push({ insertText: { location: { index: op.startIndex }, text: op.newText } });
   }
+  if (requests.length === 0) return;
   await batchUpdateDoc({ docs, docId, requests });
 }
 
@@ -186,7 +194,7 @@ export async function ensureDocWalletTemplate(params: {
   docId: string;
   minCommandRows?: number;
 }): Promise<DocWalletTemplate> {
-  const { docs, docId, minCommandRows = 12 } = params;
+  const { docs, docId, minCommandRows = 30 } = params;
 
   /* ------------------------------------------------------------------
    * FAST PATH — if all 9 anchors already have tables, skip everything.
@@ -273,165 +281,71 @@ export async function ensureDocWalletTemplate(params: {
               "\n\n🟢 FrankyDocs\n" +
               "Turn any Google Doc into a multi-chain DeFi treasury. Trade, send payments, and manage funds — no wallet extensions, no seed phrases.\n\n" +
 
-              // ═══ DASHBOARD SECTION (what users see first) ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  📊  LIVE DASHBOARD\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+              // ═══ DASHBOARD ═══
+              "📊 LIVE DASHBOARD\n\n" +
 
               `💰 Portfolio\n` +
-              `Real-time balances across all connected networks — auto-refreshed every 60 seconds\n` +
               `${DOCWALLET_BALANCES_ANCHOR}\n\n` +
 
               `📊 Open Orders\n` +
-              `Active limit orders on DeepBook V3 (Sui on-chain CLOB)\n` +
               `${DOCWALLET_OPEN_ORDERS_ANCHOR}\n\n` +
 
               `📡 Activity Feed\n` +
-              `Live stream of transactions, agent proposals, and system events\n` +
               `${DOCWALLET_RECENT_ACTIVITY_ANCHOR}\n\n` +
 
-              // ═══ COMMANDS SECTION ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  🎮  COMMAND CENTER\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+              // ═══ COMMANDS ═══
+              "🎮 COMMAND CENTER\n\n" +
 
               `📋 Commands\n` +
               `Type commands below — or use plain English. Wallets are created automatically on first use.\n` +
               `${DOCWALLET_COMMANDS_ANCHOR}\n\n` +
 
+              "QUICK REFERENCE\n" +
+              "  Trading:     buy 10 SUI  ·  sell 5 SUI  ·  buy 10 SUI at 1.50  ·  stop loss 10 SUI at 0.80\n" +
+              "  Payments:    send 100 USDC to 0x…  ·  send 0.5 SUI to 0x…  ·  DW PAYOUT_SPLIT 100 USDC TO 0xA:50,0xB:50\n" +
+              "  Cross-chain: DW BRIDGE 100 USDC FROM arc TO sui  ·  DW REBALANCE 50 FROM sui TO arc\n" +
+              "  Yellow:      DW SESSION_CREATE  ·  DW YELLOW_SEND 50 USDC TO 0x…\n" +
+              "  Monitoring:  check balance  ·  price  ·  treasury  ·  trades  ·  sweep\n" +
+              "  Automation:  DCA 5 SUI daily  ·  DW AUTO_REBALANCE ON  ·  DW ALERT_THRESHOLD SUI 0.05\n\n" +
+
               `💬 Ask Franky\n` +
-              `Chat with the AI assistant — ask anything like "buy 10 SUI", "check balance", or "help"\n` +
               `${DOCWALLET_CHAT_ANCHOR}\n\n` +
 
-              // ═══ PAYROLL SECTION ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  💸  AUTOMATED PAYROLL\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+              // ═══ PAYROLL ═══
+              "💸 AUTOMATED PAYROLL\n\n" +
 
               `💸 Payout Rules\n` +
-              `Define recurring payments in the table below. The agent processes them automatically via Circle.\n` +
               `${DOCWALLET_PAYOUT_RULES_ANCHOR}\n\n` +
 
-              // ═══ SETTINGS SECTION ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  ⚙️  SETTINGS & LOGS\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+              // ═══ SETTINGS ═══
+              "⚙️ SETTINGS & LOGS\n\n" +
 
               `⚙️ Configuration\n` +
               `${DOCWALLET_CONFIG_ANCHOR}\n\n` +
 
               `🔗 Connected Apps\n` +
-              `External dApp connections via WalletConnect\n` +
               `${DOCWALLET_SESSIONS_ANCHOR}\n\n` +
 
               `📝 Audit Log\n` +
-              `Complete history of every action taken by the system\n` +
               `${DOCWALLET_AUDIT_ANCHOR}\n\n` +
 
-              // ═══ ARCHITECTURE SECTION (wow factor for judges) ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  🏗️  HOW FRANKYDOCS WORKS\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+              // ═══ ARCHITECTURE (clean, no ASCII art) ═══
+              "🏗️ HOW IT WORKS\n\n" +
 
-              "┌─────────────────────────────────────────────────────────────────┐\n" +
-              "│                      TRANSACTION FLOW                          │\n" +
-              "│                                                                │\n" +
-              "│   👤 User types in Google Doc                                  │\n" +
-              "│        │                                                       │\n" +
-              "│        ▼                                                       │\n" +
-              "│   🤖 FrankyDocs Agent (polls every 15s)                        │\n" +
-              "│        │  Parses natural language or DW commands                │\n" +
-              "│        │  Creates wallets automatically on first use            │\n" +
-              "│        │                                                       │\n" +
-              "│        ├──── 📈 Trade ──── DeepBook V3 (Sui CLOB)             │\n" +
-              "│        │                   Limit / Market / Stop-Loss           │\n" +
-              "│        │                                                       │\n" +
-              "│        ├──── 💳 Pay ───── Circle Wallets (Arc L1)             │\n" +
-              "│        │                   USDC Payouts / Splits                │\n" +
-              "│        │                                                       │\n" +
-              "│        ├──── 🌉 Bridge ── Circle CCTP (7 chains)              │\n" +
-              "│        │                   Cross-chain USDC transfers           │\n" +
-              "│        │                                                       │\n" +
-              "│        └──── ⚡ Settle ── Yellow Network (gasless)             │\n" +
-              "│                            Off-chain state channels             │\n" +
-              "│                                                                │\n" +
-              "│        ▼                                                       │\n" +
-              "│   📄 Results written back to Google Doc                        │\n" +
-              "│      (Status, TX hash, balances — all auto-updated)            │\n" +
-              "└─────────────────────────────────────────────────────────────────┘\n\n" +
+              "① User types in Google Doc → ② Agent parses & executes → ③ Results written back automatically\n\n" +
 
-              // ═══ TREASURY MAP ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  🗺️  MULTI-CHAIN TREASURY MAP\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+              "INTEGRATIONS\n" +
+              "  🔵 Sui + DeepBook V3 — On-chain CLOB trading (limit, market, stop-loss, take-profit)\n" +
+              "  🔷 Arc + Circle — Developer-controlled wallets, USDC payouts, CCTP cross-chain bridge\n" +
+              "  ⚡ Yellow Network — Gasless off-chain state channels via NitroRPC\n" +
+              "  📄 Google Docs API — Zero-config Web2 interface with natural language commands\n\n" +
 
-              "┌──────────────────┐    CCTP     ┌──────────────────┐\n" +
-              "│  🔷 Arc (EVM)    │◄───Bridge──►│  🔵 Sui Network  │\n" +
-              "│                  │             │                  │\n" +
-              "│  Circle Wallets  │             │  DeepBook V3     │\n" +
-              "│  USDC (ERC-20)   │             │  SUI / DBUSDC    │\n" +
-              "│  Payouts & Splits│             │  Limit & Market  │\n" +
-              "│  Chain: 5042002  │             │  Stop-Loss / TP  │\n" +
-              "└────────┬─────────┘             └──────────────────┘\n" +
-              "         │\n" +
-              "         │ State Channel\n" +
-              "         ▼\n" +
-              "┌──────────────────┐\n" +
-              "│  ⚡ Yellow       │\n" +
-              "│                  │\n" +
-              "│  NitroRPC/0.4    │\n" +
-              "│  Off-chain USD   │\n" +
-              "│  Gasless Settle  │\n" +
-              "└──────────────────┘\n\n" +
+              "SECURITY\n" +
+              "  🔑 Per-doc treasury keys encrypted with AES-256 — never leave the server\n" +
+              "  ✅ Access controlled by Google Doc sharing permissions\n" +
+              "  📝 Full audit trail of every transaction\n\n" +
 
-              "DW TREASURY — View all balances  |  DW REBALANCE <amt> FROM <chain> TO <chain> — Move capital\n\n" +
-
-              // ═══ SECURITY ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  🔒  SECURITY MODEL\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-
-              "ACCESS CONTROL\n" +
-              "  ✅ Only Google Doc editors can propose transactions\n" +
-              "  ✅ Only authorized users can approve (via Doc edit or wallet signature)\n" +
-              "  ✅ Google's sharing permissions = your access policy\n\n" +
-
-              "KEY MANAGEMENT\n" +
-              "  🔑 Treasury keys generated per-doc, encrypted with AES-256\n" +
-              "  🔑 Keys never leave the server — only used in memory to sign\n" +
-              "  🔑 Master key required to decrypt (DOCWALLET_MASTER_KEY)\n" +
-              "  🔑 Circle Developer-Controlled Wallets add enterprise-grade custody\n\n" +
-
-              "ON-CHAIN SIGNING\n" +
-              "  📝 Every transaction is cryptographically signed by the doc's treasury key\n" +
-              "  📝 Chain validates the signature like any other wallet transaction\n" +
-              "  📝 Full audit trail in the Audit Log table above\n\n" +
-
-              // ═══ POWERED BY ═══
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "  ⚡  POWERED BY\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-
-              "┌────────────────────────────────────────────────────────────────┐\n" +
-              "│                                                               │\n" +
-              "│   🔵  Sui / DeepBook V3        On-chain CLOB trading          │\n" +
-              "│        PTB, BalanceManager, multi-pool routing, price oracle   │\n" +
-              "│                                                               │\n" +
-              "│   🔷  Arc + Circle              Cross-chain treasury           │\n" +
-              "│        Developer-controlled wallets, CCTP bridge, USDC payouts │\n" +
-              "│                                                               │\n" +
-              "│   ⚡  Yellow Network            Gasless state channels         │\n" +
-              "│        NitroRPC/0.4, off-chain payments, delegated keys        │\n" +
-              "│                                                               │\n" +
-              "│   📄  Google Docs API           Zero-config Web2 interface     │\n" +
-              "│        Natural language, real-time sync, familiar UX           │\n" +
-              "│                                                               │\n" +
-              "│   🤖  Autonomous Agent          Smart treasury management      │\n" +
-              "│        Stop-loss, DCA, rebalance proposals, price alerts       │\n" +
-              "│                                                               │\n" +
-              "└────────────────────────────────────────────────────────────────┘\n\n" +
-
-              "Built for ETH HackMoney 2026  —  github.com/FrankyDocs\n\n"
+              "Built for HackMoney 2026\n\n"
           }
         }
       ]
@@ -481,8 +395,8 @@ export async function ensureDocWalletTemplate(params: {
   // After the first batch we need a fresh doc if rows were actually added
   const rowDoc2 = await getDoc(docs, docId);
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_COMMANDS_ANCHOR, minRows: Math.max(2, minCommandRows) }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CHAT_ANCHOR, minRows: 8 }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_BALANCES_ANCHOR, minRows: 8 }, rowDoc2);
+  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CHAT_ANCHOR, minRows: 20 }, rowDoc2);
+  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_BALANCES_ANCHOR, minRows: 25 }, rowDoc2);
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_OPEN_ORDERS_ANCHOR, minRows: 12 }, rowDoc2);
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_RECENT_ACTIVITY_ANCHOR, minRows: 10 }, rowDoc2);
   await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_PAYOUT_RULES_ANCHOR, minRows: 8 }, rowDoc2);
@@ -521,9 +435,9 @@ export async function ensureDocWalletTemplate(params: {
 /* ---------- Table spec for each anchor section ---------- */
 const TABLE_SPEC: Record<string, { rows: number; cols: number }> = {
   [DOCWALLET_CONFIG_ANCHOR]:           { rows: 30, cols: 2 },
-  [DOCWALLET_COMMANDS_ANCHOR]:         { rows: 12, cols: 6 },
-  [DOCWALLET_CHAT_ANCHOR]:             { rows:  8, cols: 2 },
-  [DOCWALLET_BALANCES_ANCHOR]:         { rows:  8, cols: 3 },
+  [DOCWALLET_COMMANDS_ANCHOR]:         { rows: 30, cols: 6 },
+  [DOCWALLET_CHAT_ANCHOR]:             { rows: 20, cols: 2 },
+  [DOCWALLET_BALANCES_ANCHOR]:         { rows: 25, cols: 3 },
   [DOCWALLET_OPEN_ORDERS_ANCHOR]:      { rows: 12, cols: 7 },
   [DOCWALLET_RECENT_ACTIVITY_ANCHOR]:  { rows: 10, cols: 4 },
   [DOCWALLET_PAYOUT_RULES_ANCHOR]:    { rows:  8, cols: 7 },
@@ -543,7 +457,7 @@ async function ensureTablesAfterAnchors(params: {
   docId: string;
   minCommandRows?: number;
 }) {
-  const { docs, docId, minCommandRows = 12 } = params;
+  const { docs, docId, minCommandRows = 30 } = params;
   const doc = await getDoc(docs, docId);
 
   // Ordered top-to-bottom as they appear in the document.
@@ -885,6 +799,12 @@ async function styleDocTemplate(params: { docs: docs_v1.Docs; docId: string }) {
     "  🗺️  MULTI-CHAIN TREASURY MAP",
     "  🔒  SECURITY MODEL",
     "  ⚡  POWERED BY",
+    // v4 clean section labels (no leading spaces)
+    "📊 LIVE DASHBOARD",
+    "🎮 COMMAND CENTER",
+    "💸 AUTOMATED PAYROLL",
+    "⚙️ SETTINGS & LOGS",
+    "🏗️ HOW IT WORKS",
   ]);
 
   // Monospace box-drawing content (flowcharts, diagrams)
@@ -896,6 +816,9 @@ async function styleDocTemplate(params: { docs: docs_v1.Docs; docId: string }) {
     "KEY MANAGEMENT",
     "ON-CHAIN SIGNING",
     "TRANSACTION FLOW",
+    "INTEGRATIONS",
+    "SECURITY",
+    "QUICK REFERENCE",
   ]);
 
   for (const el of content) {
@@ -1030,6 +953,65 @@ async function styleDocTemplate(params: { docs: docs_v1.Docs; docId: string }) {
             foregroundColor: { color: { rgbColor: DARK_GRAY } }
           },
           fields: "fontSize,foregroundColor"
+        }
+      });
+    }
+
+    // ── Integration bullets (🔵 🔷 ⚡ 📄 lines in the architecture section) ──
+    if ((text.startsWith("🔵") || text.startsWith("🔷") || text.startsWith("⚡") || text.startsWith("📄")) && text.includes("—")) {
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex: startIdx, endIndex: endIdx - 1 },
+          textStyle: {
+            fontSize: { magnitude: 10, unit: "PT" },
+            foregroundColor: { color: { rgbColor: DARK_GRAY } }
+          },
+          fields: "fontSize,foregroundColor"
+        }
+      });
+    }
+
+    // ── Quick reference command lines (  Trading: ... / Payments: ... etc.) ──
+    if (/^\s*(Trading|Payments|Cross-chain|Yellow|Monitoring|Automation):/.test(text)) {
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex: startIdx, endIndex: endIdx - 1 },
+          textStyle: {
+            fontSize: { magnitude: 9, unit: "PT" },
+            weightedFontFamily: { fontFamily: "Roboto Mono", weight: 400 },
+            foregroundColor: { color: { rgbColor: DARK_GRAY } }
+          },
+          fields: "fontSize,weightedFontFamily,foregroundColor"
+        }
+      });
+    }
+
+    // ── Flow summary line (① User types...) ──
+    if (text.startsWith("①")) {
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex: startIdx, endIndex: endIdx - 1 },
+          textStyle: {
+            bold: true,
+            fontSize: { magnitude: 11, unit: "PT" },
+            foregroundColor: { color: { rgbColor: BRAND_BLUE } }
+          },
+          fields: "bold,fontSize,foregroundColor"
+        }
+      });
+    }
+
+    // ── "Built for HackMoney" footer ──
+    if (text.startsWith("Built for")) {
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex: startIdx, endIndex: endIdx - 1 },
+          textStyle: {
+            italic: true,
+            fontSize: { magnitude: 9, unit: "PT" },
+            foregroundColor: { color: { rgbColor: MED_GRAY } }
+          },
+          fields: "italic,fontSize,foregroundColor"
         }
       });
     }

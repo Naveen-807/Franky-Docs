@@ -9,6 +9,7 @@ import { decryptWithMasterKey, encryptWithMasterKey } from "./wallet/crypto.js";
 import { generateEvmWallet } from "./wallet/evm.js";
 import { NitroRpcYellowClient } from "./integrations/yellow.js";
 import type { WalletConnectService } from "./integrations/walletconnect.js";
+import { requestTestnetSui, requestArcTestnetUsdc } from "./integrations/sui-faucet.js";
 
 type ServerDeps = {
   docs: docs_v1.Docs;
@@ -21,6 +22,8 @@ type ServerDeps = {
   yellowAsset?: string;
   walletconnect?: WalletConnectService;
   demoMode?: boolean;
+  circleApiKey?: string;
+  suiFaucetUrl?: string;
 };
 
 type Session = { docId: string; signerAddress: `0x${string}`; createdAt: number };
@@ -54,6 +57,23 @@ export function startServer(deps: ServerDeps) {
               const shortId = d.doc_id.length > 20 ? d.doc_id.slice(0, 20) + "…" : d.doc_id;
               const activityUrl = `${deps.publicBaseUrl}/activity/${encodeURIComponent(d.doc_id)}`;
               const sessionsUrl = `${deps.publicBaseUrl}/sessions/${encodeURIComponent(d.doc_id)}`;
+              const evmAddr = d.evm_address ? escapeHtml(d.evm_address) : null;
+              const suiAddr = d.sui_address ? escapeHtml(d.sui_address) : null;
+              const walletSection = (evmAddr || suiAddr)
+                ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0">
+  ${evmAddr ? `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+    <span style="font-size:.75rem;font-weight:600;color:#0052FF;min-width:28px">ARC</span>
+    <code style="font-size:.72rem;color:#475569;word-break:break-all">${evmAddr}</code>
+    <button class="btn btn-outline btn-sm" onclick="fundWallet('${d.doc_id}','arc')" style="margin-left:auto;white-space:nowrap;font-size:.7rem;padding:2px 8px">💰 Fund USDC</button>
+  </div>` : ""}
+  ${suiAddr ? `<div style="display:flex;align-items:center;gap:6px">
+    <span style="font-size:.75rem;font-weight:600;color:#6FBCF0;min-width:28px">SUI</span>
+    <code style="font-size:.72rem;color:#475569;word-break:break-all">${suiAddr}</code>
+    <button class="btn btn-outline btn-sm" onclick="fundWallet('${d.doc_id}','sui')" style="margin-left:auto;white-space:nowrap;font-size:.7rem;padding:2px 8px">💰 Fund SUI</button>
+  </div>` : ""}
+  <div id="fund-status-${d.doc_id.slice(0, 8)}" style="font-size:.75rem;margin-top:4px;color:#64748b"></div>
+</div>`
+                : "";
               return `<div class="card" style="margin-bottom:14px">
   <div class="card-header">
     <div>
@@ -66,6 +86,7 @@ export function startServer(deps: ServerDeps) {
     <a href="${activityUrl}" class="btn btn-primary btn-sm">Activity</a>
     <a href="${sessionsUrl}" class="btn btn-ghost btn-sm">Sessions</a>
   </div>
+  ${walletSection}
 </div>`;
             }).join("\n")
           : `<div class="empty"><div class="empty-icon">📄</div><p>No docs discovered yet.<br/>Create a Google Doc and add the FrankyDocs template.</p></div>`;
@@ -169,7 +190,28 @@ export function startServer(deps: ServerDeps) {
   </div>
 </div>
 
-${rows}`
+${rows}
+
+<script>
+async function fundWallet(docId, chain) {
+  const statusEl = document.getElementById('fund-status-' + docId.slice(0, 8));
+  if (statusEl) statusEl.textContent = 'Requesting ' + chain.toUpperCase() + ' funds…';
+  try {
+    const res = await fetch('/api/fund', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ docId, chain })
+    });
+    const data = await res.json();
+    if (statusEl) {
+      statusEl.style.color = data.ok ? '#198754' : '#dc3545';
+      statusEl.textContent = data.message || (data.ok ? 'Funded!' : 'Failed');
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.style.color = '#dc3545'; statusEl.textContent = 'Error: ' + e.message; }
+  }
+}
+</script>`
         );
       }
 
@@ -179,7 +221,7 @@ ${rows}`
         return sendHtml(res, "Activity", activityPageHtml({ docId }));
       }
 
-      // API: List docs with full integration status (for demo/judges)
+      // API: List docs with full integration status
       if (req.method === "GET" && url.pathname === "/api/docs") {
         const allDocs = deps.repo.listDocs();
         const docData = allDocs.map((d) => {
@@ -333,57 +375,57 @@ ${rows}`
         return sendJson(res, 410, { ok: false, error: "FrankyDocs runs in single-user mode. Approve commands directly in the Google Doc by setting STATUS to APPROVED." });
       }
 
-      // --- Demo approve: one-click approval without wallet (demo mode only) ---
+      // --- Quick approve: one-click approval without wallet ---
       if (req.method === "POST" && url.pathname === "/api/cmd/demo-approve") {
         const body = await readJsonBody(req);
         const docId = String(body.docId ?? "");
         const cmdId = String(body.cmdId ?? "");
         if (!docId || !cmdId) return sendJson(res, 400, { ok: false, error: "Missing docId/cmdId" });
-        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Demo mode is not enabled" });
+        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Quick-approve is not enabled" });
 
         const cmd = deps.repo.getCommand(cmdId);
         if (!cmd || cmd.doc_id !== docId) return sendJson(res, 404, { ok: false, error: "Command not found" });
         if (cmd.status !== "PENDING_APPROVAL") return sendJson(res, 409, { ok: false, error: `Already ${cmd.status}` });
 
         deps.repo.setCommandStatus(cmdId, "APPROVED", { errorText: null });
-        await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "APPROVED", error: "", result: "Demo-approved (no wallet)" } });
-        await bestEffortAudit(deps.docs, docId, `${cmdId} APPROVED (demo-mode, no wallet)`);
+        await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "APPROVED", error: "", result: "Approved" } });
+        await bestEffortAudit(deps.docs, docId, `${cmdId} APPROVED (quick-approve)`);
         return sendJson(res, 200, { ok: true, status: "APPROVED" });
       }
 
-      // --- Demo reject: one-click rejection without wallet (demo mode only) ---
+      // --- Quick reject: one-click rejection without wallet ---
       if (req.method === "POST" && url.pathname === "/api/cmd/demo-reject") {
         const body = await readJsonBody(req);
         const docId = String(body.docId ?? "");
         const cmdId = String(body.cmdId ?? "");
         if (!docId || !cmdId) return sendJson(res, 400, { ok: false, error: "Missing docId/cmdId" });
-        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Demo mode is not enabled" });
+        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Quick-reject is not enabled" });
 
         const cmd = deps.repo.getCommand(cmdId);
         if (!cmd || cmd.doc_id !== docId) return sendJson(res, 404, { ok: false, error: "Command not found" });
         if (cmd.status !== "PENDING_APPROVAL") return sendJson(res, 409, { ok: false, error: `Already ${cmd.status}` });
 
-        deps.repo.setCommandStatus(cmdId, "REJECTED", { errorText: "Rejected (demo mode)" });
+        deps.repo.setCommandStatus(cmdId, "REJECTED", { errorText: "Rejected by user" });
         await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId, updates: { status: "REJECTED", error: "Rejected by user", result: "" } });
-        await bestEffortAudit(deps.docs, docId, `${cmdId} REJECTED (demo-mode)`);
+        await bestEffortAudit(deps.docs, docId, `${cmdId} REJECTED`);
         return sendJson(res, 200, { ok: true, status: "REJECTED" });
       }
 
-      // --- Bulk approve all PENDING_APPROVAL commands for a doc (demo mode) ---
+      // --- Bulk approve all PENDING_APPROVAL commands for a doc ---
       if (req.method === "POST" && url.pathname === "/api/cmd/demo-approve-all") {
         const body = await readJsonBody(req);
         const docId = String(body.docId ?? "");
         if (!docId) return sendJson(res, 400, { ok: false, error: "Missing docId" });
-        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Demo mode is not enabled" });
+        if (!deps.demoMode) return sendJson(res, 403, { ok: false, error: "Bulk approve is not enabled" });
 
         const cmds = deps.repo.listRecentCommands(docId, 100).filter(c => c.status === "PENDING_APPROVAL");
         let approved = 0;
         for (const cmd of cmds) {
           deps.repo.setCommandStatus(cmd.cmd_id, "APPROVED", { errorText: null });
-          await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId: cmd.cmd_id, updates: { status: "APPROVED", error: "", result: "Demo-approved" } });
+          await bestEffortUpdateCommandRow({ docs: deps.docs, docId, cmdId: cmd.cmd_id, updates: { status: "APPROVED", error: "", result: "Approved" } });
           approved++;
         }
-        await bestEffortAudit(deps.docs, docId, `DEMO_APPROVE_ALL: ${approved} commands approved`);
+        await bestEffortAudit(deps.docs, docId, `BULK_APPROVE: ${approved} commands approved`);
         return sendJson(res, 200, { ok: true, approved, total: cmds.length });
       }
 
@@ -521,6 +563,32 @@ ${rows}`
         }
 
         return sendJson(res, 200, { ok: true, status: "DISCONNECTED" });
+      }
+
+      // --- Fund wallet: trigger faucet for Arc USDC or Sui ---
+      if (req.method === "POST" && url.pathname === "/api/fund") {
+        const body = await readJsonBody(req);
+        const docId = String(body.docId ?? "");
+        const chain = String(body.chain ?? "").toLowerCase();
+        if (!docId || !chain) return sendJson(res, 400, { ok: false, message: "Missing docId or chain" });
+        if (chain !== "arc" && chain !== "sui") return sendJson(res, 400, { ok: false, message: "Chain must be 'arc' or 'sui'" });
+
+        const doc = deps.repo.getDoc(docId);
+        if (!doc) return sendJson(res, 404, { ok: false, message: "Doc not found" });
+
+        if (chain === "arc") {
+          const evmAddr = doc.evm_address;
+          if (!evmAddr) return sendJson(res, 400, { ok: false, message: "No EVM address for this doc. Run a command first to auto-create wallets." });
+          const result = await requestArcTestnetUsdc({ address: evmAddr, circleApiKey: deps.circleApiKey });
+          return sendJson(res, result.ok ? 200 : 502, { ok: result.ok, message: result.message });
+        }
+
+        if (chain === "sui") {
+          const suiAddr = doc.sui_address;
+          if (!suiAddr) return sendJson(res, 400, { ok: false, message: "No SUI address for this doc. Run a command first to auto-create wallets." });
+          const result = await requestTestnetSui({ address: suiAddr, faucetUrl: deps.suiFaucetUrl });
+          return sendJson(res, result.ok ? 200 : 502, { ok: result.ok, message: result.message });
+        }
       }
 
       res.statusCode = 404;
@@ -925,15 +993,13 @@ function cmdPageHtml(params: { docId: string; cmdId: string; signerAddress: stri
 const out = document.getElementById('out');
 function log(x){ out.textContent = String(x); }
 
-// --- Approve (uses demo-approve in demo mode, /api/cmd/decision otherwise) ---
+// --- Approve command ---
 document.getElementById('approveBtn').onclick = async () => {
   log('Approving…');
-  // Try demo-approve first, fall back to decision endpoint
   let res = await fetch('/api/cmd/demo-approve', { method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}' }) });
   let data = await res.json();
-  if (!data.ok && data.error && data.error.includes('Demo mode')) {
-    // Not in demo mode — use decision endpoint
+  if (!data.ok && data.error && !data.error.includes('Already')) {
     res = await fetch('/api/cmd/decision', { method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}', decision:'APPROVE' }) });
     data = await res.json();
@@ -950,7 +1016,7 @@ document.getElementById('rejectBtn').onclick = async () => {
   let res = await fetch('/api/cmd/demo-reject', { method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}' }) });
   let data = await res.json();
-  if (!data.ok && data.error && data.error.includes('Demo mode')) {
+  if (!data.ok && data.error && !data.error.includes('Already')) {
     res = await fetch('/api/cmd/decision', { method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ docId:'${escapeJs(docId)}', cmdId:'${escapeJs(cmdId)}', decision:'REJECT' }) });
     data = await res.json();

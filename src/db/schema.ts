@@ -203,4 +203,23 @@ CREATE TABLE IF NOT EXISTS conditional_orders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_conditional_orders_doc ON conditional_orders(doc_id, status);
+
+CREATE TABLE IF NOT EXISTS channel_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id TEXT NOT NULL,
+  app_session_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  amount REAL,
+  asset TEXT,
+  from_addr TEXT,
+  to_addr TEXT,
+  state_hash TEXT,
+  settlement_tx TEXT,
+  details TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_events_doc ON channel_events(doc_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_events_session ON channel_events(app_session_id, version);
 `;

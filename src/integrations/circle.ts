@@ -119,17 +119,30 @@ export class CircleArcClient {
         amount,
         fee: { type: "level" as any, config: { feeLevel: "MEDIUM" as any } }
       });
-    } catch (e) {
+    } catch (e: any) {
+      // Extract useful error details from Circle API response
+      const status = e?.response?.status ?? e?.status ?? "?";
+      const body = e?.response?.data ?? e?.data ?? e?.message ?? String(e);
+      const detail = typeof body === "object" ? JSON.stringify(body) : String(body);
+      console.warn(`[Circle] createTransaction failed (HTTP ${status}): ${detail}`);
+
       // Retry once after 2s for transient failures
-      console.warn(`[Circle] createTransaction failed, retrying in 2s:`, (e as Error).message);
+      console.warn(`[Circle] Retrying createTransaction in 2s...`);
       await sleep(2000);
-      createRes = await this.client.createTransaction({
-        walletId: params.walletId,
-        tokenId,
-        destinationAddress: params.destinationAddress,
-        amount,
-        fee: { type: "level" as any, config: { feeLevel: "MEDIUM" as any } }
-      });
+      try {
+        createRes = await this.client.createTransaction({
+          walletId: params.walletId,
+          tokenId,
+          destinationAddress: params.destinationAddress,
+          amount,
+          fee: { type: "level" as any, config: { feeLevel: "MEDIUM" as any } }
+        });
+      } catch (e2: any) {
+        const status2 = e2?.response?.status ?? e2?.status ?? "?";
+        const body2 = e2?.response?.data ?? e2?.data ?? e2?.message ?? String(e2);
+        const detail2 = typeof body2 === "object" ? JSON.stringify(body2) : String(body2);
+        throw new Error(`Circle createTransaction HTTP ${status2}: ${detail2}`);
+      }
     }
 
     const tx = createRes?.data;

@@ -110,7 +110,15 @@ export function buildWriteCellRequests(params: { cell: docs_v1.Schema$TableCell;
   const deleteEnd = Math.max(startIndex, endIndex - 1);
 
   const requests: docs_v1.Schema$Request[] = [];
-  if (deleteEnd > startIndex) {
+  if (deleteEnd > startIndex + 1) {
+    // Only delete if there's actual content beyond the mandatory cell newline
+    requests.push({
+      deleteContentRange: {
+        range: { startIndex, endIndex: deleteEnd }
+      }
+    });
+  } else if (deleteEnd > startIndex) {
+    // Minimal cell content — still try to clear it
     requests.push({
       deleteContentRange: {
         range: { startIndex, endIndex: deleteEnd }

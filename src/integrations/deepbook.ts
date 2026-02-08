@@ -181,7 +181,7 @@ export class DeepBookV3Client implements DeepBookClient {
       return { kind: "tx", txDigest, managerId };
     }
 
-    // SETTLE: withdraw settled amounts + withdraw all manager balances back to owner (demo-friendly).
+    // SETTLE: withdraw settled amounts + withdraw all manager balances back to owner.
     const [baseKey, quoteKey] = splitPoolKey(poolKey);
     const tx = new Transaction();
     deepbook.deepBook.withdrawSettledAmounts(poolKey, managerKey)(tx);

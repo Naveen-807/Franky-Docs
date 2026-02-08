@@ -97,7 +97,9 @@ async function main() {
     yellowApplicationName: config.YELLOW_APP_NAME ?? "DocWallet",
     yellowAsset: config.YELLOW_ASSET,
     walletconnect,
-    demoMode: config.DEMO_MODE
+    demoMode: config.DEMO_MODE,
+    circleApiKey: config.CIRCLE_API_KEY,
+    suiFaucetUrl: config.SUI_FAUCET_URL,
   });
 
   if (walletconnect) await walletconnect.init();
@@ -105,7 +107,7 @@ async function main() {
   console.log(`[engine] started — polling every ${config.POLL_INTERVAL_MS}ms, ${repo.listDocs().length} tracked docs`);
 
   // Best-effort initial ticks — fire-and-forget with timeout so they never block startup
-  const withTimeout = (p: Promise<void>, label: string, ms = 30_000) =>
+  const withTimeout = (p: Promise<void>, label: string, ms = 90_000) =>
     Promise.race([p, new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))])
       .catch((e) => console.error(`[startup] ${label} failed (will retry on schedule):`, (e as Error).message));
 

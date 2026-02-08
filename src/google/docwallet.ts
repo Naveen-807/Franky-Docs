@@ -114,6 +114,42 @@ export async function writeConfigValue(params: {
   throw new Error(`Config key not found: ${key}`);
 }
 
+/**
+ * Write multiple config key/value pairs in a SINGLE Google Docs API call.
+ * Much faster than calling writeConfigValue() sequentially.
+ * Requests are sorted bottom-to-top so indices stay stable.
+ */
+export async function writeConfigBatch(params: {
+  docs: docs_v1.Docs;
+  docId: string;
+  configTable: docs_v1.Schema$Table;
+  entries: Array<{ key: string; value: string }>;
+}) {
+  const { docs, docId, configTable, entries } = params;
+  if (entries.length === 0) return;
+  const rows = configTable.tableRows ?? [];
+
+  const groups: Array<{ sortIndex: number; requests: docs_v1.Schema$Request[] }> = [];
+  for (const { key, value } of entries) {
+    for (let r = 1; r < rows.length; r++) {
+      const k = cellText(rows[r].tableCells?.[0]).trim();
+      if (k !== key) continue;
+      const cell = rows[r].tableCells?.[1];
+      if (!cell) break;
+      const reqs = buildWriteCellRequests({ cell, text: value });
+      if (reqs.length > 0) {
+        const idx = tableCellStartIndex(cell) ?? 0;
+        groups.push({ sortIndex: idx, requests: reqs });
+      }
+      break;
+    }
+  }
+  if (groups.length === 0) return;
+  // Sort bottom-to-top so deletes/inserts don't shift earlier indices
+  const ordered = groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);
+  await batchUpdateDoc({ docs, docId, requests: ordered });
+}
+
 export type CommandRow = {
   rowIndex: number; // index in table (0 = header)
   id: string;
@@ -164,24 +200,39 @@ export async function appendCommandRow(params: {
   error?: string;
 }) {
   const { docs, docId, id, command, status, approvalUrl, result, error } = params;
-  const tables = await loadDocWalletTables({ docs, docId });
-  const table = tables.commands.table;
-  const startIndex = tables.commands.tableStartIndex;
-  const rowCount = (table.tableRows ?? []).length;
-  const lastRowIndex = Math.max(0, rowCount - 1);
 
-  await batchUpdateDoc({
-    docs,
-    docId,
-    requests: [
-      {
-        insertTableRow: {
-          tableCellLocation: { tableStartLocation: { index: startIndex }, rowIndex: lastRowIndex, columnIndex: 0 },
-          insertBelow: true
-        }
+  // Retry-aware table insertion: indices can shift if concurrent doc edits occur
+  let retries = 2;
+  while (true) {
+    try {
+      const tables = await loadDocWalletTables({ docs, docId });
+      const table = tables.commands.table;
+      const startIndex = tables.commands.tableStartIndex;
+      const rowCount = (table.tableRows ?? []).length;
+      const lastRowIndex = Math.max(0, rowCount - 1);
+
+      await batchUpdateDoc({
+        docs,
+        docId,
+        requests: [
+          {
+            insertTableRow: {
+              tableCellLocation: { tableStartLocation: { index: startIndex }, rowIndex: lastRowIndex, columnIndex: 0 },
+              insertBelow: true
+            }
+          }
+        ]
+      });
+      break; // success
+    } catch (err) {
+      if (retries-- > 0 && String(err).includes("Invalid")) {
+        invalidateTemplateCache(docId);
+        await new Promise(r => setTimeout(r, 500));
+        continue;
       }
-    ]
-  });
+      throw err;
+    }
+  }
 
   const tables2 = await loadDocWalletTables({ docs, docId });
   const row = (tables2.commands.table.tableRows ?? []).at(-1);
@@ -382,29 +433,42 @@ export async function appendAuditRow(params: {
 }) {
   const { docs, docId, timestampIso, message } = params;
 
-  // Insert a row below the last row, then re-fetch and fill it.
-  const tables = await loadDocWalletTables({ docs, docId });
-  const auditTable = tables.audit.table;
-  const auditTableStartIndex = tables.audit.tableStartIndex;
-  const rowCount = (auditTable.tableRows ?? []).length;
-  const lastRowIndex = Math.max(0, rowCount - 1);
+  // Retry-aware table insertion: indices can shift if concurrent doc edits occur
+  let retries = 2;
+  while (true) {
+    try {
+      const tables = await loadDocWalletTables({ docs, docId });
+      const auditTable = tables.audit.table;
+      const auditTableStartIndex = tables.audit.tableStartIndex;
+      const rowCount = (auditTable.tableRows ?? []).length;
+      const lastRowIndex = Math.max(0, rowCount - 1);
 
-  await batchUpdateDoc({
-    docs,
-    docId,
-    requests: [
-      {
-        insertTableRow: {
-          tableCellLocation: {
-            tableStartLocation: { index: auditTableStartIndex },
-            rowIndex: lastRowIndex,
-            columnIndex: 0
-          },
-          insertBelow: true
-        }
+      await batchUpdateDoc({
+        docs,
+        docId,
+        requests: [
+          {
+            insertTableRow: {
+              tableCellLocation: {
+                tableStartLocation: { index: auditTableStartIndex },
+                rowIndex: lastRowIndex,
+                columnIndex: 0
+              },
+              insertBelow: true
+            }
+          }
+        ]
+      });
+      break; // success
+    } catch (err) {
+      if (retries-- > 0 && String(err).includes("Invalid")) {
+        invalidateTemplateCache(docId);
+        await new Promise(r => setTimeout(r, 500));
+        continue;
       }
-    ]
-  });
+      throw err;
+    }
+  }
 
   const tables2 = await loadDocWalletTables({ docs, docId });
   const audit2 = tables2.audit.table;
@@ -438,28 +502,42 @@ export async function appendRecentActivityRow(params: {
 }) {
   const { docs, docId, timestampIso, type, details, tx } = params;
 
-  const tables = await loadDocWalletTables({ docs, docId });
-  const table = tables.recentActivity.table;
-  const startIndex = tables.recentActivity.tableStartIndex;
-  const rowCount = (table.tableRows ?? []).length;
-  const lastRowIndex = Math.max(0, rowCount - 1);
+  // Retry-aware table insertion: indices can shift if concurrent doc edits occur
+  let retries = 2;
+  while (true) {
+    try {
+      const tables = await loadDocWalletTables({ docs, docId });
+      const table = tables.recentActivity.table;
+      const startIndex = tables.recentActivity.tableStartIndex;
+      const rowCount = (table.tableRows ?? []).length;
+      const lastRowIndex = Math.max(0, rowCount - 1);
 
-  await batchUpdateDoc({
-    docs,
-    docId,
-    requests: [
-      {
-        insertTableRow: {
-          tableCellLocation: {
-            tableStartLocation: { index: startIndex },
-            rowIndex: lastRowIndex,
-            columnIndex: 0
-          },
-          insertBelow: true
-        }
+      await batchUpdateDoc({
+        docs,
+        docId,
+        requests: [
+          {
+            insertTableRow: {
+              tableCellLocation: {
+                tableStartLocation: { index: startIndex },
+                rowIndex: lastRowIndex,
+                columnIndex: 0
+              },
+              insertBelow: true
+            }
+          }
+        ]
+      });
+      break; // success
+    } catch (err) {
+      if (retries-- > 0 && String(err).includes("Invalid")) {
+        invalidateTemplateCache(docId);
+        await new Promise(r => setTimeout(r, 500));
+        continue;
       }
-    ]
-  });
+      throw err;
+    }
+  }
 
   const tables2 = await loadDocWalletTables({ docs, docId });
   const t2 = tables2.recentActivity.table;
