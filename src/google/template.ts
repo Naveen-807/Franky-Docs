@@ -189,6 +189,45 @@ async function upgradeOldHeadings(params: { docs: docs_v1.Docs; docId: string })
   await batchUpdateDoc({ docs, docId, requests });
 }
 
+/** Same as upgradeOldHeadings but accepts an already-fetched doc to avoid an extra getDoc call */
+async function upgradeOldHeadingsWithDoc(params: { docs: docs_v1.Docs; docId: string; doc: docs_v1.Schema$Document }) {
+  const { docs, docId, doc } = params;
+  const content = doc.body?.content ?? [];
+
+  const renames: Record<string, string> = {
+    "Config": "⚙️ Configuration", "Commands": "📋 Commands", "Chat": "💬 Ask Franky",
+    "Dashboard — Balances": "💰 Portfolio", "Dashboard — Open Orders": "📊 Open Orders",
+    "Dashboard — Recent Activity": "📡 Activity Feed", "WalletConnect Sessions": "🔗 Connected Apps",
+    "Audit Log": "📝 Audit Log", "💬 Chat": "💬 Ask Franky", "💰 Balances": "💰 Portfolio",
+    "🕐 Recent Activity": "📡 Activity Feed", "🔗 WalletConnect Sessions": "🔗 Connected Apps",
+  };
+  const ops: Array<{ startIndex: number; endIndex: number; newText: string }> = [];
+  for (const el of content) {
+    if (!el.paragraph) continue;
+    const text = paragraphPlainText(el.paragraph).trim();
+    if (typeof el.startIndex !== "number" || typeof el.endIndex !== "number") continue;
+    const newHeading = renames[text];
+    if (newHeading && newHeading !== text) {
+      const textEnd = el.endIndex - 1;
+      if (textEnd > el.startIndex) ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: newHeading });
+      continue;
+    }
+    if (text === "FrankyDocs" || text === "🟢 FrankyDocs — DocWallet") {
+      const textEnd = el.endIndex - 1;
+      if (textEnd > el.startIndex) ops.push({ startIndex: el.startIndex, endIndex: textEnd, newText: "🟢 FrankyDocs" });
+    }
+  }
+  if (ops.length === 0) return;
+  ops.sort((a, b) => b.startIndex - a.startIndex);
+  const requests: docs_v1.Schema$Request[] = [];
+  for (const op of ops) {
+    if (op.endIndex <= op.startIndex) continue;
+    requests.push({ deleteContentRange: { range: { startIndex: op.startIndex, endIndex: op.endIndex } } });
+    requests.push({ insertText: { location: { index: op.startIndex }, text: op.newText } });
+  }
+  if (requests.length > 0) await batchUpdateDoc({ docs, docId, requests });
+}
+
 export async function ensureDocWalletTemplate(params: {
   docs: docs_v1.Docs;
   docId: string;
@@ -237,13 +276,15 @@ export async function ensureDocWalletTemplate(params: {
    * Phase 0 — Remove duplicate template blocks from previous failed runs.
    * ---------------------------------------------------------------- */
   await removeDuplicateTemplateBlocks({ docs, docId });
-  await upgradeOldHeadings({ docs, docId });
 
   /* ------------------------------------------------------------------
    * Phase 1 — Ensure all 8 anchor paragraphs exist in the document.
    *           (Text only — tables are inserted in Phase 2.)
    * ---------------------------------------------------------------- */
   const doc = await getDoc(docs, docId);
+
+  // Upgrade old headings inline using the doc we already have (no extra getDoc)
+  await upgradeOldHeadingsWithDoc({ docs, docId, doc });
   const hasBaseAnchors =
     Boolean(findAnchor(doc, DOCWALLET_CONFIG_ANCHOR)) &&
     Boolean(findAnchor(doc, DOCWALLET_COMMANDS_ANCHOR)) &&
@@ -387,28 +428,51 @@ export async function ensureDocWalletTemplate(params: {
   /* ------------------------------------------------------------------
    * Phase 3 — Ensure minimum row counts, populate headers/keys,
    *           hide anchor text, migrate v1 schema, apply styles.
-   *           Uses a single getDoc() for all ensureMinTableRows calls.
+   *           Merged into fewer API calls for speed.
    * ---------------------------------------------------------------- */
+  // Single getDoc for row checks
   const rowDoc = await getDoc(docs, docId);
-  // Run sequentially because each insertion shifts indices for later tables
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CONFIG_ANCHOR, minRows: 30 }, rowDoc);
-  // After the first batch we need a fresh doc if rows were actually added
-  const rowDoc2 = await getDoc(docs, docId);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_COMMANDS_ANCHOR, minRows: Math.max(2, minCommandRows) }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CHAT_ANCHOR, minRows: 20 }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_BALANCES_ANCHOR, minRows: 25 }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_OPEN_ORDERS_ANCHOR, minRows: 12 }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_RECENT_ACTIVITY_ANCHOR, minRows: 10 }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_PAYOUT_RULES_ANCHOR, minRows: 8 }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_SESSIONS_ANCHOR, minRows: 8 }, rowDoc2);
-  await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_AUDIT_ANCHOR, minRows: 2 }, rowDoc2);
+  const configTableCheck = findAnchor(rowDoc, DOCWALLET_CONFIG_ANCHOR);
+  const configInfo = configTableCheck ? findNextTable(rowDoc, configTableCheck.elementIndex) : null;
+  const needsRowExpansion = configInfo ? ((configInfo.table.tableRows ?? []).length < 30) : true;
 
-  await populateTemplateTables({ docs, docId, onlyFillEmpty: true });
-  await hideAnchorText({ docs, docId });
-  await maybeMigrateCommandsTableV1({ docs, docId });
-  await styleDocTemplate({ docs, docId });
-  await ensureGuideTab({ docs, docId });
-  await renameMainTab({ docs, docId });
+  if (needsRowExpansion) {
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CONFIG_ANCHOR, minRows: 30 }, rowDoc);
+    const rowDoc2 = await getDoc(docs, docId);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_COMMANDS_ANCHOR, minRows: Math.max(2, minCommandRows) }, rowDoc2);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_CHAT_ANCHOR, minRows: 20 }, rowDoc2);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_BALANCES_ANCHOR, minRows: 25 }, rowDoc2);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_OPEN_ORDERS_ANCHOR, minRows: 12 }, rowDoc2);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_RECENT_ACTIVITY_ANCHOR, minRows: 10 }, rowDoc2);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_PAYOUT_RULES_ANCHOR, minRows: 8 }, rowDoc2);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_SESSIONS_ANCHOR, minRows: 8 }, rowDoc2);
+    await ensureMinTableRows({ docs, docId, anchorText: DOCWALLET_AUDIT_ANCHOR, minRows: 2 }, rowDoc2);
+  }
+
+  // Merge populateTemplateTables + hideAnchorText + maybeMigrateCommandsTableV1
+  // into a single getDoc + combined batchUpdate
+  const mergedDoc = await getDoc(docs, docId);
+  const mergedRequests: docs_v1.Schema$Request[] = [];
+
+  // --- Populate template tables ---
+  mergedRequests.push(...buildPopulateRequests(mergedDoc, docId, true));
+
+  // --- Hide anchor text ---
+  mergedRequests.push(...buildHideAnchorRequests(mergedDoc));
+
+  // --- Migrate commands table v1 if needed ---
+  mergedRequests.push(...buildMigrateV1Requests(mergedDoc));
+
+  if (mergedRequests.length > 0) {
+    await batchUpdateDoc({ docs, docId, requests: mergedRequests });
+  }
+
+  // Style + tabs (these need fresh doc state after the merge)
+  await Promise.allSettled([
+    styleDocTemplate({ docs, docId }),
+    ensureGuideTab({ docs, docId }),
+    renameMainTab({ docs, docId }),
+  ]);
 
   const finalDoc = await getDoc(docs, docId);
 
@@ -642,6 +706,125 @@ async function populateTemplateTables(params: {
 
   const ordered = groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);
   await batchUpdateDoc({ docs, docId, requests: ordered });
+}
+
+/** Build populate requests without calling getDoc — uses an already-fetched doc. Returns sorted requests. */
+function buildPopulateRequests(doc: docs_v1.Schema$Document, docId: string, onlyFillEmpty: boolean): docs_v1.Schema$Request[] {
+  const groups: Array<{ sortIndex: number; requests: docs_v1.Schema$Request[] }> = [];
+  const setIf = (cell: docs_v1.Schema$TableCell | undefined, text: string) => {
+    if (!cell) return;
+    if (onlyFillEmpty) {
+      const existing = cellPlainText(cell);
+      if (existing.trim() !== "") return;
+    }
+    groups.push({ sortIndex: tableCellStartIndex(cell) ?? 0, requests: buildWriteCellRequests({ cell, text }) });
+  };
+
+  try {
+    const configTable = mustGetTable(doc, DOCWALLET_CONFIG_ANCHOR);
+    const cfg = configTable.tableRows ?? [];
+    setIf(cfg[0]?.tableCells?.[0], "KEY");
+    setIf(cfg[0]?.tableCells?.[1], "VALUE");
+    const cfgKeys: Array<[string, string]> = [
+      ["DOCWALLET_VERSION", "2"], ["STATUS", "NEEDS_SETUP"], ["DOC_ID", docId],
+      ["EVM_ADDRESS", ""], ["WEB_BASE_URL", ""], ["YELLOW_SESSION_ID", ""],
+      ["YELLOW_PROTOCOL", "NitroRPC/0.4"], ["MODE", "SINGLE_USER"], ["SUI_ADDRESS", ""],
+      ["SUI_ENV", "testnet"], ["DEEPBOOK_POOL", "SUI_DBUSDC"], ["DEEPBOOK_MANAGER", ""],
+      ["ARC_NETWORK", "ARC-TESTNET"], ["ARC_WALLET_ADDRESS", ""], ["ARC_WALLET_ID", ""],
+      ["APPROVALS_TOTAL", "0"], ["EST_APPROVAL_TX_AVOIDED", "0"], ["SIGNER_APPROVAL_GAS_PAID", "0.003"],
+      ["DOC_CELL_APPROVALS", "1"], ["AGENT_AUTOPROPOSE", "1"], ["LAST_PROPOSAL", ""],
+      ["LAST_APPROVAL", ""], ["DEMO_MODE", "1"],
+    ];
+    for (let i = 0; i < cfgKeys.length; i++) {
+      const row = cfg[i + 1];
+      setIf(row?.tableCells?.[0], cfgKeys[i][0]);
+      setIf(row?.tableCells?.[1], cfgKeys[i][1]);
+    }
+  } catch { /* config table missing */ }
+
+  const tableHeaders: Array<{ anchor: string; headers: string[] }> = [
+    { anchor: DOCWALLET_COMMANDS_ANCHOR, headers: ["ID", "COMMAND", "STATUS", "APPROVAL_URL", "RESULT", "ERROR"] },
+    { anchor: DOCWALLET_CHAT_ANCHOR, headers: ["USER", "AGENT"] },
+    { anchor: DOCWALLET_BALANCES_ANCHOR, headers: ["LOCATION", "ASSET", "BALANCE"] },
+    { anchor: DOCWALLET_OPEN_ORDERS_ANCHOR, headers: ["ORDER_ID", "SIDE", "PRICE", "QTY", "STATUS", "UPDATED_AT", "TX"] },
+    { anchor: DOCWALLET_RECENT_ACTIVITY_ANCHOR, headers: ["TIME", "TYPE", "DETAILS", "TX"] },
+    { anchor: DOCWALLET_SESSIONS_ANCHOR, headers: ["SESSION_ID", "PEER_NAME", "CHAINS", "CREATED_AT", "STATUS"] },
+    { anchor: DOCWALLET_AUDIT_ANCHOR, headers: ["TIME", "MESSAGE"] },
+  ];
+  for (const { anchor, headers } of tableHeaders) {
+    try {
+      const table = mustGetTable(doc, anchor);
+      const rows = table.tableRows ?? [];
+      for (let c = 0; c < headers.length; c++) setIf(rows[0]?.tableCells?.[c], headers[c]);
+    } catch { /* table missing */ }
+  }
+
+  try {
+    const payoutRulesTable = mustGetTable(doc, DOCWALLET_PAYOUT_RULES_ANCHOR);
+    const prRows = payoutRulesTable.tableRows ?? [];
+    const prHeader = ["LABEL", "RECIPIENT", "AMOUNT_USDC", "FREQUENCY", "NEXT_RUN", "LAST_TX", "STATUS"];
+    for (let c = 0; c < prHeader.length; c++) setIf(prRows[0]?.tableCells?.[c], prHeader[c]);
+    if (prRows.length > 1 && onlyFillEmpty) {
+      const exampleRow = ["Team Salary (example)", "0x0000000000000000000000000000000000000000", "500", "monthly", "—", "—", "PAUSED"];
+      for (let c = 0; c < exampleRow.length; c++) setIf(prRows[1]?.tableCells?.[c], exampleRow[c]);
+    }
+  } catch { /* no payout rules table */ }
+
+  return groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);
+}
+
+/** Build hide-anchor-text requests from an already-fetched doc */
+function buildHideAnchorRequests(doc: docs_v1.Schema$Document): docs_v1.Schema$Request[] {
+  const anchors = [
+    DOCWALLET_CONFIG_ANCHOR, DOCWALLET_COMMANDS_ANCHOR, DOCWALLET_CHAT_ANCHOR,
+    DOCWALLET_BALANCES_ANCHOR, DOCWALLET_OPEN_ORDERS_ANCHOR, DOCWALLET_RECENT_ACTIVITY_ANCHOR,
+    DOCWALLET_PAYOUT_RULES_ANCHOR, DOCWALLET_SESSIONS_ANCHOR, DOCWALLET_AUDIT_ANCHOR
+  ];
+  const requests: docs_v1.Schema$Request[] = [];
+  for (const anchorText of anchors) {
+    const anchor = findAnchor(doc, anchorText);
+    if (!anchor) continue;
+    const endIndex = Math.max(anchor.startIndex + 1, anchor.endIndex - 1);
+    if (endIndex <= anchor.startIndex) continue;
+    requests.push({
+      updateTextStyle: {
+        range: { startIndex: anchor.startIndex, endIndex },
+        textStyle: {
+          fontSize: { magnitude: 1, unit: "PT" },
+          foregroundColor: { color: { rgbColor: { red: 1, green: 1, blue: 1 } } }
+        },
+        fields: "fontSize,foregroundColor"
+      }
+    });
+  }
+  return requests;
+}
+
+/** Build v1→v2 migration requests from an already-fetched doc */
+function buildMigrateV1Requests(doc: docs_v1.Schema$Document): docs_v1.Schema$Request[] {
+  try {
+    const commandsTable = mustGetTable(doc, DOCWALLET_COMMANDS_ANCHOR);
+    const rows = commandsTable.tableRows ?? [];
+    const headerCells = rows[0]?.tableCells ?? [];
+    const col2 = headerCells[2] ? cellPlainText(headerCells[2]) : "";
+    const col3 = headerCells[3] ? cellPlainText(headerCells[3]) : "";
+    if (col2.trim().toUpperCase() !== "APPROVAL" || col3.trim().toUpperCase() !== "STATUS") return [];
+
+    const groups: Array<{ sortIndex: number; requests: docs_v1.Schema$Request[] }> = [];
+    const write = (cell: docs_v1.Schema$TableCell | undefined, text: string) => {
+      if (!cell) return;
+      groups.push({ sortIndex: tableCellStartIndex(cell) ?? 0, requests: buildWriteCellRequests({ cell, text }) });
+    };
+    const v2Header = ["ID", "COMMAND", "STATUS", "APPROVAL_URL", "RESULT", "ERROR"];
+    for (let c = 0; c < v2Header.length; c++) write(headerCells[c], v2Header[c]!);
+    for (let r = 1; r < rows.length; r++) {
+      const cells = rows[r]?.tableCells ?? [];
+      const statusVal = cells[3] ? cellPlainText(cells[3]) : "";
+      if (statusVal.trim()) write(cells[2], statusVal.trim());
+      write(cells[3], "");
+    }
+    return groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);
+  } catch { return []; }
 }
 
 async function hideAnchorText(params: { docs: docs_v1.Docs; docId: string }) {
