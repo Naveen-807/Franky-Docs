@@ -105,20 +105,19 @@ export function buildWriteCellRequests(params: { cell: docs_v1.Schema$TableCell;
   const range = tableCellRange(cell);
   if (!range) return [];
 
+  // Validate the cell has actual paragraph content we can write into
+  const hasParagraph = (cell.content ?? []).some((el) => el.paragraph);
+  if (!hasParagraph) return [];
+
   const startIndex = range.startIndex;
   const endIndex = range.endIndex;
-  const deleteEnd = Math.max(startIndex, endIndex - 1);
+  if (startIndex < 1 || endIndex <= startIndex) return [];
 
+  // Google Docs cells always have a mandatory trailing newline that CANNOT be deleted.
+  // Only delete content if there are at least 2 chars beyond startIndex (i.e. real content + newline).
+  const deleteEnd = endIndex - 1; // preserve the trailing newline
   const requests: docs_v1.Schema$Request[] = [];
-  if (deleteEnd > startIndex + 1) {
-    // Only delete if there's actual content beyond the mandatory cell newline
-    requests.push({
-      deleteContentRange: {
-        range: { startIndex, endIndex: deleteEnd }
-      }
-    });
-  } else if (deleteEnd > startIndex) {
-    // Minimal cell content — still try to clear it
+  if (deleteEnd > startIndex) {
     requests.push({
       deleteContentRange: {
         range: { startIndex, endIndex: deleteEnd }

@@ -2,14 +2,6 @@ import { loadConfig } from "../config.js";
 import { createGoogleAuth, loadServiceAccountKey } from "../google/auth.js";
 import { createDocsClient, createDriveClient } from "../google/clients.js";
 import { listAccessibleDocs } from "../google/drive.js";
-import { CircleArcClient } from "../integrations/circle.js";
-import { SuiClient } from "@mysten/sui/client";
-
-function mask(s: string | undefined, keep = 4) {
-  if (!s) return "(unset)";
-  if (s.length <= keep) return "***";
-  return `${"*".repeat(Math.max(0, s.length - keep))}${s.slice(-keep)}`;
-}
 
 async function main() {
   const config = loadConfig();
@@ -49,47 +41,6 @@ async function main() {
       console.log("- Set DOCWALLET_DISCOVER_ALL=1, or");
       console.log("- Set DOCWALLET_DOC_ID=<the doc id>");
     }
-  }
-
-  // Sui
-  if (config.DEEPBOOK_ENABLED) {
-    const sui = new SuiClient({ url: config.SUI_RPC_URL! });
-    const state = await sui.getLatestSuiSystemState();
-    console.log(`\nSui RPC: OK (epoch ${state.epoch})`);
-  } else {
-    console.log("\nSui/DeepBook: disabled (DEEPBOOK_ENABLED=0)");
-  }
-
-  // Circle
-  if (config.CIRCLE_ENABLED) {
-    console.log(`\nCircle: enabled (apiKey=${mask(config.CIRCLE_API_KEY)} entitySecret=${mask(config.CIRCLE_ENTITY_SECRET)})`);
-    const circle = new CircleArcClient({
-      apiKey: config.CIRCLE_API_KEY!,
-      entitySecret: config.CIRCLE_ENTITY_SECRET!,
-      walletSetId: config.CIRCLE_WALLET_SET_ID,
-      blockchain: config.CIRCLE_BLOCKCHAIN,
-      usdcTokenAddress: config.ARC_USDC_ADDRESS as `0x${string}`,
-      accountType: config.CIRCLE_ACCOUNT_TYPE
-    });
-    const pk = await (circle as any).client.getPublicKey?.();
-    const hasPk = Boolean(pk?.data?.publicKey);
-    console.log(`Circle getPublicKey: ${hasPk ? "OK" : "UNEXPECTED_RESPONSE"}`);
-  } else {
-    console.log("\nCircle: disabled (CIRCLE_ENABLED=0)");
-  }
-
-  // Yellow
-  if (config.YELLOW_ENABLED) {
-    console.log(`\nYellow: enabled (rpcUrl=${config.YELLOW_RPC_URL})`);
-    console.log("Yellow health: not probed (requires signer join flow).");
-  } else {
-    console.log("\nYellow: disabled (YELLOW_ENABLED=0)");
-  }
-
-  if (config.WALLETCONNECT_ENABLED) {
-    console.log(`\nWalletConnect: enabled (projectId=${mask(config.WALLETCONNECT_PROJECT_ID)})`);
-  } else {
-    console.log("\nWalletConnect: disabled (WALLETCONNECT_ENABLED=0)");
   }
 
   console.log("\nDoctor complete.");

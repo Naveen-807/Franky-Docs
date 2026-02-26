@@ -56,8 +56,22 @@ export async function loadDocWalletTables(params: { docs: docs_v1.Docs; docId: s
     await ensureDocWalletTemplate({ docs, docId });
     templateEnsuredDocs.add(docId);
   }
-  const doc = await getDoc(docs, docId);
+  let doc = await getDoc(docs, docId);
 
+  try {
+    return buildDocWalletTables(doc);
+  } catch {
+    // Template may have been created but anchors/tables not fully materialised.
+    // Invalidate cache, re-run template, re-fetch doc, and try once more.
+    templateEnsuredDocs.delete(docId);
+    await ensureDocWalletTemplate({ docs, docId });
+    templateEnsuredDocs.add(docId);
+    doc = await getDoc(docs, docId);
+    return buildDocWalletTables(doc);
+  }
+}
+
+function buildDocWalletTables(doc: docs_v1.Schema$Document): DocWalletTables {
   const cfg = mustGetTableInfo(doc, DOCWALLET_CONFIG_ANCHOR);
   const cmds = mustGetTableInfo(doc, DOCWALLET_COMMANDS_ANCHOR);
   const chat = mustGetTableInfo(doc, DOCWALLET_CHAT_ANCHOR);
@@ -255,6 +269,7 @@ export async function appendCommandRow(params: {
   write(5, error ?? "");
 
   const requests = groups.sort((a, b) => b.sortIndex - a.sortIndex).flatMap((g) => g.requests);
+  if (requests.length === 0) return; // cells have no writable paragraphs — skip
   await batchUpdateDoc({ docs, docId, requests });
 }
 
@@ -478,18 +493,15 @@ export async function appendAuditRow(params: {
   const c1 = newRow?.tableCells?.[1];
   if (!c0 || !c1) return;
 
-  await batchUpdateDoc({
-    docs,
-    docId,
-    requests: [
-      ...[
-        { sortIndex: tableCellStartIndex(c0) ?? 0, requests: buildWriteCellRequests({ cell: c0, text: timestampIso }) },
-        { sortIndex: tableCellStartIndex(c1) ?? 0, requests: buildWriteCellRequests({ cell: c1, text: message }) }
-      ]
-        .sort((a, b) => b.sortIndex - a.sortIndex)
-        .flatMap((g) => g.requests)
+  const auditReqs = [
+      { sortIndex: tableCellStartIndex(c0) ?? 0, requests: buildWriteCellRequests({ cell: c0, text: timestampIso }) },
+      { sortIndex: tableCellStartIndex(c1) ?? 0, requests: buildWriteCellRequests({ cell: c1, text: message }) }
     ]
-  });
+      .sort((a, b) => b.sortIndex - a.sortIndex)
+      .flatMap((g) => g.requests);
+  if (auditReqs.length > 0) {
+    await batchUpdateDoc({ docs, docId, requests: auditReqs });
+  }
 }
 
 export async function appendRecentActivityRow(params: {
@@ -548,20 +560,17 @@ export async function appendRecentActivityRow(params: {
   const c3 = newRow?.tableCells?.[3];
   if (!c0 || !c1 || !c2 || !c3) return;
 
-  await batchUpdateDoc({
-    docs,
-    docId,
-    requests: [
-      ...[
-        { sortIndex: tableCellStartIndex(c0) ?? 0, requests: buildWriteCellRequests({ cell: c0, text: timestampIso }) },
-        { sortIndex: tableCellStartIndex(c1) ?? 0, requests: buildWriteCellRequests({ cell: c1, text: type }) },
-        { sortIndex: tableCellStartIndex(c2) ?? 0, requests: buildWriteCellRequests({ cell: c2, text: details }) },
-        { sortIndex: tableCellStartIndex(c3) ?? 0, requests: buildWriteCellRequests({ cell: c3, text: tx }) }
-      ]
-        .sort((a, b) => b.sortIndex - a.sortIndex)
-        .flatMap((g) => g.requests)
+  const actReqs = [
+      { sortIndex: tableCellStartIndex(c0) ?? 0, requests: buildWriteCellRequests({ cell: c0, text: timestampIso }) },
+      { sortIndex: tableCellStartIndex(c1) ?? 0, requests: buildWriteCellRequests({ cell: c1, text: type }) },
+      { sortIndex: tableCellStartIndex(c2) ?? 0, requests: buildWriteCellRequests({ cell: c2, text: details }) },
+      { sortIndex: tableCellStartIndex(c3) ?? 0, requests: buildWriteCellRequests({ cell: c3, text: tx }) }
     ]
-  });
+      .sort((a, b) => b.sortIndex - a.sortIndex)
+      .flatMap((g) => g.requests);
+  if (actReqs.length > 0) {
+    await batchUpdateDoc({ docs, docId, requests: actReqs });
+  }
 }
 
 function cellText(cell?: docs_v1.Schema$TableCell): string {

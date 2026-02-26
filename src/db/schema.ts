@@ -204,6 +204,19 @@ CREATE TABLE IF NOT EXISTS conditional_orders (
 
 CREATE INDEX IF NOT EXISTS idx_conditional_orders_doc ON conditional_orders(doc_id, status);
 
+CREATE TABLE IF NOT EXISTS bch_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id TEXT NOT NULL,
+  token_category TEXT NOT NULL,
+  ticker TEXT NOT NULL,
+  name TEXT NOT NULL,
+  supply TEXT NOT NULL,
+  genesis_txid TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bch_tokens_doc_category ON bch_tokens(doc_id, token_category);
+
 CREATE TABLE IF NOT EXISTS channel_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   doc_id TEXT NOT NULL,
@@ -222,4 +235,62 @@ CREATE TABLE IF NOT EXISTS channel_events (
 
 CREATE INDEX IF NOT EXISTS idx_channel_events_doc ON channel_events(doc_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_channel_events_session ON channel_events(app_session_id, version);
+
+CREATE TABLE IF NOT EXISTS bch_vaults (
+  vault_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  contract_address TEXT NOT NULL,
+  beneficiary TEXT NOT NULL,
+  unlock_time INTEGER NOT NULL,
+  amount_sats INTEGER NOT NULL,
+  redeem_script TEXT NOT NULL,
+  fund_txid TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'LOCKED',
+  claim_txid TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bch_vaults_doc ON bch_vaults(doc_id, created_at);
+
+CREATE TABLE IF NOT EXISTS bch_multisig_wallets (
+  wallet_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  script_address TEXT NOT NULL,
+  redeem_script TEXT NOT NULL,
+  threshold INTEGER NOT NULL,
+  pubkeys_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bch_multisig_doc ON bch_multisig_wallets(doc_id, created_at);
+
+CREATE TABLE IF NOT EXISTS bch_payment_requests (
+  request_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  address TEXT NOT NULL,
+  amount_sats INTEGER NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  expires_at INTEGER NOT NULL,
+  paid_txid TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bch_payment_requests_doc ON bch_payment_requests(doc_id, created_at);
+
+CREATE TABLE IF NOT EXISTS bch_nft_listings (
+  listing_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  token_category TEXT NOT NULL,
+  token_name TEXT NOT NULL DEFAULT '',
+  price_sats INTEGER NOT NULL,
+  seller_address TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  buyer_doc_id TEXT,
+  buy_txid TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bch_nft_listings_doc ON bch_nft_listings(doc_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_bch_nft_listings_active ON bch_nft_listings(status, created_at);
 `;

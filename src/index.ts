@@ -3,12 +3,13 @@ import { createGoogleAuth } from "./google/auth.js";
 import { createDocsClient, createDriveClient } from "./google/clients.js";
 import { Repo } from "./db/repo.js";
 import { Engine } from "./engine.js";
-import { ArcClient } from "./integrations/arc.js";
-import { CircleArcClient } from "./integrations/circle.js";
-import { NitroRpcYellowClient } from "./integrations/yellow.js";
-import { DeepBookV3Client } from "./integrations/deepbook.js";
+import { HederaClient } from "./integrations/hedera.js";
 import { startServer } from "./server.js";
-import { WalletConnectService } from "./integrations/walletconnect.js";
+import { BchClient } from "./integrations/bch.js";
+import { BchNftClient } from "./integrations/bch-nft.js";
+import { BchMultisigClient } from "./integrations/bch-multisig.js";
+import { CashScriptClient } from "./integrations/cashscript.js";
+import { BchPaymentsClient } from "./integrations/bch-payments.js";
 
 async function main() {
   const config = loadConfig();
@@ -21,70 +22,40 @@ async function main() {
   const drive = createDriveClient(auth);
   const repo = new Repo("data/docwallet.db");
 
-  let yellow: NitroRpcYellowClient | undefined;
-  if (config.YELLOW_ENABLED) {
+  let hedera: HederaClient | undefined;
+  if (config.HEDERA_ENABLED) {
     try {
-      yellow = new NitroRpcYellowClient(config.YELLOW_RPC_URL!, { defaultApplication: config.YELLOW_APP_NAME });
-    } catch (e) {
-      console.error("[startup] Yellow client init failed (continuing without Yellow):", (e as Error).message);
-    }
-  }
-
-  let deepbook: DeepBookV3Client | undefined;
-  if (config.DEEPBOOK_ENABLED) {
-    try {
-      deepbook = new DeepBookV3Client({ rpcUrl: config.SUI_RPC_URL! });
-    } catch (e) {
-      console.error("[startup] DeepBook client init failed (continuing without DeepBook):", (e as Error).message);
-    }
-  }
-
-  let arc: ArcClient | undefined;
-  if (config.ARC_ENABLED) {
-    try {
-      arc = new ArcClient({
-        rpcUrl: config.ARC_RPC_URL,
-        usdcAddress: config.ARC_USDC_ADDRESS as `0x${string}`
+      hedera = new HederaClient({
+        rpcUrl: config.HEDERA_RPC_URL,
+        tokenAddress: config.HEDERA_TOKEN_ADDRESS
       });
     } catch (e) {
-      console.error("[startup] Arc client init failed (continuing without Arc):", (e as Error).message);
+      console.error("[startup] Hedera client init failed (continuing without Hedera):", (e as Error).message);
     }
   }
 
-  let circle: CircleArcClient | undefined;
-  if (config.CIRCLE_ENABLED && config.CIRCLE_API_KEY && config.CIRCLE_ENTITY_SECRET) {
+  let bch: BchClient | undefined;
+  let bchNft: BchNftClient | undefined;
+  let bchMultisig: BchMultisigClient | undefined;
+  let cashScript: CashScriptClient | undefined;
+  let bchPayments: BchPaymentsClient | undefined;
+  if (config.BCH_ENABLED) {
     try {
-      circle = new CircleArcClient({
-        apiKey: config.CIRCLE_API_KEY,
-        entitySecret: config.CIRCLE_ENTITY_SECRET,
-        walletSetId: config.CIRCLE_WALLET_SET_ID,
-        blockchain: config.CIRCLE_BLOCKCHAIN,
-        usdcTokenAddress: config.ARC_USDC_ADDRESS as `0x${string}`,
-        accountType: config.CIRCLE_ACCOUNT_TYPE
+      bch = new BchClient({
+        restUrl: config.BCH_REST_URL,
+        network: config.BCH_NETWORK
       });
+      bchNft = new BchNftClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
+      bchMultisig = new BchMultisigClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
+      cashScript = new CashScriptClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
+      bchPayments = new BchPaymentsClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
+      console.log(`[startup] BCH client initialized (${config.BCH_NETWORK}, REST: ${config.BCH_REST_URL})`);
     } catch (e) {
-      console.error("[startup] Circle client init failed (continuing without Circle):", (e as Error).message);
+      console.error("[startup] BCH client init failed (continuing without BCH):", (e as Error).message);
     }
   }
 
-  let engine: Engine;
-  const walletconnect = config.WALLETCONNECT_ENABLED
-    ? new WalletConnectService({
-        projectId: config.WALLETCONNECT_PROJECT_ID!,
-        relayUrl: config.WALLETCONNECT_RELAY_URL,
-        metadata: {
-          name: "DocWallet",
-          description: "DocWallet approvals",
-          url: config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`,
-          icons: []
-        },
-        repo,
-        onRequest: async (req) => engine.handleWalletConnectRequest(req),
-        onSessionUpdate: async (session) => engine.handleWalletConnectSessionUpdate(session)
-      })
-    : undefined;
-
-  engine = new Engine({ config, docs, drive, repo, yellow, deepbook, arc, circle, walletconnect });
+  const engine = new Engine({ config, docs, drive, repo, hedera, bch, bchNft, bchMultisig, cashScript, bchPayments });
 
   const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
   startServer({
@@ -93,16 +64,8 @@ async function main() {
     masterKey: config.DOCWALLET_MASTER_KEY,
     port: config.HTTP_PORT,
     publicBaseUrl,
-    yellow,
-    yellowApplicationName: config.YELLOW_APP_NAME ?? "DocWallet",
-    yellowAsset: config.YELLOW_ASSET,
-    walletconnect,
-    demoMode: config.DEMO_MODE,
-    circleApiKey: config.CIRCLE_API_KEY,
-    suiFaucetUrl: config.SUI_FAUCET_URL,
+    demoMode: config.DEMO_MODE
   });
-
-  if (walletconnect) await walletconnect.init();
 
   console.log(`[engine] started — polling every ${config.POLL_INTERVAL_MS}ms, ${repo.listDocs().length} tracked docs`);
 

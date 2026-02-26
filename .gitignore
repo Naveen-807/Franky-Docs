@@ -1,7 +1,7 @@
 node_modules
 dist
 
-# env/secrets
+# ── Secrets / Credentials ──────────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
@@ -11,15 +11,17 @@ dist
 *.jks
 *.crt
 *.cert
-# common credential files
 *service-account*.json
 *serviceaccount*.json
 *credentials*.json
 *gcp*.json
 *google*.json
 *firebase*.json
+# Download folder keys / service account files
+*.frankydocs*.json
+Downloads/
 
-# local data/db
+# ── Database / Wallet data (never commit funded wallet keys) ──────────────────
 data/
 *.db
 *.db-shm
@@ -27,24 +29,38 @@ data/
 *.sqlite
 *.sqlite3
 
-# logs/coverage
+# ── Plans / Internal strategy docs ──────────────────────────────────────────
+plans/
+BCH_HACKERATHON_ENHANCEMENT_PLAN.md
+Plan_v1___Hackathon_Plan.md
+FrankyDocs-Project-Explanation.md
+
+# ── Zoro sub-project (separate repo) ─────────────────────────────────────────
+Zoro/
+
+# ── PDF / binary assets ───────────────────────────────────────────────────────
+*.pdf
+*.PDF
+
+# ── Logs / coverage ───────────────────────────────────────────────────────────
 *.log
 coverage
 .nyc_output
 .eslintcache
 .stylelintcache
 
-# OS/editor
+# ── OS / editor ───────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .idea
 .vscode
 .cursor
+.kiro
 *.swp
 *.swo
 *~
 
-# build artifacts
+# ── Build artifacts ───────────────────────────────────────────────────────────
 *.tsbuildinfo
 *.map
 

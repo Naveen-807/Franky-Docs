@@ -177,6 +177,66 @@ export type ConditionalOrderRow = {
   updated_at: number;
 };
 
+export type BchTokenRow = {
+  id: number;
+  doc_id: string;
+  token_category: string;
+  ticker: string;
+  name: string;
+  supply: string;
+  genesis_txid: string;
+  created_at: number;
+};
+
+export type BchVaultRow = {
+  vault_id: string;
+  doc_id: string;
+  contract_address: string;
+  beneficiary: string;
+  unlock_time: number;
+  amount_sats: number;
+  redeem_script: string;
+  fund_txid: string;
+  status: string;
+  claim_txid: string | null;
+  created_at: number;
+};
+
+export type BchMultisigWalletRow = {
+  wallet_id: string;
+  doc_id: string;
+  script_address: string;
+  redeem_script: string;
+  threshold: number;
+  pubkeys_json: string;
+  created_at: number;
+};
+
+export type BchPaymentRequestRow = {
+  request_id: string;
+  doc_id: string;
+  address: string;
+  amount_sats: number;
+  description: string;
+  status: string;
+  expires_at: number;
+  paid_txid: string | null;
+  created_at: number;
+};
+
+export type BchNftListingRow = {
+  listing_id: string;
+  doc_id: string;
+  token_category: string;
+  token_name: string;
+  price_sats: number;
+  seller_address: string;
+  status: string;
+  buyer_doc_id: string | null;
+  buy_txid: string | null;
+  created_at: number;
+};
+
 export class Repo {
   private db: Database.Database;
 
@@ -227,6 +287,11 @@ export class Repo {
       .run(params.docId, params.name ?? null, now, now);
   }
 
+  removeDoc(docId: string) {
+    this.db.prepare(`DELETE FROM docs WHERE doc_id=?`).run(docId);
+    this.db.prepare(`DELETE FROM commands WHERE doc_id=?`).run(docId);
+  }
+
   listDocs(): DocRow[] {
     return this.db.prepare(`SELECT * FROM docs ORDER BY updated_at DESC`).all() as DocRow[];
   }
@@ -240,11 +305,11 @@ export class Repo {
     this.db.prepare(`UPDATE docs SET last_user_hash=?, updated_at=? WHERE doc_id=?`).run(hash, now, docId);
   }
 
-  setDocAddresses(docId: string, params: { evmAddress: string; suiAddress: string }) {
+  setDocAddresses(docId: string, params: { evmAddress: string; secondaryAddress: string }) {
     const now = Date.now();
     this.db
       .prepare(`UPDATE docs SET evm_address=?, sui_address=?, updated_at=? WHERE doc_id=?`)
-      .run(params.evmAddress, params.suiAddress, now, docId);
+      .run(params.evmAddress, params.secondaryAddress, now, docId);
   }
 
   setDocPolicy(docId: string, params: { policySource: string; ensName?: string | null }) {
@@ -700,7 +765,7 @@ export class Repo {
       .run(status, extra?.resultText ?? null, extra?.errorText ?? null, now, cmdId);
   }
 
-  setCommandExecutionIds(cmdId: string, params: { yellowIntentId?: string; suiTxDigest?: string; arcTxHash?: string }) {
+  setCommandExecutionIds(cmdId: string, params: { legacyIntentId?: string; legacySecondaryTx?: string; txId?: string }) {
     const now = Date.now();
     this.db
       .prepare(
@@ -709,9 +774,9 @@ export class Repo {
           sui_tx_digest=COALESCE(?, sui_tx_digest),
           arc_tx_hash=COALESCE(?, arc_tx_hash),
           updated_at=?
-        WHERE cmd_id=?`
+         WHERE cmd_id=?`
       )
-      .run(params.yellowIntentId ?? null, params.suiTxDigest ?? null, params.arcTxHash ?? null, now, cmdId);
+      .run(params.legacyIntentId ?? null, params.legacySecondaryTx ?? null, params.txId ?? null, now, cmdId);
   }
 
   // --- Schedule CRUD ---
@@ -973,5 +1038,146 @@ export class Repo {
     this.db
       .prepare(`UPDATE conditional_orders SET status='CANCELLED', updated_at=? WHERE order_id=?`)
       .run(now, orderId);
+  }
+
+  // --- BCH CashTokens ---
+
+  insertBchToken(params: { docId: string; tokenCategory: string; ticker: string; name: string; supply: string; genesisTxid: string }) {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO bch_tokens(doc_id, token_category, ticker, name, supply, genesis_txid, created_at)
+         VALUES(?,?,?,?,?,?,?)
+         ON CONFLICT(doc_id, token_category) DO UPDATE SET
+           ticker=excluded.ticker,
+           name=excluded.name,
+           supply=excluded.supply,
+           genesis_txid=excluded.genesis_txid`
+      )
+      .run(params.docId, params.tokenCategory, params.ticker, params.name, params.supply, params.genesisTxid, now);
+  }
+
+  getBchTokens(docId: string): BchTokenRow[] {
+    return this.db.prepare(`SELECT * FROM bch_tokens WHERE doc_id=? ORDER BY created_at DESC`).all(docId) as BchTokenRow[];
+  }
+
+  getBchToken(docId: string, tokenCategory: string): BchTokenRow | undefined {
+    return this.db.prepare(`SELECT * FROM bch_tokens WHERE doc_id=? AND token_category=?`).get(docId, tokenCategory) as BchTokenRow | undefined;
+  }
+
+  // --- BCH Vaults ---
+
+  insertBchVault(params: { vaultId: string; docId: string; contractAddress: string; beneficiary: string; unlockTime: number; amountSats: number; redeemScript: string; fundTxid: string }) {
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO bch_vaults(vault_id, doc_id, contract_address, beneficiary, unlock_time, amount_sats, redeem_script, fund_txid, status, created_at)
+       VALUES(?,?,?,?,?,?,?,?,'LOCKED',?)`
+    ).run(params.vaultId, params.docId, params.contractAddress, params.beneficiary, params.unlockTime, params.amountSats, params.redeemScript, params.fundTxid, now);
+  }
+
+  getBchVault(vaultId: string): BchVaultRow | undefined {
+    return this.db.prepare(`SELECT * FROM bch_vaults WHERE vault_id=?`).get(vaultId) as BchVaultRow | undefined;
+  }
+
+  getBchVaultsByDoc(docId: string): BchVaultRow[] {
+    return this.db.prepare(`SELECT * FROM bch_vaults WHERE doc_id=? ORDER BY created_at DESC`).all(docId) as BchVaultRow[];
+  }
+
+  updateBchVaultStatus(vaultId: string, status: string, claimTxid?: string) {
+    this.db.prepare(`UPDATE bch_vaults SET status=?, claim_txid=? WHERE vault_id=?`).run(status, claimTxid ?? null, vaultId);
+  }
+
+  // --- BCH Multisig ---
+
+  insertBchMultisig(params: { walletId: string; docId: string; scriptAddress: string; redeemScript: string; threshold: number; pubkeys: string[] }) {
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO bch_multisig_wallets(wallet_id, doc_id, script_address, redeem_script, threshold, pubkeys_json, created_at)
+       VALUES(?,?,?,?,?,?,?)`
+    ).run(params.walletId, params.docId, params.scriptAddress, params.redeemScript, params.threshold, JSON.stringify(params.pubkeys), now);
+  }
+
+  getBchMultisig(walletId: string): BchMultisigWalletRow | undefined {
+    return this.db.prepare(`SELECT * FROM bch_multisig_wallets WHERE wallet_id=?`).get(walletId) as BchMultisigWalletRow | undefined;
+  }
+
+  getBchMultisigByDoc(docId: string): BchMultisigWalletRow[] {
+    return this.db.prepare(`SELECT * FROM bch_multisig_wallets WHERE doc_id=? ORDER BY created_at DESC`).all(docId) as BchMultisigWalletRow[];
+  }
+
+  // --- BCH Payment Requests ---
+
+  insertBchPaymentRequest(params: { requestId: string; docId: string; address: string; amountSats: number; description: string; expiresAt: number }) {
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO bch_payment_requests(request_id, doc_id, address, amount_sats, description, status, expires_at, created_at)
+       VALUES(?,?,?,?,?,'pending',?,?)`
+    ).run(params.requestId, params.docId, params.address, params.amountSats, params.description, params.expiresAt, now);
+  }
+
+  getBchPaymentRequest(requestId: string): BchPaymentRequestRow | undefined {
+    return this.db.prepare(`SELECT * FROM bch_payment_requests WHERE request_id=?`).get(requestId) as BchPaymentRequestRow | undefined;
+  }
+
+  getBchPaymentRequestsByDoc(docId: string): BchPaymentRequestRow[] {
+    return this.db.prepare(`SELECT * FROM bch_payment_requests WHERE doc_id=? ORDER BY created_at DESC`).all(docId) as BchPaymentRequestRow[];
+  }
+
+  updateBchPaymentRequestPaid(requestId: string, paidTxid: string) {
+    this.db.prepare(`UPDATE bch_payment_requests SET status='paid', paid_txid=? WHERE request_id=?`).run(paidTxid, requestId);
+  }
+
+  // --- BCH NFT Listings ---
+
+  insertBchNftListing(params: { listingId: string; docId: string; tokenCategory: string; tokenName: string; priceSats: number; sellerAddress: string }) {
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO bch_nft_listings(listing_id, doc_id, token_category, token_name, price_sats, seller_address, status, created_at)
+       VALUES(?,?,?,?,?,?,'active',?)`
+    ).run(params.listingId, params.docId, params.tokenCategory, params.tokenName, params.priceSats, params.sellerAddress, now);
+  }
+
+  getBchNftListing(listingId: string): BchNftListingRow | undefined {
+    return this.db.prepare(`SELECT * FROM bch_nft_listings WHERE listing_id=?`).get(listingId) as BchNftListingRow | undefined;
+  }
+
+  getActiveBchNftListings(): BchNftListingRow[] {
+    return this.db.prepare(`SELECT * FROM bch_nft_listings WHERE status='active' ORDER BY created_at DESC`).all() as BchNftListingRow[];
+  }
+
+  updateBchNftListingSold(listingId: string, buyerDocId: string, buyTxid: string) {
+    this.db.prepare(`UPDATE bch_nft_listings SET status='sold', buyer_doc_id=?, buy_txid=? WHERE listing_id=?`).run(buyerDocId, buyTxid, listingId);
+  }
+
+  // ── Stats / Count Methods ──────────────────────────────────────────────────
+
+  countPendingCommands(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM commands WHERE status='PENDING'`).get() as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
+  }
+
+  countActiveSchedules(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE active=1`).get() as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
+  }
+
+  countBchVaults(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM bch_vaults`).get() as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
+  }
+
+  countBchMultisigWallets(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM bch_multisig_wallets`).get() as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
+  }
+
+  countBchPaymentRequests(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM bch_payment_requests`).get() as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
+  }
+
+  countActiveBchNftListings(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM bch_nft_listings WHERE status='active'`).get() as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
   }
 }
