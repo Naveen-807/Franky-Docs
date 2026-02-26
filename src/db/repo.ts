@@ -1157,7 +1157,7 @@ export class Repo {
   }
 
   countActiveSchedules(): number {
-    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE active=1`).get() as { cnt: number } | undefined;
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE status='ACTIVE'`).get() as { cnt: number } | undefined;
     return row?.cnt ?? 0;
   }
 
