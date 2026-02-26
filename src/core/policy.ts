@@ -7,9 +7,9 @@ export const EnsPolicySchema = z
     denyCommands: z.array(z.string()).optional(),
     schedulingAllowed: z.boolean().optional(),
     maxScheduleIntervalHours: z.number().positive().optional(),
-    maxSingleTxSats: z.number().positive().optional(),
-    dailyLimitSats: z.number().positive().optional(),
-    allowedBchNetworks: z.array(z.enum(["mainnet", "testnet"])).optional()
+    maxSingleTxMicroStx: z.number().positive().optional(),
+    dailyLimitMicroStx: z.number().positive().optional(),
+    allowedStxNetworks: z.array(z.enum(["mainnet", "testnet"])).optional()
   })
   .strict();
 
@@ -20,7 +20,7 @@ export type PolicyDecision = { ok: true; autoApprove?: boolean } | { ok: false; 
 export function evaluatePolicy(
   policy: EnsPolicy,
   cmd: ParsedCommand,
-  context?: { dailySpendSats?: number }
+  context?: { dailySpendMicroStx?: number }
 ): PolicyDecision {
   const deny = new Set((policy.denyCommands ?? []).map((s) => s.toUpperCase()));
   if (deny.has(cmd.type.toUpperCase())) return { ok: false, reason: `Blocked by policy (denyCommands: ${cmd.type})` };
@@ -36,15 +36,16 @@ export function evaluatePolicy(
     }
   }
 
-  if (cmd.type === "BCH_SEND") {
-    if (policy.maxSingleTxSats !== undefined && cmd.amountSats > policy.maxSingleTxSats) {
-      return { ok: false, reason: `Blocked by policy (maxSingleTxSats=${policy.maxSingleTxSats})` };
+  if (cmd.type === "STX_SEND") {
+    const amount = Number(cmd.amountMicroStx);
+    if (policy.maxSingleTxMicroStx !== undefined && amount > policy.maxSingleTxMicroStx) {
+      return { ok: false, reason: `Blocked by policy (maxSingleTxMicroStx=${policy.maxSingleTxMicroStx})` };
     }
-    if (policy.dailyLimitSats !== undefined && context?.dailySpendSats !== undefined) {
-      if (context.dailySpendSats + cmd.amountSats > policy.dailyLimitSats) {
+    if (policy.dailyLimitMicroStx !== undefined && context?.dailySpendMicroStx !== undefined) {
+      if (context.dailySpendMicroStx + amount > policy.dailyLimitMicroStx) {
         return {
           ok: false,
-          reason: `Blocked by policy (dailyLimitSats=${policy.dailyLimitSats}, spent=${context.dailySpendSats})`
+          reason: `Blocked by policy (dailyLimitMicroStx=${policy.dailyLimitMicroStx}, spent=${context.dailySpendMicroStx})`
         };
       }
     }

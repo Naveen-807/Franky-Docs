@@ -20,12 +20,12 @@ import {
 } from "./google/docwallet.js";
 import { createAndStoreDocSecrets, loadDocSecrets } from "./wallet/store.js";
 import type { AppConfig } from "./config.js";
-import type { BchClient } from "./integrations/bch.js";
+import type { StacksClient } from "./integrations/stacks.js";
+import type { SbtcClient } from "./integrations/sbtc.js";
+import type { UsdcxClient } from "./integrations/usdcx.js";
+import type { X402Client } from "./integrations/x402.js";
 import type { HederaClient } from "./integrations/hedera.js";
-import type { BchNftClient } from "./integrations/bch-nft.js";
-import type { BchMultisigClient } from "./integrations/bch-multisig.js";
-import type { CashScriptClient } from "./integrations/cashscript.js";
-import type { BchPaymentsClient } from "./integrations/bch-payments.js";
+import { cvToJSON, stringAsciiCV, uintCV, principalCV } from "@stacks/transactions";
 
 type ExecutionContext = {
   config: AppConfig;
@@ -33,11 +33,10 @@ type ExecutionContext = {
   drive: drive_v3.Drive;
   repo: Repo;
   hedera?: HederaClient;
-  bch?: BchClient;
-  bchNft?: BchNftClient;
-  bchMultisig?: BchMultisigClient;
-  cashScript?: CashScriptClient;
-  bchPayments?: BchPaymentsClient;
+  stacks?: StacksClient;
+  sbtc?: SbtcClient;
+  usdcx?: UsdcxClient;
+  x402?: X402Client;
 };
 
 export class Engine {
@@ -53,7 +52,6 @@ export class Engine {
 
   constructor(private ctx: ExecutionContext) {}
 
-  /** Track consecutive poll failures per doc for auto-cleanup */
   private pollFailures = new Map<string, number>();
 
   async discoveryTick() {
@@ -74,26 +72,24 @@ export class Engine {
 
       console.log(`[discovery] Drive returned ${files.length} doc(s)${namePrefix ? ` (prefix: "${namePrefix}")` : " (all docs)"}`);
 
-      // Prune stale DB entries — docs Drive no longer returns
       const driveIds = new Set(files.map((f) => f.id));
       const tracked = repo.listDocs();
       let pruned = 0;
       for (const d of tracked) {
         if (!driveIds.has(d.doc_id)) {
-          console.log(`[discovery] removing stale doc ${d.doc_id.slice(0, 8)}… ("${d.name}") — no longer accessible via Drive`);
+          console.log(`[discovery] removing stale doc ${d.doc_id.slice(0, 8)}…`);
           try { repo.removeDoc(d.doc_id); } catch { /* ignore */ }
           pruned++;
         }
       }
-      if (pruned > 0) console.log(`[discovery] pruned ${pruned} stale doc(s) from DB`);
+      if (pruned > 0) console.log(`[discovery] pruned ${pruned} stale doc(s)`);
 
-      // Ensure template on each accessible doc
       for (const f of files) {
         try {
           repo.upsertDoc({ docId: f.id, name: f.name });
           await loadDocWalletTables({ docs, docId: f.id });
           console.log(`[discovery] ✅ ${f.id.slice(0, 8)}… "${f.name}" — template OK`);
-          this.pollFailures.delete(f.id); // reset failures on success
+          this.pollFailures.delete(f.id);
         } catch (err) {
           console.error(`[discovery] ❌ ${f.id.slice(0, 8)}… "${f.name}" — ${(err as Error).message}`);
           try { repo.removeDoc(f.id); } catch { /* ignore */ }
@@ -103,7 +99,6 @@ export class Engine {
       if (files.length === 0) {
         console.warn(
           `[discovery] no docs found! Make sure your Google Docs are shared with the service account as Editor.\n` +
-          `  Prefix filter: ${namePrefix ? `"${namePrefix}" (set DOCWALLET_DISCOVER_ALL=1 to disable)` : "none (discovering all docs)"}\n` +
           `  Tip: Share your doc → Add people → paste the service account email → choose "Editor" role`
         );
       }
@@ -127,16 +122,15 @@ export class Engine {
         try {
           tables = await loadDocWalletTables({ docs, docId });
           configMap = readConfig(tables.config.table);
-          this.pollFailures.delete(docId); // reset on success
+          this.pollFailures.delete(docId);
         } catch (err) {
           const fails = (this.pollFailures.get(docId) ?? 0) + 1;
           this.pollFailures.set(docId, fails);
           if (fails <= 2) {
             console.error(`[poll] ${docId.slice(0, 8)}… ${(err as Error).message}`);
           } else if (fails === 3) {
-            console.error(`[poll] ${docId.slice(0, 8)}… failed ${fails}x — suppressing future logs (will retry on next discovery)`);
+            console.error(`[poll] ${docId.slice(0, 8)}… failed ${fails}x — suppressing future logs`);
           }
-          // After 10 consecutive failures, auto-remove from DB
           if (fails >= 10) {
             console.warn(`[poll] removing ${docId.slice(0, 8)}… after ${fails} consecutive failures`);
             try { repo.removeDoc(docId); } catch { /* ignore */ }
@@ -208,8 +202,9 @@ export class Engine {
             }
 
             const AUTO_APPROVE = new Set([
-              "SETUP", "STATUS", "BCH_PRICE", "BCH_TOKEN_BALANCE", "TREASURY", "PRICE", "TRADE_HISTORY",
-              "NFT_BALANCE", "BCH_MULTISIG_BALANCE", "CASH_VAULT_STATUS", "PAYMENT_CHECK", "PAYMENT_QR"
+              "SETUP", "STATUS", "STX_PRICE", "STX_BALANCE", "STX_HISTORY", "TREASURY",
+              "SBTC_BALANCE", "SBTC_INFO", "USDCX_BALANCE", "X402_STATUS",
+              "CONTRACT_READ", "STACK_STATUS"
             ]);
             const demoMode = config.DEMO_MODE || configMap["DEMO_MODE"]?.value?.trim() === "1";
             const initialStatus = AUTO_APPROVE.has(parsed.value.type) || demoMode ? "APPROVED" : "PENDING_APPROVAL";
@@ -221,7 +216,7 @@ export class Engine {
               cmd_id: cmdId,
               doc_id: docId,
               raw_command: row.command,
-              parsed_json: JSON.stringify(parsed.value),
+              parsed_json: JSON.stringify(parsed.value, (_k, v) => typeof v === "bigint" ? v.toString() : v),
               status: initialStatus,
               yellow_intent_id: null,
               sui_tx_digest: null,
@@ -275,7 +270,7 @@ export class Engine {
               cmd_id: existing.cmd_id,
               doc_id: existing.doc_id,
               raw_command: row.command,
-              parsed_json: JSON.stringify(parsed.value),
+              parsed_json: JSON.stringify(parsed.value, (_k, v) => typeof v === "bigint" ? v.toString() : v),
               status: "PENDING_APPROVAL",
               yellow_intent_id: existing.yellow_intent_id,
               sui_tx_digest: existing.sui_tx_digest,
@@ -318,14 +313,18 @@ export class Engine {
             repo.setCommandStatus(cmd.cmd_id, "FAILED", { errorText: "Missing parsed command" });
             continue;
           }
+          // Restore BigInt values from JSON strings
+          if ("amountMicroStx" in parsed) (parsed as any).amountMicroStx = BigInt((parsed as any).amountMicroStx);
+          if ("amountSats" in parsed) (parsed as any).amountSats = BigInt((parsed as any).amountSats);
+          if ("amount" in parsed && typeof (parsed as any).amount === "string" && parsed.type.startsWith("USDCX")) {
+            (parsed as any).amount = BigInt((parsed as any).amount);
+          }
           try {
             repo.setCommandStatus(cmd.cmd_id, "EXECUTING");
             await this.updateDocRow(cmd.doc_id, cmd.cmd_id, { status: "EXECUTING", error: "" });
 
             const result = await this.execute(cmd.doc_id, cmd.cmd_id, parsed);
-            repo.setCommandExecutionIds(cmd.cmd_id, {
-              txId: result.txId
-            });
+            repo.setCommandExecutionIds(cmd.cmd_id, { txId: result.txId });
             repo.setCommandStatus(cmd.cmd_id, "EXECUTED", { resultText: result.resultText, errorText: null });
 
             await this.updateDocRow(cmd.doc_id, cmd.cmd_id, { status: "EXECUTED", result: result.resultText, error: "" });
@@ -373,7 +372,7 @@ export class Engine {
               docId,
               chatTable: tables.chat.table,
               rowIndex: row.rowIndex,
-              agent: "Use BCH commands like: DW BCH_PRICE, DW BCH_SEND <cashaddr> <sats>, DW BCH_TOKEN_BALANCE"
+              agent: "Use Stacks commands: DW STX_PRICE, DW STX_SEND <addr> <microSTX>, DW SBTC_BALANCE, DW USDCX_BALANCE"
             });
             continue;
           }
@@ -384,7 +383,7 @@ export class Engine {
               docId,
               chatTable: tables.chat.table,
               rowIndex: row.rowIndex,
-              agent: "That command is not supported in BCH-only mode."
+              agent: "That command is not supported."
             });
             continue;
           }
@@ -395,7 +394,7 @@ export class Engine {
               cmd_id: cmdId,
               doc_id: docId,
               raw_command: dw,
-              parsed_json: JSON.stringify(detected.value),
+              parsed_json: JSON.stringify(detected.value, (_k, v) => typeof v === "bigint" ? v.toString() : v),
               status: "PENDING_APPROVAL",
               yellow_intent_id: null,
               sui_tx_digest: null,
@@ -442,7 +441,7 @@ export class Engine {
     if (this.balancesRunning) return;
     this.balancesRunning = true;
     try {
-      const { docs, repo, config, bch } = this.ctx;
+      const { docs, repo, config, stacks, sbtc, usdcx } = this.ctx;
       const tracked = repo.listDocs();
       for (const d of tracked) {
         const docId = d.doc_id;
@@ -450,28 +449,37 @@ export class Engine {
         if (!secrets) continue;
 
         const entries: Array<{ location: string; asset: string; balance: string }> = [];
-        if (bch && secrets.bch) {
-          try {
-            const bal = await bch.getBalance(secrets.bch.cashAddress);
-            const bchPrice = repo.getPrice("BCH/USD")?.mid_price ?? 0;
-            const usd = bchPrice > 0 ? ` ($${(Number(bal.bchFormatted) * bchPrice).toFixed(2)})` : "";
-            entries.push({ location: "Bitcoin Cash", asset: "BCH", balance: `${bal.bchFormatted}${usd}` });
 
-            if (config.BCH_CASHTOKENS_ENABLED) {
-              const tokenUtxos = await bch.getTokenUtxos(secrets.bch.cashAddress);
-              const grouped = new Map<string, bigint>();
-              for (const u of tokenUtxos) {
-                grouped.set(u.tokenCategory, (grouped.get(u.tokenCategory) ?? 0n) + u.tokenAmount);
-              }
-              for (const [category, amount] of grouped) {
-                const dbToken = repo.getBchTokens(docId).find((t) => t.token_category === category);
-                const label = dbToken ? dbToken.ticker : `${category.slice(0, 12)}…`;
-                entries.push({ location: "Bitcoin Cash", asset: `${label} (CashToken)`, balance: amount.toString() });
-              }
-            }
+        // STX balance
+        if (stacks && secrets.stx) {
+          try {
+            const bal = await stacks.getBalance(secrets.stx.stxAddress);
+            const stxPrice = repo.getPrice("STX/USD")?.mid_price ?? 0;
+            const usd = stxPrice > 0 ? ` ($${(Number(bal.stx) / 1_000_000 * stxPrice).toFixed(2)})` : "";
+            entries.push({ location: "Stacks", asset: "STX", balance: `${bal.stxFormatted}${usd}` });
           } catch {
-            entries.push({ location: "Bitcoin Cash", asset: "BCH", balance: "Unavailable" });
+            entries.push({ location: "Stacks", asset: "STX", balance: "Unavailable" });
           }
+        }
+
+        // sBTC balance
+        if (sbtc && secrets.stx) {
+          try {
+            const bal = await sbtc.getBalance(secrets.stx.stxAddress);
+            if (bal.balanceSats > 0n) {
+              entries.push({ location: "Stacks (sBTC)", asset: "sBTC", balance: `${bal.balanceBtc} BTC` });
+            }
+          } catch { /* ignore */ }
+        }
+
+        // USDCx balance
+        if (usdcx && secrets.stx) {
+          try {
+            const bal = await usdcx.getBalance(secrets.stx.stxAddress);
+            if (bal.balanceRaw > 0n) {
+              entries.push({ location: "Stacks (USDCx)", asset: "USDCx", balance: `$${bal.balanceFormatted}` });
+            }
+          } catch { /* ignore */ }
         }
 
         const tables = await loadDocWalletTables({ docs, docId });
@@ -502,7 +510,7 @@ export class Engine {
           cmd_id: cmdId,
           doc_id: s.doc_id,
           raw_command: s.inner_command,
-          parsed_json: JSON.stringify(parsed.value),
+          parsed_json: JSON.stringify(parsed.value, (_k, v) => typeof v === "bigint" ? v.toString() : v),
           status: "APPROVED",
           yellow_intent_id: null,
           sui_tx_digest: null,
@@ -531,44 +539,38 @@ export class Engine {
     if (this.priceTickRunning) return;
     this.priceTickRunning = true;
     try {
-      const { repo, bch, config } = this.ctx;
-      if (!bch) return;
+      const { repo, stacks, config } = this.ctx;
+      if (!stacks) return;
 
-      try {
-        const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin-cash&vs_currencies=usd", {
-          signal: AbortSignal.timeout(8000)
-        });
-        if (res.ok) {
-          const data = await res.json() as Record<string, Record<string, number>>;
-          const price = data?.["bitcoin-cash"]?.usd;
-          if (price && price > 0) repo.upsertPrice("BCH/USD", price, price * 0.999, price * 1.001, "coingecko");
-        }
-      } catch {
-        // ignore
+      // Fetch STX price
+      const price = await stacks.getStxPrice();
+      if (price && price > 0) {
+        repo.upsertPrice("STX/USD", price, price * 0.999, price * 1.001, "coingecko");
       }
 
-      const bchMid = repo.getPrice("BCH/USD")?.mid_price ?? 0;
-      if (bchMid <= 0) return;
+      const stxMid = repo.getPrice("STX/USD")?.mid_price ?? 0;
+      if (stxMid <= 0) return;
 
-      const activeOrders = repo.listActiveConditionalOrders().filter((o) => o.base.toUpperCase() === "BCH");
+      // Check conditional orders
+      const activeOrders = repo.listActiveConditionalOrders().filter((o) => o.base.toUpperCase() === "STX");
       for (const order of activeOrders) {
         const shouldTrigger =
-          (order.type === "STOP_LOSS" && bchMid <= order.trigger_price) ||
-          (order.type === "TAKE_PROFIT" && bchMid >= order.trigger_price);
+          (order.type === "STOP_LOSS" && stxMid <= order.trigger_price) ||
+          (order.type === "TAKE_PROFIT" && stxMid >= order.trigger_price);
         if (!shouldTrigger) continue;
 
         const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId: order.doc_id });
-        if (!secrets?.bch) continue;
+        if (!secrets?.stx) continue;
 
         const cmdId = generateCmdId(order.doc_id, `${order.type}:${order.order_id}`);
-        const amountSats = Math.round(order.qty * 1e8);
-        const rawCommand = `DW BCH_SEND ${secrets.bch.cashAddress} ${amountSats}`;
+        const amountMicroStx = Math.round(order.qty * 1_000_000);
+        const rawCommand = `DW STX_SEND ${secrets.stx.stxAddress} ${amountMicroStx}`;
 
         repo.upsertCommand({
           cmd_id: cmdId,
           doc_id: order.doc_id,
           raw_command: rawCommand,
-          parsed_json: JSON.stringify({ type: "BCH_SEND", to: secrets.bch.cashAddress, amountSats }),
+          parsed_json: JSON.stringify({ type: "STX_SEND", to: secrets.stx.stxAddress, amountMicroStx: String(amountMicroStx) }),
           status: "APPROVED",
           yellow_intent_id: null,
           sui_tx_digest: null,
@@ -588,9 +590,7 @@ export class Engine {
             result: "",
             error: ""
           });
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       }
     } catch (err) {
       console.error("priceTick error:", err);
@@ -603,7 +603,7 @@ export class Engine {
     if (this.agentDecisionRunning) return;
     this.agentDecisionRunning = true;
     try {
-      // BCH-only mode: keep this as a no-op tick.
+      // Stacks mode: no-op for now
     } finally {
       this.agentDecisionRunning = false;
     }
@@ -613,17 +613,23 @@ export class Engine {
     if (this.payoutRulesRunning) return;
     this.payoutRulesRunning = true;
     try {
-      // BCH-only mode: payout rules are intentionally disabled here.
+      // Stacks mode: payout rules disabled
     } finally {
       this.payoutRulesRunning = false;
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════════════
+  // Command Execution
+  // ══════════════════════════════════════════════════════════════════════════════
+
   private async execute(docId: string, _cmdId: string, command: ParsedCommand): Promise<{
     resultText: string;
     txId?: string;
   }> {
-    const { repo, config, bch, bchNft, bchMultisig, cashScript, bchPayments } = this.ctx;
+    const { repo, config, stacks, sbtc, usdcx, x402 } = this.ctx;
+
+    // ── Core Commands ──
 
     if (command.type === "SETUP") {
       const existing = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
@@ -631,9 +637,9 @@ export class Engine {
         repo,
         masterKey: config.DOCWALLET_MASTER_KEY,
         docId,
-        bchNetwork: config.BCH_NETWORK
+        stxNetwork: config.STX_NETWORK
       });
-      repo.setDocAddresses(docId, { evmAddress: secrets.evm.address, secondaryAddress: "" });
+      repo.setDocAddresses(docId, { evmAddress: secrets.evm.address, secondaryAddress: secrets.stx?.stxAddress ?? "" });
 
       const tables = await loadDocWalletTables({ docs: this.ctx.docs, docId });
       await writeConfigBatch({
@@ -642,69 +648,60 @@ export class Engine {
         configTable: tables.config.table,
         entries: [
           { key: "EVM_ADDRESS", value: secrets.evm.address },
+          { key: "STX_ADDRESS", value: secrets.stx?.stxAddress ?? "" },
+          { key: "STX_NETWORK", value: config.STX_NETWORK },
           { key: "STATUS", value: "READY" },
-          { key: "BCH_ADDRESS", value: secrets.bch?.cashAddress ?? "" },
-          { key: "BCH_NETWORK", value: config.BCH_NETWORK }
         ]
       });
-      return { resultText: `EVM=${secrets.evm.address}${secrets.bch ? ` BCH=${secrets.bch.cashAddress}` : ""}` };
+      return { resultText: `EVM=${secrets.evm.address} STX=${secrets.stx?.stxAddress ?? "(none)"}` };
     }
 
     if (command.type === "STATUS") {
       const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
       if (!secrets) return { resultText: "STATUS=NO_WALLET (run DW SETUP)" };
       return {
-        resultText: `MODE=BCH_ONLY EVM=${secrets.evm.address}${secrets.bch ? ` BCH=${secrets.bch.cashAddress}` : ""}`
+        resultText: `MODE=STACKS EVM=${secrets.evm.address} STX=${secrets.stx?.stxAddress ?? "(none)"} NETWORK=${config.STX_NETWORK}`
       };
     }
 
-    if (command.type === "BCH_PRICE") {
-      try {
-        const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin-cash&vs_currencies=usd", {
-          signal: AbortSignal.timeout(8000)
-        });
-        if (res.ok) {
-          const data = await res.json() as Record<string, Record<string, number>>;
-          const price = data?.["bitcoin-cash"]?.usd;
-          if (price && price > 0) {
-            repo.upsertPrice("BCH/USD", price, price * 0.999, price * 1.001, "coingecko");
-            return { resultText: `BCH/USD PRICE=$${price.toFixed(2)} (via CoinGecko)` };
-          }
-        }
-      } catch {
-        // ignore
+    if (command.type === "STX_PRICE") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      const price = await stacks.getStxPrice();
+      if (price && price > 0) {
+        repo.upsertPrice("STX/USD", price, price * 0.999, price * 1.001, "coingecko");
+        return { resultText: `STX/USD PRICE=$${price.toFixed(4)} (via CoinGecko)` };
       }
-      const cached = repo.getPrice("BCH/USD");
-      if (cached?.mid_price) return { resultText: `BCH/USD PRICE=$${cached.mid_price.toFixed(2)} (cached)` };
-      return { resultText: "BCH/USD PRICE=UNAVAILABLE" };
+      const cached = repo.getPrice("STX/USD");
+      if (cached?.mid_price) return { resultText: `STX/USD PRICE=$${cached.mid_price.toFixed(4)} (cached)` };
+      return { resultText: "STX/USD PRICE=UNAVAILABLE" };
     }
 
-    if (command.type === "BCH_STOP_LOSS") {
-      const orderId = `bch_sl_${Date.now()}_${sha256Hex(`${docId}:${command.qty}:${command.triggerPrice}`).slice(0, 8)}`;
+    if (command.type === "STX_STOP_LOSS") {
+      const orderId = `stx_sl_${Date.now()}_${sha256Hex(`${docId}:${command.qty}:${command.triggerPrice}`).slice(0, 8)}`;
       repo.insertConditionalOrder({
         orderId,
         docId,
         type: "STOP_LOSS",
-        base: "BCH",
+        base: "STX",
         quote: "USD",
         triggerPrice: command.triggerPrice,
         qty: command.qty
       });
-      return { resultText: `BCH_STOP_LOSS=${orderId} SELL ${command.qty} BCH WHEN ≤ $${command.triggerPrice}` };
+      return { resultText: `STX_STOP_LOSS=${orderId} SELL ${command.qty} STX WHEN ≤ $${command.triggerPrice}` };
     }
 
-    if (command.type === "BCH_TAKE_PROFIT") {
-      const orderId = `bch_tp_${Date.now()}_${sha256Hex(`${docId}:${command.qty}:${command.triggerPrice}`).slice(0, 8)}`;
+    if (command.type === "STX_TAKE_PROFIT") {
+      const orderId = `stx_tp_${Date.now()}_${sha256Hex(`${docId}:${command.qty}:${command.triggerPrice}`).slice(0, 8)}`;
       repo.insertConditionalOrder({
         orderId,
         docId,
         type: "TAKE_PROFIT",
-        base: "BCH",
+        base: "STX",
         quote: "USD",
         triggerPrice: command.triggerPrice,
         qty: command.qty
       });
-      return { resultText: `BCH_TAKE_PROFIT=${orderId} SELL ${command.qty} BCH WHEN ≥ $${command.triggerPrice}` };
+      return { resultText: `STX_TAKE_PROFIT=${orderId} SELL ${command.qty} STX WHEN ≥ $${command.triggerPrice}` };
     }
 
     if (command.type === "CANCEL_ORDER") {
@@ -724,109 +721,229 @@ export class Engine {
 
     if (command.type === "TREASURY") {
       const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
-      if (!secrets?.bch || !bch) return { resultText: "TREASURY: BCH wallet not initialized" };
+      if (!secrets?.stx || !stacks) return { resultText: "TREASURY: Stacks wallet not initialized" };
 
-      const b = await bch.getBalance(secrets.bch.cashAddress);
-      const p = repo.getPrice("BCH/USD")?.mid_price ?? 0;
-      const usd = p > 0 ? Number(b.bchFormatted) * p : 0;
-      const lines = [`BCH=${b.bchFormatted}`, p > 0 ? `BCH/USD=$${p.toFixed(2)}` : "BCH/USD=unknown", `USD=$${usd.toFixed(2)}`];
-      if (config.BCH_CASHTOKENS_ENABLED) {
-        const tokenUtxos = await bch.getTokenUtxos(secrets.bch.cashAddress);
-        const grouped = new Map<string, bigint>();
-        for (const u of tokenUtxos) grouped.set(u.tokenCategory, (grouped.get(u.tokenCategory) ?? 0n) + u.tokenAmount);
-        for (const [cat, amount] of grouped) {
-          const token = repo.getBchTokens(docId).find((t) => t.token_category === cat);
-          lines.push(`${token?.ticker ?? cat.slice(0, 10)}=${amount.toString()}`);
-        }
+      const bal = await stacks.getBalance(secrets.stx.stxAddress);
+      const stxPrice = repo.getPrice("STX/USD")?.mid_price ?? 0;
+      const stxUsd = stxPrice > 0 ? Number(bal.stx) / 1_000_000 * stxPrice : 0;
+      const lines: string[] = [`STX=${bal.stxFormatted}`, stxPrice > 0 ? `STX/USD=$${stxPrice.toFixed(4)}` : "STX/USD=unknown", `USD=$${stxUsd.toFixed(2)}`];
+
+      if (sbtc) {
+        try {
+          const sbtcBal = await sbtc.getBalance(secrets.stx.stxAddress);
+          if (sbtcBal.balanceSats > 0n) lines.push(`sBTC=${sbtcBal.balanceBtc}`);
+        } catch { /* ignore */ }
       }
+
+      if (usdcx) {
+        try {
+          const usdcxBal = await usdcx.getBalance(secrets.stx.stxAddress);
+          if (usdcxBal.balanceRaw > 0n) lines.push(`USDCx=$${usdcxBal.balanceFormatted}`);
+        } catch { /* ignore */ }
+      }
+
       return { resultText: `TREASURY | ${lines.join(" | ")}` };
     }
+
+    // ── Secrets required from here ──
 
     const secrets = loadDocSecrets({ repo, masterKey: config.DOCWALLET_MASTER_KEY, docId });
     if (!secrets) return { resultText: `No wallet found. Type "DW SETUP" first.` };
 
-    if (command.type === "BCH_SEND") {
-      if (!bch) throw new Error("BCH integration disabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const out = await bch.sendBch({
-        privateKeyHex: secrets.bch.privateKeyHex,
-        fromAddress: secrets.bch.cashAddress,
+    // ── STX Commands ──
+
+    if (command.type === "STX_SEND") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const out = await stacks.sendStx({
+        privateKeyHex: secrets.stx.privateKeyHex,
         to: command.to,
-        amountSats: command.amountSats
+        amountMicroStx: command.amountMicroStx,
       });
-      return { resultText: `BCH_Tx=${out.txid} (${command.amountSats} sats → ${command.to})`, txId: out.txid as any };
+      const stxAmount = (Number(command.amountMicroStx) / 1_000_000).toFixed(6);
+      return { resultText: `STX_SEND txid=${out.txid} (${stxAmount} STX → ${command.to})`, txId: out.txid };
     }
 
-    if (command.type === "BCH_TOKEN_ISSUE") {
-      if (!bch) throw new Error("BCH integration disabled");
-      if (!config.BCH_CASHTOKENS_ENABLED) throw new Error("CashTokens disabled (set BCH_CASHTOKENS_ENABLED=1)");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const out = await bch.issueToken({
-        privateKeyHex: secrets.bch.privateKeyHex,
-        fromAddress: secrets.bch.cashAddress,
-        supply: BigInt(command.supply),
-        recipientAddress: secrets.bch.cashAddress
+    if (command.type === "STX_BALANCE") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const bal = await stacks.getBalance(secrets.stx.stxAddress);
+      const lockedStx = (Number(bal.locked) / 1_000_000).toFixed(6);
+      return { resultText: `STX Balance: ${bal.stxFormatted} STX (locked: ${lockedStx} STX) | Address: ${secrets.stx.stxAddress}` };
+    }
+
+    if (command.type === "STX_HISTORY") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const txs = await stacks.getTransactionHistory(secrets.stx.stxAddress, command.limit);
+      if (txs.length === 0) return { resultText: "STX_HISTORY: No transactions found" };
+      const lines = txs.map((tx) => {
+        const stxAmount = tx.amount !== "0" ? ` ${(Number(tx.amount) / 1_000_000).toFixed(6)} STX` : "";
+        return `  ${tx.txid.slice(0, 16)}… ${tx.type} ${tx.status}${stxAmount}`;
       });
-      repo.insertBchToken({
+      return { resultText: `Recent Transactions (${txs.length}):\n${lines.join("\n")}` };
+    }
+
+    // ── sBTC Commands ──
+
+    if (command.type === "SBTC_BALANCE") {
+      if (!sbtc) throw new Error("sBTC integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const bal = await sbtc.getBalance(secrets.stx.stxAddress);
+      return { resultText: `sBTC Balance: ${bal.balanceBtc} BTC (${bal.balanceSats.toString()} sats) | Address: ${secrets.stx.stxAddress}` };
+    }
+
+    if (command.type === "SBTC_SEND") {
+      if (!sbtc) throw new Error("sBTC integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const out = await sbtc.transfer({
+        privateKeyHex: secrets.stx.privateKeyHex,
+        to: command.to,
+        amountSats: command.amountSats,
+      });
+      const btcAmount = (Number(command.amountSats) / 1e8).toFixed(8);
+      return { resultText: `SBTC_SEND txid=${out.txid} (${btcAmount} sBTC → ${command.to})`, txId: out.txid };
+    }
+
+    if (command.type === "SBTC_INFO") {
+      if (!sbtc) throw new Error("sBTC integration disabled");
+      const info = sbtc.getContractInfo();
+      const supply = await sbtc.getTotalSupply();
+      const supplyBtc = (Number(supply) / 1e8).toFixed(8);
+      return { resultText: `sBTC Info | Contract: ${info.address}.${info.name} | Network: ${info.network} | Total Supply: ${supplyBtc} BTC` };
+    }
+
+    // ── USDCx Commands ──
+
+    if (command.type === "USDCX_BALANCE") {
+      if (!usdcx) throw new Error("USDCx integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const bal = await usdcx.getBalance(secrets.stx.stxAddress);
+      return { resultText: `USDCx Balance: $${bal.balanceFormatted} (${bal.balanceRaw.toString()} raw) | Address: ${secrets.stx.stxAddress}` };
+    }
+
+    if (command.type === "USDCX_SEND") {
+      if (!usdcx) throw new Error("USDCx integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const out = await usdcx.transfer({
+        privateKeyHex: secrets.stx.privateKeyHex,
+        to: command.to,
+        amount: command.amount,
+      });
+      const usdcAmount = (Number(command.amount) / 1_000_000).toFixed(2);
+      return { resultText: `USDCX_SEND txid=${out.txid} ($${usdcAmount} USDCx → ${command.to})`, txId: out.txid };
+    }
+
+    if (command.type === "USDCX_APPROVE") {
+      if (!usdcx) throw new Error("USDCx integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const out = await usdcx.approve({
+        privateKeyHex: secrets.stx.privateKeyHex,
+        spender: command.spender,
+        amount: command.amount,
+      });
+      const usdcAmount = (Number(command.amount) / 1_000_000).toFixed(2);
+      return { resultText: `USDCX_APPROVE txid=${out.txid} (approved $${usdcAmount} for ${command.spender})`, txId: out.txid };
+    }
+
+    if (command.type === "USDCX_PAYMENT") {
+      if (!usdcx) throw new Error("USDCx integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const rawAmount = Math.round(command.amount * 1_000_000);
+      const requestId = `pay_${Date.now()}_${sha256Hex(`${docId}:${command.amount}:${command.description}`).slice(0, 8)}`;
+      const uri = usdcx.createPaymentUri({
+        toAddress: secrets.stx.stxAddress,
+        amount: command.amount,
+        memo: command.description,
+      });
+      repo.insertStacksPaymentRequest({
+        requestId,
         docId,
-        tokenCategory: out.tokenCategory,
-        ticker: command.ticker,
-        name: command.name,
-        supply: command.supply,
-        genesisTxid: out.txid
+        address: secrets.stx.stxAddress,
+        amountRaw: rawAmount,
+        token: "USDCx",
+        description: command.description,
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000,
       });
+      return { resultText: `USDCX_PAYMENT requestId=${requestId} amount=$${command.amount} USDCx\nAddress: ${secrets.stx.stxAddress}\nURI: ${uri}` };
+    }
+
+    // ── x402 Commands ──
+
+    if (command.type === "X402_CALL") {
+      if (!x402) throw new Error("x402 integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const receipt = await x402.callPaidResource({
+        url: command.url,
+        method: command.method,
+        privateKeyHex: secrets.stx.privateKeyHex,
+      });
+      const responsePreview = typeof receipt.responseData === "string"
+        ? receipt.responseData.slice(0, 200)
+        : JSON.stringify(receipt.responseData).slice(0, 200);
       return {
-        resultText: `TOKEN_ISSUED=${command.ticker} SUPPLY=${command.supply} CATEGORY=${out.tokenCategory.slice(0, 16)}… TX=${out.txid}`,
-        txId: out.txid as any
+        resultText: `X402_CALL txid=${receipt.txid} paid=${receipt.amount} ${receipt.token} challengeId=${receipt.challengeId}\nResponse: ${responsePreview}`,
+        txId: receipt.txid || undefined
       };
     }
 
-    if (command.type === "BCH_TOKEN_SEND") {
-      if (!bch) throw new Error("BCH integration disabled");
-      if (!config.BCH_CASHTOKENS_ENABLED) throw new Error("CashTokens disabled (set BCH_CASHTOKENS_ENABLED=1)");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
+    if (command.type === "X402_STATUS") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      const status = await stacks.getTransactionStatus(command.txid);
+      return { resultText: `X402_STATUS txid=${command.txid} status=${status.status}${status.block_height ? ` block=${status.block_height}` : ""}` };
+    }
 
-      let tokenCategory = command.tokenCategory;
-      if (tokenCategory.length < 64 && !/^[0-9a-f]{64}$/i.test(tokenCategory)) {
-        const token = repo.getBchTokens(docId).find((t) => t.ticker.toUpperCase() === tokenCategory.toUpperCase());
-        if (!token) throw new Error(`Unknown token ticker: ${tokenCategory}`);
-        tokenCategory = token.token_category;
-      }
+    // ── Clarity Contract Commands ──
 
-      const out = await bch.sendToken({
-        privateKeyHex: secrets.bch.privateKeyHex,
-        fromAddress: secrets.bch.cashAddress,
-        to: command.to,
-        tokenCategory,
-        tokenAmount: BigInt(command.tokenAmount)
+    if (command.type === "CONTRACT_CALL") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      // Parse args as Clarity values (basic: numbers → uint, strings → string-ascii, addresses → principal)
+      const clarityArgs = command.args.map(parseClarityArg);
+      const out = await stacks.contractCall({
+        privateKeyHex: secrets.stx.privateKeyHex,
+        contractAddress: command.contractAddress,
+        contractName: command.contractName,
+        functionName: command.functionName,
+        functionArgs: clarityArgs,
       });
-      return {
-        resultText: `TOKEN_SENT=${command.tokenAmount} ${tokenCategory.slice(0, 12)}… → ${command.to} TX=${out.txid}`,
-        txId: out.txid as any
-      };
+      return { resultText: `CONTRACT_CALL txid=${out.txid} (${command.contractAddress}.${command.contractName}::${command.functionName})`, txId: out.txid };
     }
 
-    if (command.type === "BCH_TOKEN_BALANCE") {
-      if (!bch) throw new Error("BCH integration disabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const lines: string[] = [];
-
-      const bchBal = await bch.getBalance(secrets.bch.cashAddress);
-      lines.push(`BCH: ${bchBal.bchFormatted} (${bchBal.confirmed} sats)`);
-
-      const tokenUtxos = await bch.getTokenUtxos(secrets.bch.cashAddress);
-      if (tokenUtxos.length === 0) {
-        lines.push("TOKENS: none");
-      } else {
-        const grouped = new Map<string, bigint>();
-        for (const u of tokenUtxos) grouped.set(u.tokenCategory, (grouped.get(u.tokenCategory) ?? 0n) + u.tokenAmount);
-        for (const [cat, amt] of grouped) {
-          const token = repo.getBchTokens(docId).find((t) => t.token_category === cat);
-          lines.push(`TOKEN ${token?.ticker ?? cat.slice(0, 16)}: ${amt.toString()}`);
-        }
-      }
-      return { resultText: lines.join(" | ") };
+    if (command.type === "CONTRACT_READ") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const clarityArgs = command.args.map(parseClarityArg);
+      const result = await stacks.contractRead({
+        contractAddress: command.contractAddress,
+        contractName: command.contractName,
+        functionName: command.functionName,
+        functionArgs: clarityArgs,
+        senderAddress: secrets.stx.stxAddress,
+      });
+      const json = cvToJSON(result);
+      return { resultText: `CONTRACT_READ ${command.contractAddress}.${command.contractName}::${command.functionName}\nResult: ${JSON.stringify(json, null, 2)}` };
     }
+
+    // ── Stacking ──
+
+    if (command.type === "STACK_STX") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      // Stacking is informational for now — would require pox contract interaction
+      return { resultText: `STACK_STX: Would stack ${command.amountStx} STX for ${command.cycles} cycles. Full PoX stacking requires a BTC reward address and minimum threshold. Use the Stacks Explorer to initiate stacking.` };
+    }
+
+    if (command.type === "STACK_STATUS") {
+      if (!stacks) throw new Error("Stacks integration disabled");
+      if (!secrets.stx) throw new Error("No STX wallet. Run DW SETUP first.");
+      const bal = await stacks.getBalance(secrets.stx.stxAddress);
+      const lockedStx = (Number(bal.locked) / 1_000_000).toFixed(6);
+      const isStacking = bal.locked > 0n;
+      return { resultText: `STACK_STATUS: ${isStacking ? "ACTIVE" : "NOT STACKING"} | Locked: ${lockedStx} STX | Total: ${bal.stxFormatted} STX` };
+    }
+
+    // ── Scheduling ──
 
     if (command.type === "SCHEDULE" || command.type === "CANCEL_SCHEDULE") {
       if (command.type === "SCHEDULE") {
@@ -847,204 +964,12 @@ export class Engine {
       return { resultText: `SCHEDULE_CANCELLED=${command.scheduleId}` };
     }
 
-    // ── NFT Commands ────────────────────────────────────────────────────────────
-
-    if (command.type === "NFT_MINT") {
-      if (!bchNft) throw new Error("BCH NFT integration disabled (BCH_NFT_ENABLED=0)");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const { txid, tokenCategory } = await bchNft.mintNft({
-        privateKeyHex: secrets.bch.privateKeyHex,
-        fromAddress: secrets.bch.cashAddress,
-        toAddress: command.to || secrets.bch.cashAddress,
-        tokenTicker: command.ticker,
-        tokenName: command.name,
-        tokenUri: command.uri,
-        amount: command.amount,
-      });
-      repo.insertBchToken({ docId, tokenCategory, ticker: command.ticker, name: command.name, supply: String(command.amount), genesisTxid: txid });
-      return { resultText: `NFT_MINT name="${command.name}" ticker=${command.ticker} category=${tokenCategory.slice(0, 16)}… txid=${txid}`, txId: txid };
-    }
-
-    if (command.type === "NFT_SEND") {
-      if (!bchNft) throw new Error("BCH NFT integration disabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const { txid } = await bchNft.sendNft({
-        privateKeyHex: secrets.bch.privateKeyHex,
-        fromAddress: secrets.bch.cashAddress,
-        toAddress: command.to,
-        tokenCategory: command.tokenCategory,
-        tokenId: command.tokenId,
-        amount: command.amount,
-      });
-      return { resultText: `NFT_SEND ${command.amount} of ${command.tokenCategory.slice(0, 16)}… → ${command.to} txid=${txid}`, txId: txid };
-    }
-
-    if (command.type === "NFT_BALANCE") {
-      if (!bchNft) throw new Error("BCH NFT integration disabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const collections = await bchNft.getNftBalance(secrets.bch.cashAddress);
-      const dbTokens = repo.getBchTokens(docId);
-      if (collections.length === 0) return { resultText: "NFT_BALANCE: No NFTs in wallet" };
-      const lines = collections.map(c => {
-        const category = c.nfts[0]?.tokenCategory ?? "";
-        const db = dbTokens.find(t => t.token_category === category);
-        const label = db ? `${db.name} (${db.ticker})` : category.slice(0, 16) + "…";
-        return `  ${label}: ${c.totalMinted} units`;
-      });
-      return { resultText: "NFT Holdings:\n" + lines.join("\n") };
-    }
-
-    if (command.type === "NFT_MARKET_LIST") {
-      if (!bchNft) throw new Error("BCH NFT integration disabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const priceSats = Math.round(command.priceBch * 1e8);
-      const listing = bchNft.createListing({ tokenCategory: command.tokenId, tokenId: command.tokenId, sellerAddress: secrets.bch.cashAddress, priceSats });
-      const dbToken = repo.getBchToken(docId, command.tokenId);
-      repo.insertBchNftListing({ listingId: listing.listingId, docId, tokenCategory: command.tokenId, tokenName: dbToken?.name ?? command.tokenId.slice(0, 12), priceSats, sellerAddress: secrets.bch.cashAddress });
-      return { resultText: `NFT_MARKET_LIST listingId=${listing.listingId} token=${command.tokenId.slice(0, 16)}… price=${command.priceBch} BCH` };
-    }
-
-    if (command.type === "NFT_MARKET_BUY") {
-      if (!bch) throw new Error("BCH integration disabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const listing = repo.getBchNftListing(command.listingId);
-      if (!listing) throw new Error(`Listing not found: ${command.listingId}`);
-      if (listing.status !== "active") throw new Error(`Listing is ${listing.status}, cannot buy`);
-      const payResult = await bch.sendBch({ privateKeyHex: secrets.bch.privateKeyHex, fromAddress: secrets.bch.cashAddress, to: listing.seller_address, amountSats: listing.price_sats });
-      repo.updateBchNftListingSold(command.listingId, docId, payResult.txid);
-      return { resultText: `NFT_MARKET_BUY "${listing.token_name}" payTxid=${payResult.txid}`, txId: payResult.txid };
-    }
-
-    // ── Multisig Commands ───────────────────────────────────────────────────────
-
-    if (command.type === "BCH_MULTISIG_CREATE") {
-      if (!bchMultisig) throw new Error("BCH multisig not enabled (BCH_MULTISIG_ENABLED=0)");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const wallet = bchMultisig.createMultisigWallet({ threshold: command.threshold, pubkeys: command.pubkeys });
-      const walletId = `ms_${Date.now()}_${wallet.scriptAddress.slice(-8)}`;
-      repo.insertBchMultisig({ walletId, docId, scriptAddress: wallet.scriptAddress, redeemScript: wallet.redeemScript, threshold: command.threshold, pubkeys: command.pubkeys });
-      return { resultText: `BCH_MULTISIG_CREATE walletId=${walletId} address=${wallet.scriptAddress} threshold=${command.threshold}/${command.pubkeys.length}` };
-    }
-
-    if (command.type === "BCH_MULTISIG_BALANCE") {
-      if (!bchMultisig) throw new Error("BCH multisig not enabled");
-      const multisigs = repo.getBchMultisigByDoc(docId);
-      if (multisigs.length === 0) return { resultText: "BCH_MULTISIG_BALANCE: No multisig wallets for this doc" };
-      const lines = await Promise.all(multisigs.map(async ms => {
-        const bal = await bchMultisig.getBalance(ms.script_address);
-        const pubkeys = JSON.parse(ms.pubkeys_json) as string[];
-        return `  ${ms.script_address.slice(0, 24)}… (${ms.threshold}-of-${pubkeys.length}): ${bal.confirmed} sats confirmed, ${bal.unconfirmed} unconfirmed`;
-      }));
-      return { resultText: "Multisig Wallets:\n" + lines.join("\n") };
-    }
-
-    if (command.type === "BCH_MULTISIG_SEND") {
-      if (!bchMultisig) throw new Error("BCH multisig not enabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const multisigs = repo.getBchMultisigByDoc(docId);
-      if (multisigs.length === 0) throw new Error("No multisig wallet found — create one with BCH_MULTISIG_CREATE first");
-      const ms = multisigs[0]!;
-      const { txid } = await bchMultisig.sendFromMultisig({ fromScriptAddress: ms.script_address, redeemScriptHex: ms.redeem_script, toAddress: command.to, amountSats: command.amountSats, privateKeysHex: [secrets.bch.privateKeyHex] });
-      return { resultText: `BCH_MULTISIG_SEND ${command.amountSats} sats → ${command.to} txid=${txid}`, txId: txid };
-    }
-
-    // ── Vault Commands ──────────────────────────────────────────────────────────
-
-    if (command.type === "CASH_VAULT_CREATE") {
-      if (!cashScript) throw new Error("CashScript vaults not enabled (CASH_ENABLED=0)");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const beneficiary = command.beneficiary || secrets.bch.cashAddress;
-      const { txid, contractAddress, redeemScript } = await cashScript.deployVault({ beneficiary, unlockTime: command.unlockTime, amountSats: command.amountSats, funderPrivateKey: secrets.bch.privateKeyHex, funderAddress: secrets.bch.cashAddress });
-      const vaultId = `v_${contractAddress.slice(-12)}`;
-      repo.insertBchVault({ vaultId, docId, contractAddress, beneficiary, unlockTime: command.unlockTime, amountSats: command.amountSats, redeemScript, fundTxid: txid });
-      const unlockDate = new Date(command.unlockTime * 1000).toISOString();
-      return { resultText: `CASH_VAULT_CREATE vaultId=${vaultId} address=${contractAddress} fundTxid=${txid} unlocks=${unlockDate}`, txId: txid };
-    }
-
-    if (command.type === "CASH_VAULT_CLAIM") {
-      if (!cashScript) throw new Error("CashScript vaults not enabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const vaults = repo.getBchVaultsByDoc(docId).filter(v => v.contract_address === command.vaultAddress);
-      if (vaults.length === 0) throw new Error(`Vault not found for address: ${command.vaultAddress}`);
-      const vault = vaults[0]!;
-      if (vault.status === "CLAIMED") throw new Error("Vault already claimed");
-      const { txid } = await cashScript.claimVault({ contractAddress: vault.contract_address, redeemScriptHex: vault.redeem_script, beneficiaryPrivateKey: secrets.bch.privateKeyHex, recipientAddress: secrets.bch.cashAddress, unlockTime: vault.unlock_time });
-      repo.updateBchVaultStatus(vault.vault_id, "CLAIMED", txid);
-      return { resultText: `CASH_VAULT_CLAIM vaultId=${vault.vault_id} txid=${txid}`, txId: txid };
-    }
-
-    if (command.type === "CASH_VAULT_RECLAIM") {
-      if (!cashScript) throw new Error("CashScript vaults not enabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const vaults = repo.getBchVaultsByDoc(docId).filter(v => v.contract_address === command.vaultAddress);
-      if (vaults.length === 0) throw new Error(`Vault not found for address: ${command.vaultAddress}`);
-      const vault = vaults[0]!;
-      if (vault.status !== "LOCKED") throw new Error(`Vault is not LOCKED (status=${vault.status})`);
-      const { txid } = await cashScript.reclaimVault({ contractAddress: vault.contract_address, redeemScriptHex: vault.redeem_script, creatorPrivateKey: secrets.bch.privateKeyHex, recipientAddress: secrets.bch.cashAddress, locktime: vault.unlock_time });
-      repo.updateBchVaultStatus(vault.vault_id, "RECLAIMED", txid);
-      return { resultText: `CASH_VAULT_RECLAIM vaultId=${vault.vault_id} txid=${txid}`, txId: txid };
-    }
-
-    if (command.type === "CASH_VAULT_STATUS") {
-      if (!cashScript) throw new Error("CashScript vaults not enabled");
-      const vaults = repo.getBchVaultsByDoc(docId).filter(v => v.contract_address === command.vaultAddress);
-      if (vaults.length === 0) return { resultText: `CASH_VAULT_STATUS: Vault not found: ${command.vaultAddress}` };
-      const vault = vaults[0]!;
-      const onChain = await cashScript.getVaultInfo(vault.contract_address);
-      const unlockDate = new Date(vault.unlock_time * 1000).toISOString();
-      const now = Math.floor(Date.now() / 1000);
-      const timeleft = vault.unlock_time > now ? `${vault.unlock_time - now}s remaining` : "UNLOCKED";
-      const lines = [`Vault: ${vault.contract_address}`, `Status: ${vault.status}`, `Timelock: ${unlockDate} (${timeleft})`, `Deposited: ${vault.amount_sats} sats`, `On-chain balance: ${onChain?.balance ?? "unavailable"} sats`, `Fund txid: ${vault.fund_txid}`];
-      if (vault.claim_txid) lines.push(`Claim txid: ${vault.claim_txid}`);
-      return { resultText: lines.join("\n") };
-    }
-
-    // ── Payment Commands ────────────────────────────────────────────────────────
-
-    if (command.type === "PAYMENT_REQUEST") {
-      if (!bchPayments) throw new Error("BCH payments not enabled");
-      if (!secrets.bch) throw new Error("No BCH wallet. Run DW SETUP first.");
-      const amountSats = Math.round(command.amountBch * 1e8);
-      const request = await bchPayments.createPaymentRequest({ amountSats, description: command.description, receiveAddress: secrets.bch.cashAddress });
-      repo.insertBchPaymentRequest({ requestId: request.requestId, docId, address: request.address, amountSats, description: command.description, expiresAt: request.expiresAt });
-      const uri = `bitcoincash:${request.address}?amount=${command.amountBch}&message=${encodeURIComponent(command.description)}`;
-      return { resultText: `PAYMENT_REQUEST requestId=${request.requestId} amount=${command.amountBch} BCH address=${request.address}\nURI: ${uri}` };
-    }
-
-    if (command.type === "PAYMENT_CHECK") {
-      if (!bchPayments) throw new Error("BCH payments not enabled");
-      const dbReq = repo.getBchPaymentRequest(command.requestId);
-      if (!dbReq) throw new Error(`Payment request not found: ${command.requestId}`);
-      if (dbReq.status === "paid") return { resultText: `PAYMENT_CHECK requestId=${command.requestId} status=PAID txid=${dbReq.paid_txid}` };
-      if (Date.now() > dbReq.expires_at) return { resultText: `PAYMENT_CHECK requestId=${command.requestId} status=EXPIRED` };
-      const result = await bchPayments.checkPayment(command.requestId);
-      if (result && result.status === "paid" && result.paidTxid) {
-        repo.updateBchPaymentRequestPaid(command.requestId, result.paidTxid);
-        return { resultText: `PAYMENT_CHECK requestId=${command.requestId} status=PAID txid=${result.paidTxid}` };
-      }
-      return { resultText: `PAYMENT_CHECK requestId=${command.requestId} status=PENDING` };
-    }
-
-    if (command.type === "PAYMENT_QR") {
-      if (!bchPayments) throw new Error("BCH payments not enabled");
-      const dbReq = repo.getBchPaymentRequest(command.requestId);
-      if (!dbReq) throw new Error(`Payment request not found: ${command.requestId}`);
-      const qrUri = bchPayments.generateQR(command.requestId);
-      return { resultText: `PAYMENT_QR requestId=${command.requestId}\nURI: ${qrUri ?? `bitcoincash:${dbReq.address}?amount=${(dbReq.amount_sats / 1e8).toFixed(8)}`}` };
-    }
-
-    // ── Bridge Commands (informational only) ────────────────────────────────────
-
-    if (command.type === "BRIDGE_TO_BCH") {
-      return { resultText: `BRIDGE_TO_BCH: No production ${command.fromChain}→BCH bridge on Chipnet. Use the Chipnet faucet at https://tbch.googol.cash/` };
-    }
-
-    if (command.type === "BRIDGE_FROM_BCH") {
-      return { resultText: `BRIDGE_FROM_BCH: No production BCH→${command.toChain} bridge on Chipnet. For mainnet bridging, explore SideShift.ai or AtomicDEX.` };
-    }
-
-    throw new Error("Unsupported command in BCH-only mode");
+    throw new Error(`Unsupported command: ${(command as any).type}`);
   }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // Helpers
+  // ══════════════════════════════════════════════════════════════════════════════
 
   private async updateDocRow(
     docId: string,
@@ -1089,79 +1014,60 @@ export class Engine {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Utility functions
+// ══════════════════════════════════════════════════════════════════════════════
+
 function generateCmdId(docId: string, raw: string): string {
   const now = new Date().toISOString().replace(/[-:.TZ]/g, "");
   const h = sha256Hex(`${docId}|${raw}|${Date.now()}`).slice(0, 10);
   return `cmd_${now}_${h}`;
 }
 
+function parseClarityArg(arg: string) {
+  // Number → uint
+  if (/^\d+$/.test(arg)) return uintCV(BigInt(arg));
+  // Stacks address → principal
+  if (/^(SP|ST)[A-Z0-9]{38,}/i.test(arg)) return principalCV(arg);
+  // Default → string-ascii
+  return stringAsciiCV(arg);
+}
+
 function reconstructDwCommand(cmd: ParsedCommand): string | null {
   switch (cmd.type) {
-    case "SETUP":
-      return "DW SETUP";
-    case "STATUS":
-      return "DW STATUS";
-    case "SCHEDULE":
-      return `DW SCHEDULE EVERY ${cmd.intervalHours}h: ${cmd.innerCommand}`;
-    case "CANCEL_SCHEDULE":
-      return `DW CANCEL_SCHEDULE ${cmd.scheduleId}`;
-    case "ALERT_THRESHOLD":
-      return `DW ALERT_THRESHOLD ${cmd.coinType} ${cmd.below}`;
-    case "AUTO_REBALANCE":
-      return `DW AUTO_REBALANCE ${cmd.enabled ? "ON" : "OFF"}`;
-    case "CANCEL_ORDER":
-      return `DW CANCEL_ORDER ${cmd.orderId}`;
-    case "BCH_PRICE":
-      return "DW BCH_PRICE";
-    case "BCH_SEND":
-      return `DW BCH_SEND ${cmd.to} ${cmd.amountSats}`;
-    case "BCH_TOKEN_ISSUE":
-      return `DW BCH_TOKEN_ISSUE ${cmd.ticker} ${cmd.name} ${cmd.supply}`;
-    case "BCH_TOKEN_SEND":
-      return `DW BCH_TOKEN_SEND ${cmd.to} ${cmd.tokenCategory} ${cmd.tokenAmount}`;
-    case "BCH_TOKEN_BALANCE":
-      return "DW BCH_TOKEN_BALANCE";
-    case "BCH_STOP_LOSS":
-      return `DW BCH_STOP_LOSS ${cmd.qty} @ ${cmd.triggerPrice}`;
-    case "BCH_TAKE_PROFIT":
-      return `DW BCH_TAKE_PROFIT ${cmd.qty} @ ${cmd.triggerPrice}`;
-    case "TREASURY":
-      return "DW TREASURY";
-    case "NFT_MINT":
-      return `DW NFT_MINT ${cmd.ticker} "${cmd.name}" ${cmd.amount}${cmd.to ? ` to ${cmd.to}` : ""}${cmd.uri ? ` uri=${cmd.uri}` : ""}`;
-    case "NFT_SEND":
-      return `DW NFT_SEND ${cmd.to} ${cmd.tokenCategory} ${cmd.amount}${cmd.tokenId ? ` tokenId=${cmd.tokenId}` : ""}`;
-    case "NFT_BALANCE":
-      return "DW NFT_BALANCE";
-    case "NFT_MARKET_LIST":
-      return `DW NFT_MARKET_LIST ${cmd.tokenId} ${cmd.priceBch} BCH`;
-    case "NFT_MARKET_BUY":
-      return `DW NFT_MARKET_BUY ${cmd.listingId}`;
-    case "BCH_MULTISIG_CREATE":
-      return `DW BCH_MULTISIG_CREATE ${cmd.threshold}-of-${cmd.pubkeys.length}`;
-    case "BCH_MULTISIG_BALANCE":
-      return "DW BCH_MULTISIG_BALANCE";
-    case "BCH_MULTISIG_SEND":
-      return `DW BCH_MULTISIG_SEND ${cmd.to} ${cmd.amountSats}`;
-    case "CASH_VAULT_CREATE":
-      return `DW CASH_VAULT_CREATE ${cmd.amountSats} sats unlockTime=${cmd.unlockTime}${cmd.beneficiary ? ` beneficiary=${cmd.beneficiary}` : ""}`;
-    case "CASH_VAULT_CLAIM":
-      return `DW CASH_VAULT_CLAIM ${cmd.vaultAddress}`;
-    case "CASH_VAULT_RECLAIM":
-      return `DW CASH_VAULT_RECLAIM ${cmd.vaultAddress}`;
-    case "CASH_VAULT_STATUS":
-      return `DW CASH_VAULT_STATUS ${cmd.vaultAddress}`;
-    case "PAYMENT_REQUEST":
-      return `DW PAYMENT_REQUEST ${cmd.amountBch} BCH "${cmd.description}"`;
-    case "PAYMENT_CHECK":
-      return `DW PAYMENT_CHECK ${cmd.requestId}`;
-    case "PAYMENT_QR":
-      return `DW PAYMENT_QR ${cmd.requestId}`;
-    case "BRIDGE_TO_BCH":
-      return `DW BRIDGE_TO_BCH ${cmd.fromChain} ${cmd.amount}`;
-    case "BRIDGE_FROM_BCH":
-      return `DW BRIDGE_FROM_BCH ${cmd.toChain} ${cmd.amountSats}`;
-    default:
-      return null;
+    case "SETUP": return "DW SETUP";
+    case "STATUS": return "DW STATUS";
+    case "TREASURY": return "DW TREASURY";
+    case "SCHEDULE": return `DW SCHEDULE EVERY ${cmd.intervalHours}h: ${cmd.innerCommand}`;
+    case "CANCEL_SCHEDULE": return `DW CANCEL_SCHEDULE ${cmd.scheduleId}`;
+    case "ALERT_THRESHOLD": return `DW ALERT_THRESHOLD ${cmd.coinType} ${cmd.below}`;
+    case "AUTO_REBALANCE": return `DW AUTO_REBALANCE ${cmd.enabled ? "ON" : "OFF"}`;
+    case "CANCEL_ORDER": return `DW CANCEL_ORDER ${cmd.orderId}`;
+    // STX
+    case "STX_PRICE": return "DW STX_PRICE";
+    case "STX_BALANCE": return "DW STX_BALANCE";
+    case "STX_SEND": return `DW STX_SEND ${cmd.to} ${cmd.amountMicroStx.toString()}`;
+    case "STX_HISTORY": return `DW STX_HISTORY ${cmd.limit}`;
+    case "STX_STOP_LOSS": return `DW STX_STOP_LOSS ${cmd.qty} @ ${cmd.triggerPrice}`;
+    case "STX_TAKE_PROFIT": return `DW STX_TAKE_PROFIT ${cmd.qty} @ ${cmd.triggerPrice}`;
+    // sBTC
+    case "SBTC_BALANCE": return "DW SBTC_BALANCE";
+    case "SBTC_SEND": return `DW SBTC_SEND ${cmd.to} ${cmd.amountSats.toString()}`;
+    case "SBTC_INFO": return "DW SBTC_INFO";
+    // USDCx
+    case "USDCX_BALANCE": return "DW USDCX_BALANCE";
+    case "USDCX_SEND": return `DW USDCX_SEND ${cmd.to} ${cmd.amount.toString()}`;
+    case "USDCX_APPROVE": return `DW USDCX_APPROVE ${cmd.spender} ${cmd.amount.toString()}`;
+    case "USDCX_PAYMENT": return `DW USDCX_PAYMENT ${cmd.amount} ${cmd.description}`;
+    // x402
+    case "X402_CALL": return `DW X402_CALL ${cmd.url} ${cmd.method}`;
+    case "X402_STATUS": return `DW X402_STATUS ${cmd.txid}`;
+    // Contracts
+    case "CONTRACT_CALL": return `DW CONTRACT_CALL ${cmd.contractAddress}.${cmd.contractName} ${cmd.functionName}${cmd.args.length ? " " + cmd.args.join(" ") : ""}`;
+    case "CONTRACT_READ": return `DW CONTRACT_READ ${cmd.contractAddress}.${cmd.contractName} ${cmd.functionName}${cmd.args.length ? " " + cmd.args.join(" ") : ""}`;
+    // Stacking
+    case "STACK_STX": return `DW STACK_STX ${cmd.amountStx} ${cmd.cycles}`;
+    case "STACK_STATUS": return "DW STACK_STATUS";
+    default: return null;
   }
 }

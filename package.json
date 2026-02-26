@@ -16,6 +16,11 @@
   },
   "dependencies": {
     "@noble/curves": "^1.9.0",
+    "@stacks/common": "^7.3.1",
+    "@stacks/network": "^7.3.1",
+    "@stacks/stacking": "^7.3.1",
+    "@stacks/transactions": "^7.3.1",
+    "@stacks/wallet-sdk": "^7.2.0",
     "better-sqlite3": "^11.5.0",
     "dotenv": "^16.4.5",
     "googleapis": "^140.0.0",

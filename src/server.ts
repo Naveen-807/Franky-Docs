@@ -1,7 +1,6 @@
 import http from "node:http";
 import type { docs_v1 } from "googleapis";
 import { Repo } from "./db/repo.js";
-import { parseCommand } from "./core/commands.js";
 import { loadDocWalletTables, readCommandsTable, updateCommandsRowCells, appendAuditRow } from "./google/docwallet.js";
 import { loadDocSecrets } from "./wallet/store.js";
 
@@ -31,7 +30,7 @@ export function startServer(deps: ServerDeps) {
                 masterKey: deps.masterKey,
                 docId: d.doc_id
               });
-              const bchAddr = secrets?.bch?.cashAddress ?? "(run DW SETUP)";
+              const stxAddr = secrets?.stx?.stxAddress ?? "(run DW SETUP)";
               return `
 <div class="card">
   <div class="row">
@@ -41,7 +40,7 @@ export function startServer(deps: ServerDeps) {
     </div>
     <a class="btn" href="/activity/${encodeURIComponent(d.doc_id)}">Activity</a>
   </div>
-  <div class="meta" style="margin-top:8px"><strong>BCH:</strong> <code>${escapeHtml(bchAddr)}</code></div>
+  <div class="meta" style="margin-top:8px"><strong>STX:</strong> <code>${escapeHtml(stxAddr)}</code></div>
   <div class="meta"><strong>EVM:</strong> <code>${escapeHtml(d.evm_address ?? "(not set)")}</code></div>
 </div>`;
             }).join("\n")
@@ -54,61 +53,65 @@ export function startServer(deps: ServerDeps) {
     <details>
       <summary style="cursor:pointer;font-weight:500">Core Commands</summary>
       <div style="padding-left:16px; margin-top:8px">
-        <code>DW SETUP</code> — Initialize BCH wallet for this document<br>
+        <code>DW SETUP</code> — Initialize STX + EVM wallets for this document<br>
         <code>DW STATUS</code> — View runtime status<br>
         <code>DW TREASURY</code> — Show all wallet balances
       </div>
     </details>
     <details>
-      <summary style="cursor:pointer;font-weight:500">BCH Transactions</summary>
+      <summary style="cursor:pointer;font-weight:500">STX Transactions</summary>
       <div style="padding-left:16px; margin-top:8px">
-        <code>DW BCH_SEND &lt;address&gt; &lt;sats&gt;</code><br>
-        <code>DW BCH_PRICE</code> — Fetch current BCH/USD price<br>
-        <code>DW BCH_TOKEN_BALANCE</code>
+        <code>DW STX_SEND &lt;address&gt; &lt;microSTX&gt;</code><br>
+        <code>DW STX_BALANCE</code> — View STX balance<br>
+        <code>DW STX_PRICE</code> — Fetch current STX/USD price<br>
+        <code>DW STX_HISTORY [limit]</code> — Recent transactions
       </div>
     </details>
     <details>
-      <summary style="cursor:pointer;font-weight:500">NFT Commands</summary>
+      <summary style="cursor:pointer;font-weight:500; color:#f97316">sBTC Commands</summary>
       <div style="padding-left:16px; margin-top:8px">
-        <code>DW NFT_MINT &lt;ticker&gt; "&lt;name&gt;" &lt;qty&gt;</code><br>
-        <code>DW NFT_SEND &lt;to&gt; &lt;tokenCategory&gt; &lt;amount&gt;</code><br>
-        <code>DW NFT_BALANCE</code><br>
-        <code>DW NFT_MARKET_LIST &lt;tokenId&gt; &lt;priceBch&gt;</code><br>
-        <code>DW NFT_MARKET_BUY &lt;listingId&gt;</code>
+        <code>DW SBTC_BALANCE</code> — View sBTC balance<br>
+        <code>DW SBTC_SEND &lt;address&gt; &lt;sats&gt;</code><br>
+        <code>DW SBTC_INFO</code> — sBTC contract info &amp; supply
       </div>
     </details>
     <details>
-      <summary style="cursor:pointer;font-weight:500; color:#16a34a">Multisig Wallets</summary>
+      <summary style="cursor:pointer;font-weight:500; color:#2563eb">USDCx Commands</summary>
       <div style="padding-left:16px; margin-top:8px">
-        <code>DW BCH_MULTISIG_CREATE &lt;M&gt;-of-&lt;N&gt; &lt;pubkey1&gt; &lt;pubkey2&gt;...</code><br>
-        <code>DW BCH_MULTISIG_BALANCE</code><br>
-        <code>DW BCH_MULTISIG_SEND &lt;to&gt; &lt;sats&gt;</code>
+        <code>DW USDCX_BALANCE</code> — View USDCx balance<br>
+        <code>DW USDCX_SEND &lt;address&gt; &lt;amount&gt;</code><br>
+        <code>DW USDCX_APPROVE &lt;spender&gt; &lt;amount&gt;</code><br>
+        <code>DW USDCX_PAYMENT &lt;amount&gt; "&lt;description&gt;"</code>
       </div>
     </details>
     <details>
-      <summary style="cursor:pointer;font-weight:500; color:#7c3aed">Time-Locked Vaults</summary>
+      <summary style="cursor:pointer;font-weight:500; color:#7c3aed">x402 Protocol</summary>
       <div style="padding-left:16px; margin-top:8px">
-        <code>DW CASH_VAULT_CREATE &lt;sats&gt; &lt;unlockTime&gt;</code><br>
-        <code>DW CASH_VAULT_CLAIM &lt;vaultAddress&gt;</code><br>
-        <code>DW CASH_VAULT_RECLAIM &lt;vaultAddress&gt;</code><br>
-        <code>DW CASH_VAULT_STATUS &lt;vaultAddress&gt;</code>
+        <code>DW X402_CALL &lt;url&gt; [method]</code> — Pay-and-call HTTP 402 resource<br>
+        <code>DW X402_STATUS &lt;txid&gt;</code> — Check payment transaction status
       </div>
     </details>
     <details>
-      <summary style="cursor:pointer;font-weight:500; color:#ea580c">Payment Requests</summary>
+      <summary style="cursor:pointer;font-weight:500; color:#16a34a">Clarity Contracts</summary>
       <div style="padding-left:16px; margin-top:8px">
-        <code>DW PAYMENT_REQUEST &lt;amountBch&gt; "&lt;description&gt;"</code><br>
-        <code>DW PAYMENT_CHECK &lt;requestId&gt;</code><br>
-        <code>DW PAYMENT_QR &lt;requestId&gt;</code>
+        <code>DW CONTRACT_CALL &lt;addr&gt;.&lt;name&gt; &lt;function&gt; [args...]</code><br>
+        <code>DW CONTRACT_READ &lt;addr&gt;.&lt;name&gt; &lt;function&gt; [args...]</code>
+      </div>
+    </details>
+    <details>
+      <summary style="cursor:pointer;font-weight:500; color:#ea580c">Stacking</summary>
+      <div style="padding-left:16px; margin-top:8px">
+        <code>DW STACK_STX &lt;amountSTX&gt; &lt;cycles&gt;</code><br>
+        <code>DW STACK_STATUS</code> — View current stacking position
       </div>
     </details>
   </div>
 </div>`;
 
-        return sendHtml(res, "FrankyDocs BCH", `
-<div style="background:linear-gradient(135deg,#0ea5e9 0%,#16a34a 100%); color:#fff; padding:18px; border-radius:12px; margin-bottom:20px">
-  <h2 style="margin:0; font-size:1.8rem">🏦 FrankyDocs BCH</h2>
-  <p style="margin:4px 0 0 0; opacity:0.95">Production-grade Bitcoin Cash automation for Google Docs</p>
+        return sendHtml(res, "FrankyDocs Stacks", `
+<div style="background:linear-gradient(135deg,#5546ff 0%,#f97316 100%); color:#fff; padding:18px; border-radius:12px; margin-bottom:20px">
+  <h2 style="margin:0; font-size:1.8rem">⚡ FrankyDocs Stacks</h2>
+  <p style="margin:4px 0 0 0; opacity:0.95">Stacks/Bitcoin automation for Google Docs — STX, sBTC, USDCx, x402</p>
 </div>
 <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-bottom:20px">
   <div class="stat-card">
@@ -128,7 +131,7 @@ export function startServer(deps: ServerDeps) {
 <div class="grid">${cards}</div>
 ${commandsRef}
 <footer style="margin-top:40px; padding-top:20px; border-top:1px solid var(--border); text-align:center; color:var(--muted); font-size:0.9rem">
-  Powered by <a href="https://fullstack.cash" target="_blank" style="color:#16a34a; text-decoration:none; font-weight:500">fullstack.cash</a> API • Chipnet testnet • BCH-only mode
+  Powered by <a href="https://hiro.so" target="_blank" style="color:#5546ff; text-decoration:none; font-weight:500">Hiro API</a> • Stacks Testnet • STX + sBTC + USDCx + x402
 </footer>`);
       }
 
@@ -202,12 +205,12 @@ async function decide(decision) {
         const allDocs = deps.repo.listDocs();
         const payload = allDocs.map((d) => {
           const secrets = loadDocSecrets({ repo: deps.repo, masterKey: deps.masterKey, docId: d.doc_id });
-          const bchAddress = secrets?.bch?.cashAddress ?? null;
+          const stxAddress = secrets?.stx?.stxAddress ?? null;
           return {
             docId: d.doc_id,
             name: d.name,
             evmAddress: d.evm_address,
-            bchAddress
+            stxAddress
           };
         });
         return sendJson(res, 200, { ok: true, docs: payload });
@@ -217,10 +220,9 @@ async function decide(decision) {
         const allDocs = deps.repo.listDocs();
         const totalPending = deps.repo.countPendingCommands();
         const totalSchedules = deps.repo.countActiveSchedules();
-        const totalVaults = deps.repo.countBchVaults();
-        const totalMultisigs = deps.repo.countBchMultisigWallets();
-        const totalPayments = deps.repo.countBchPaymentRequests();
-        const totalNftListings = deps.repo.countActiveBchNftListings();
+        const totalPayments = deps.repo.countStacksPaymentRequests();
+        const totalX402 = deps.repo.countX402Receipts();
+        const totalContracts = deps.repo.countContractCalls();
 
         return sendJson(res, 200, {
           ok: true,
@@ -229,11 +231,10 @@ async function decide(decision) {
             documents: allDocs.length,
             pendingCommands: totalPending,
             activeSchedules: totalSchedules,
-            vaults: totalVaults,
-            multisigWallets: totalMultisigs,
             paymentRequests: totalPayments,
-            nftListings: totalNftListings,
-            mode: "BCH-only"
+            x402Receipts: totalX402,
+            contractCalls: totalContracts,
+            mode: "Stacks"
           }
         });
       }
@@ -310,61 +311,68 @@ function describeCommand(cmd: any): string {
   if (!cmd || typeof cmd !== "object" || typeof cmd.type !== "string") return "Unknown command";
   switch (cmd.type) {
     case "SETUP":
-      return "Create BCH + EVM wallets for this document";
+      return "Create STX + EVM wallets for this document";
     case "STATUS":
       return "Display runtime status";
-    case "BCH_PRICE":
-      return "Fetch BCH/USD price";
-    case "BCH_SEND":
-      return `Send ${cmd.amountSats ?? "?"} sats to ${shortAddress(cmd.to)}`;
-    case "BCH_TOKEN_ISSUE":
-      return `Issue token ${cmd.ticker ?? ""} supply ${cmd.supply ?? ""}`;
-    case "BCH_TOKEN_SEND":
-      return `Send token ${cmd.tokenCategory ?? ""} amount ${cmd.tokenAmount ?? ""}`;
-    case "BCH_TOKEN_BALANCE":
-      return "Show BCH and CashToken balances";
-    case "BCH_STOP_LOSS":
-      return `Create BCH stop-loss at $${cmd.triggerPrice}`;
-    case "BCH_TAKE_PROFIT":
-      return `Create BCH take-profit at $${cmd.triggerPrice}`;
-    case "NFT_MINT":
-      return `Mint NFT "${cmd.name ?? ""}" (${cmd.ticker ?? ""}) ${cmd.amount ?? ""} units`;
-    case "NFT_SEND":
-      return `Send ${cmd.amount ?? ""} NFT of ${shortAddress(cmd.tokenCategory)} → ${shortAddress(cmd.to)}`;
-    case "NFT_BALANCE":
-      return "View NFT holdings";
-    case "NFT_MARKET_LIST":
-      return `List NFT ${shortAddress(cmd.tokenId)} for ${cmd.priceBch ?? "?"} BCH`;
-    case "NFT_MARKET_BUY":
-      return `Buy NFT listing ${cmd.listingId ?? "?"}`;
-    case "BCH_MULTISIG_CREATE":
-      return `Create ${cmd.threshold ?? "?"}-of-${(cmd.pubkeys?.length) ?? "?"} multisig wallet`;
-    case "BCH_MULTISIG_BALANCE":
-      return "View multisig wallet balances";
-    case "BCH_MULTISIG_SEND":
-      return `Send ${cmd.amountSats ?? "?"} sats from multisig → ${shortAddress(cmd.to)}`;
-    case "CASH_VAULT_CREATE":
-      return `Deploy time-locked vault ${cmd.amountSats ?? "?"} sats until ${new Date((cmd.unlockTime ?? 0) * 1000).toUTCString()}`;
-    case "CASH_VAULT_CLAIM":
-      return `Claim vault ${shortAddress(cmd.vaultAddress)}`;
-    case "CASH_VAULT_RECLAIM":
-      return `Reclaim vault ${shortAddress(cmd.vaultAddress)}`;
-    case "CASH_VAULT_STATUS":
-      return `Check vault ${shortAddress(cmd.vaultAddress)} status`;
-    case "PAYMENT_REQUEST":
-      return `Create payment request for ${cmd.amountBch ?? "?"} BCH: "${cmd.description ?? ""}"`;
-    case "PAYMENT_CHECK":
-      return `Check payment ${cmd.requestId ?? "?"}`;
-    case "PAYMENT_QR":
-      return `Generate QR for payment ${cmd.requestId ?? "?"}`;
-    case "BRIDGE_TO_BCH":
-      return `Bridge from ${cmd.fromChain ?? "?"} → BCH: ${cmd.amount ?? "?"}`;
-    case "BRIDGE_FROM_BCH":
-      return `Bridge BCH → ${cmd.toChain ?? "?"}: ${cmd.amount ?? "?"}`;
+    case "TREASURY":
+      return "Show all wallet balances (STX, sBTC, USDCx)";
+    // STX
+    case "STX_PRICE":
+      return "Fetch STX/USD price";
+    case "STX_BALANCE":
+      return "View STX balance";
+    case "STX_SEND":
+      return `Send ${cmd.amountMicroStx ?? "?"} microSTX to ${shortAddress(cmd.to)}`;
+    case "STX_HISTORY":
+      return `Show last ${cmd.limit ?? 10} transactions`;
+    case "STX_STOP_LOSS":
+      return `Create STX stop-loss at $${cmd.triggerPrice}`;
+    case "STX_TAKE_PROFIT":
+      return `Create STX take-profit at $${cmd.triggerPrice}`;
+    // sBTC
+    case "SBTC_BALANCE":
+      return "View sBTC balance";
+    case "SBTC_SEND":
+      return `Send ${cmd.amountSats ?? "?"} sats sBTC to ${shortAddress(cmd.to)}`;
+    case "SBTC_INFO":
+      return "sBTC contract info and total supply";
+    // USDCx
+    case "USDCX_BALANCE":
+      return "View USDCx balance";
+    case "USDCX_SEND":
+      return `Send ${cmd.amount ?? "?"} USDCx to ${shortAddress(cmd.to)}`;
+    case "USDCX_APPROVE":
+      return `Approve ${cmd.amount ?? "?"} USDCx for ${shortAddress(cmd.spender)}`;
+    case "USDCX_PAYMENT":
+      return `Create USDCx payment request for $${cmd.amount ?? "?"}: "${cmd.description ?? ""}"`;
+    // x402
+    case "X402_CALL":
+      return `Pay-and-call ${cmd.url ?? "?"} via x402 protocol`;
+    case "X402_STATUS":
+      return `Check x402 payment status for txid ${shortAddress(cmd.txid)}`;
+    // Contracts
+    case "CONTRACT_CALL":
+      return `Call ${shortAddress(cmd.contractAddress)}.${cmd.contractName ?? "?"}::${cmd.functionName ?? "?"}`;
+    case "CONTRACT_READ":
+      return `Read ${shortAddress(cmd.contractAddress)}.${cmd.contractName ?? "?"}::${cmd.functionName ?? "?"}`;
+    // Stacking
+    case "STACK_STX":
+      return `Stack ${cmd.amountStx ?? "?"} STX for ${cmd.cycles ?? "?"} cycles`;
+    case "STACK_STATUS":
+      return "View stacking position";
+    // Scheduling
+    case "SCHEDULE":
+      return `Schedule "${cmd.innerCommand}" every ${cmd.intervalHours}h`;
+    case "CANCEL_SCHEDULE":
+      return `Cancel schedule ${cmd.scheduleId ?? "?"}`;
+    case "ALERT_THRESHOLD":
+      return `Alert when ${cmd.coinType ?? "?"} < ${cmd.below ?? "?"}`;
+    case "AUTO_REBALANCE":
+      return `Auto-rebalance ${cmd.enabled ? "ON" : "OFF"}`;
+    case "CANCEL_ORDER":
+      return `Cancel order ${cmd.orderId ?? "?"}`;
     default:
-      return parseCommand(`DW ${cmd.type}`).ok
-        ? `${cmd.type} command`
-        : `${cmd.type} (unsupported in BCH-only mode)`;
+      return `${cmd.type} command`;
   }
 }
 

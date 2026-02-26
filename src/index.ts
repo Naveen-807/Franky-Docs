@@ -5,11 +5,10 @@ import { Repo } from "./db/repo.js";
 import { Engine } from "./engine.js";
 import { HederaClient } from "./integrations/hedera.js";
 import { startServer } from "./server.js";
-import { BchClient } from "./integrations/bch.js";
-import { BchNftClient } from "./integrations/bch-nft.js";
-import { BchMultisigClient } from "./integrations/bch-multisig.js";
-import { CashScriptClient } from "./integrations/cashscript.js";
-import { BchPaymentsClient } from "./integrations/bch-payments.js";
+import { StacksClient } from "./integrations/stacks.js";
+import { SbtcClient } from "./integrations/sbtc.js";
+import { UsdcxClient } from "./integrations/usdcx.js";
+import { X402Client } from "./integrations/x402.js";
 
 async function main() {
   const config = loadConfig();
@@ -34,28 +33,53 @@ async function main() {
     }
   }
 
-  let bch: BchClient | undefined;
-  let bchNft: BchNftClient | undefined;
-  let bchMultisig: BchMultisigClient | undefined;
-  let cashScript: CashScriptClient | undefined;
-  let bchPayments: BchPaymentsClient | undefined;
-  if (config.BCH_ENABLED) {
+  let stacks: StacksClient | undefined;
+  let sbtc: SbtcClient | undefined;
+  let usdcx: UsdcxClient | undefined;
+  let x402: X402Client | undefined;
+  if (config.STACKS_ENABLED) {
     try {
-      bch = new BchClient({
-        restUrl: config.BCH_REST_URL,
-        network: config.BCH_NETWORK
-      });
-      bchNft = new BchNftClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
-      bchMultisig = new BchMultisigClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
-      cashScript = new CashScriptClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
-      bchPayments = new BchPaymentsClient({ restUrl: config.BCH_REST_URL, network: config.BCH_NETWORK });
-      console.log(`[startup] BCH client initialized (${config.BCH_NETWORK}, REST: ${config.BCH_REST_URL})`);
+      const apiUrl = config.STACKS_API_URL || (config.STX_NETWORK === "mainnet"
+        ? "https://api.hiro.so"
+        : "https://api.testnet.hiro.so");
+      stacks = new StacksClient({ network: config.STX_NETWORK, apiUrl });
+      console.log(`[startup] Stacks client initialized (${config.STX_NETWORK}, API: ${apiUrl})`);
     } catch (e) {
-      console.error("[startup] BCH client init failed (continuing without BCH):", (e as Error).message);
+      console.error("[startup] Stacks client init failed:", (e as Error).message);
+    }
+
+    if (stacks && config.SBTC_ENABLED) {
+      try {
+        sbtc = new SbtcClient({ network: config.STX_NETWORK });
+        sbtc.setStacksClient(stacks);
+        console.log(`[startup] sBTC client initialized (${config.STX_NETWORK})`);
+      } catch (e) {
+        console.error("[startup] sBTC client init failed:", (e as Error).message);
+      }
+    }
+
+    if (stacks && config.USDCX_ENABLED) {
+      try {
+        usdcx = new UsdcxClient({ network: config.STX_NETWORK });
+        usdcx.setStacksClient(stacks);
+        console.log(`[startup] USDCx client initialized (${config.STX_NETWORK})`);
+      } catch (e) {
+        console.error("[startup] USDCx client init failed:", (e as Error).message);
+      }
+    }
+
+    if (stacks && config.X402_ENABLED) {
+      try {
+        x402 = new X402Client({ network: config.STX_NETWORK });
+        x402.setStacksClient(stacks);
+        console.log(`[startup] x402 client initialized (${config.STX_NETWORK})`);
+      } catch (e) {
+        console.error("[startup] x402 client init failed:", (e as Error).message);
+      }
     }
   }
 
-  const engine = new Engine({ config, docs, drive, repo, hedera, bch, bchNft, bchMultisig, cashScript, bchPayments });
+  const engine = new Engine({ config, docs, drive, repo, hedera, stacks, sbtc, usdcx, x402 });
 
   const publicBaseUrl = config.PUBLIC_BASE_URL ?? `http://localhost:${config.HTTP_PORT}`;
   startServer({
