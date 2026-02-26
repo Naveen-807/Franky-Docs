@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { google } from "googleapis";
+import { JWT } from "google-auth-library";
 
 export type ServiceAccountKey = {
   client_email: string;
@@ -18,7 +18,9 @@ export async function loadServiceAccountKey(source: string): Promise<ServiceAcco
 
 export async function createGoogleAuth(serviceAccountJson: string, scopes: string[]) {
   const key = await loadServiceAccountKey(serviceAccountJson);
-  const auth = new google.auth.JWT({
+  console.log(`[auth] service account: ${key.client_email}`);
+  console.log(`[auth] share your Google Docs with this email as \"Editor\" for auto-detection`);
+  const auth = new JWT({
     email: key.client_email,
     key: key.private_key,
     scopes

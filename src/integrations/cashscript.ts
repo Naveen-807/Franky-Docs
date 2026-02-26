@@ -8,11 +8,17 @@
  *   OP_DUP OP_HASH160 <beneficiaryHash160> OP_EQUALVERIFY OP_CHECKSIG
  *
  * Fund the vault by sending BCH to the P2SH contract address (real broadcast
- * via fullstack.cash REST API). Claim after locktime passes using BIP-143.
+ * via Fulcrum ElectrumX WebSocket). Claim after locktime passes using BIP-143.
  */
 
 import { createHash } from "node:crypto";
 import { secp256k1 } from "@noble/curves/secp256k1";
+import {
+  fulcrumCall,
+  fulcrumBroadcast,
+  getWssEndpoints,
+  addressToElectrumScriptHash,
+} from "./fulcrum.js";
 
 // ── Crypto helpers ───────────────────────────────────────────────────────────
 
@@ -143,10 +149,12 @@ export interface VaultContract {
 export class CashScriptClient {
   private restUrl: string;
   private network: string;
+  private wssEndpoints: string[];
 
   constructor(config: CashScriptConfig) {
     this.restUrl = config.restUrl.replace(/\/+$/, "");
     this.network = config.network ?? "chipnet";
+    this.wssEndpoints = getWssEndpoints(this.network);
   }
 
   /**
@@ -230,13 +238,14 @@ export class CashScriptClient {
     });
   }
 
-  /** Query vault balance on-chain */
+  /** Query vault balance on-chain via Fulcrum ElectrumX */
   async getVaultInfo(contractAddress: string): Promise<{ balance: number; address: string } | null> {
     try {
-      const res = await fetch(this.restUrl + "/electrumx/balance/" + contractAddress);
-      if (!res.ok) return null;
-      const data = (await res.json()) as any;
-      const balance = (data?.balance?.confirmed ?? 0) + (data?.balance?.unconfirmed ?? 0);
+      const sh = addressToElectrumScriptHash(contractAddress);
+      const result = await fulcrumCall<{ confirmed: number; unconfirmed: number }>(
+        this.wssEndpoints, "blockchain.scripthash.get_balance", [sh],
+      );
+      const balance = (result?.confirmed ?? 0) + (result?.unconfirmed ?? 0);
       return { balance, address: contractAddress };
     } catch {
       return null;
@@ -383,10 +392,11 @@ export class CashScriptClient {
 
   private async _getUtxos(addr: string): Promise<{ txid: string; vout: number; value: number }[]> {
     try {
-      const res = await fetch(this.restUrl + "/electrumx/utxos/" + addr);
-      if (!res.ok) return [];
-      const data = (await res.json()) as any;
-      return (data?.utxos ?? []).map((u: any) => ({
+      const sh = addressToElectrumScriptHash(addr);
+      const utxos = await fulcrumCall<Array<{ tx_hash: string; tx_pos: number; value: number }>>(
+        this.wssEndpoints, "blockchain.scripthash.listunspent", [sh],
+      );
+      return (utxos ?? []).map((u) => ({
         txid: u.tx_hash as string,
         vout: u.tx_pos as number,
         value: u.value as number,
@@ -397,16 +407,8 @@ export class CashScriptClient {
   }
 
   private async _broadcast(rawTx: string): Promise<{ txid: string }> {
-    const res = await fetch(this.restUrl + "/rawtransactions/sendRawTransaction", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hexes: [rawTx] }),
-    });
-    if (!res.ok) throw new Error("Vault broadcast failed: " + (await res.text()));
-    const result = (await res.json()) as any;
-    const txid = Array.isArray(result) ? result[0] : result;
-    if (typeof txid === "string" && txid.length === 64) return { txid };
-    throw new Error("Unexpected broadcast result: " + JSON.stringify(result));
+    const txid = await fulcrumBroadcast(this.wssEndpoints, rawTx);
+    return { txid };
   }
 }
 

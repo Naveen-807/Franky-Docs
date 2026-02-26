@@ -7,11 +7,17 @@
  * - sendFromMultisig: builds and broadcasts a real BIP-143-signed P2SH-spending
  *   transaction (works for any threshold where the caller supplies enough keys).
  *
- * All transactions are broadcast via the fullstack.cash REST API.
+ * All transactions are broadcast via Fulcrum ElectrumX WebSocket.
  */
 
 import { createHash } from "node:crypto";
 import { secp256k1 } from "@noble/curves/secp256k1";
+import {
+  fulcrumCall,
+  fulcrumBroadcast,
+  getWssEndpoints,
+  addressToElectrumScriptHash,
+} from "./fulcrum.js";
 
 // ── Crypto helpers ──────────────────────────────────────────────────────────
 
@@ -174,10 +180,12 @@ export interface MultisigWallet {
 export class BchMultisigClient {
   private restUrl: string;
   private network: string;
+  private wssEndpoints: string[];
 
   constructor(config: MultisigConfig) {
     this.restUrl = config.restUrl.replace(/\/+$/, "");
     this.network = config.network ?? "chipnet";
+    this.wssEndpoints = getWssEndpoints(this.network);
   }
 
   /** Derive compressed secp256k1 public key (33-byte hex) from a private key hex */
@@ -209,23 +217,25 @@ export class BchMultisigClient {
     return { scriptAddress: legacyAddr, cashAddress: cashAddr, redeemScript: redeemScript.toString("hex"), pubkeys, threshold, totalSigners: pubkeys.length };
   }
 
-  /** Get BCH balance at a P2SH multisig address */
+  /** Get BCH balance at a P2SH multisig address via Fulcrum ElectrumX */
   async getBalance(scriptAddress: string): Promise<{ confirmed: number; unconfirmed: number }> {
     try {
-      const res = await fetch(`${this.restUrl}/electrumx/balance/${scriptAddress}`);
-      if (!res.ok) return { confirmed: 0, unconfirmed: 0 };
-      const data = await res.json() as any;
-      return { confirmed: data?.balance?.confirmed ?? 0, unconfirmed: data?.balance?.unconfirmed ?? 0 };
+      const sh = addressToElectrumScriptHash(scriptAddress);
+      const result = await fulcrumCall<{ confirmed: number; unconfirmed: number }>(
+        this.wssEndpoints, "blockchain.scripthash.get_balance", [sh],
+      );
+      return { confirmed: result?.confirmed ?? 0, unconfirmed: result?.unconfirmed ?? 0 };
     } catch { return { confirmed: 0, unconfirmed: 0 }; }
   }
 
-  /** Get UTXOs at a P2SH multisig address */
+  /** Get UTXOs at a P2SH multisig address via Fulcrum ElectrumX */
   async getUtxos(scriptAddress: string): Promise<Array<{ txid: string; vout: number; value: number }>> {
     try {
-      const res = await fetch(`${this.restUrl}/electrumx/utxos/${scriptAddress}`);
-      if (!res.ok) return [];
-      const data = await res.json() as any;
-      return (data?.utxos ?? []).map((u: any) => ({ txid: u.tx_hash, vout: u.tx_pos, value: u.value }));
+      const sh = addressToElectrumScriptHash(scriptAddress);
+      const utxos = await fulcrumCall<Array<{ tx_hash: string; tx_pos: number; value: number }>>(
+        this.wssEndpoints, "blockchain.scripthash.listunspent", [sh],
+      );
+      return (utxos ?? []).map((u) => ({ txid: u.tx_hash, vout: u.tx_pos, value: u.value }));
     } catch { return []; }
   }
 
@@ -311,19 +321,9 @@ export class BchMultisigClient {
 
     const rawTx = Buffer.concat([version, encodeVarint(utxos.length), ...signedInputs, encodeVarint(outBuffers.length), allOutputs, locktime]).toString("hex");
 
-    const res = await fetch(`${this.restUrl}/rawtransactions/sendRawTransaction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hexes: [rawTx] })
-    });
-    if (!res.ok) throw new Error(`Multisig broadcast failed: ${await res.text()}`);
-    const result = await res.json() as any;
-    const txid = Array.isArray(result) ? result[0] : result;
-    if (typeof txid === "string" && txid.length === 64) {
-      console.log(`[bch-multisig] Sent ${params.amountSats} sats → ${params.toAddress} txid=${txid}`);
-      return { txid };
-    }
-    throw new Error(`Multisig broadcast unexpected result: ${JSON.stringify(result)}`);
+    const txid = await fulcrumBroadcast(this.wssEndpoints, rawTx);
+    console.log(`[bch-multisig] Sent ${params.amountSats} sats → ${params.toAddress} txid=${txid}`);
+    return { txid };
   }
 }
 

@@ -22,7 +22,7 @@ const EnvSchema = z.object({
   POLL_INTERVAL_MS: z.string().optional().default("15000").pipe(NumberString),
   DISCOVERY_INTERVAL_MS: z.string().optional().default("60000").pipe(NumberString),
   DOCWALLET_DOC_ID: z.string().optional().transform((v) => (v?.trim() ? v.trim() : undefined)),
-  DOCWALLET_DISCOVER_ALL: z.string().optional().default("0").pipe(BoolString),
+  DOCWALLET_DISCOVER_ALL: z.string().optional().default("1").pipe(BoolString),
   DOCWALLET_NAME_PREFIX: z
     .string()
     .optional()

@@ -1,10 +1,22 @@
 /**
  * BCH Client — lightweight Bitcoin Cash integration for Chipnet testnet.
- * Uses raw HTTP calls to fullstack.cash REST API (no external BCH library needed).
+ * Uses Fulcrum ElectrumX WebSocket protocol for balance/UTXO queries and
+ * transaction broadcasting. No external BCH library needed.
  */
 
+import { createHash as ch } from "node:crypto";
+import { secp256k1 } from "@noble/curves/secp256k1";
+import {
+  fulcrumCall,
+  fulcrumBroadcast,
+  getWssEndpoints,
+  addressToElectrumScriptHash,
+  CHIPNET_FULCRUM_WSS,
+  MAINNET_FULCRUM_WSS,
+} from "./fulcrum.js";
+
 export interface BchClientParams {
-  restUrl: string; // e.g. https://chipnet.fullstack.cash/v5/
+  restUrl: string; // kept for config compatibility (not actively used)
   network?: string; // chipnet | mainnet | testnet3
 }
 
@@ -21,32 +33,36 @@ export interface BchBalance {
   bchFormatted: string; // human-readable BCH amount
 }
 
+// ── Fulcrum WebSocket RPC helper (imported from ./fulcrum.ts) ──
+// fulcrumCall, addressToElectrumScriptHash, fulcrumBroadcast are shared
+
 export class BchClient {
   private restUrl: string;
   private network: string;
+  private wssEndpoints: string[];
 
   constructor(params: BchClientParams) {
     this.restUrl = params.restUrl.replace(/\/+$/, "");
     this.network = params.network ?? "chipnet";
+    this.wssEndpoints = this.network === "mainnet" ? MAINNET_FULCRUM_WSS : CHIPNET_FULCRUM_WSS;
   }
 
-  /** Get balance for a BCH address (CashAddr or legacy format) */
+  /** Get balance for a BCH address via Fulcrum ElectrumX WebSocket */
   async getBalance(address: string): Promise<BchBalance> {
     try {
-      const url = `${this.restUrl}/electrumx/balance/${address}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        console.error(`[bch] Balance fetch failed: ${res.status} ${res.statusText}`);
-        return { confirmed: 0, unconfirmed: 0, bchFormatted: "0" };
-      }
-      const data = await res.json() as any;
-      const confirmed = data?.balance?.confirmed ?? 0;
-      const unconfirmed = data?.balance?.unconfirmed ?? 0;
+      const scriptHash = addressToElectrumScriptHash(address);
+      const result = await fulcrumCall<{ confirmed: number; unconfirmed: number }>(
+        this.wssEndpoints,
+        "blockchain.scripthash.get_balance",
+        [scriptHash],
+      );
+      const confirmed = result?.confirmed ?? 0;
+      const unconfirmed = result?.unconfirmed ?? 0;
       const totalSats = confirmed + unconfirmed;
       return {
         confirmed,
         unconfirmed,
-        bchFormatted: (totalSats / 1e8).toFixed(8)
+        bchFormatted: (totalSats / 1e8).toFixed(8),
       };
     } catch (e) {
       console.error(`[bch] Balance error:`, (e as Error).message);
@@ -54,19 +70,20 @@ export class BchClient {
     }
   }
 
-  /** Get UTXOs for a BCH address */
+  /** Get UTXOs for a BCH address via Fulcrum */
   async getUtxos(address: string): Promise<BchUtxo[]> {
     try {
-      const url = `${this.restUrl}/electrumx/utxos/${address}`;
-      const res = await fetch(url);
-      if (!res.ok) return [];
-      const data = await res.json() as any;
-      const utxos = data?.utxos ?? [];
-      return utxos.map((u: any) => ({
+      const scriptHash = addressToElectrumScriptHash(address);
+      const result = await fulcrumCall<Array<{ tx_hash: string; tx_pos: number; value: number; height: number }>>(
+        this.wssEndpoints,
+        "blockchain.scripthash.listunspent",
+        [scriptHash],
+      );
+      return (result ?? []).map((u) => ({
         txid: u.tx_hash,
         vout: u.tx_pos,
         value: u.value,
-        height: u.height ?? 0
+        height: u.height ?? 0,
       }));
     } catch (e) {
       console.error(`[bch] UTXO fetch error:`, (e as Error).message);
@@ -118,35 +135,29 @@ export class BchClient {
       ]
     });
 
-    // Broadcast via REST API
-    const broadcastUrl = `${this.restUrl}/rawtransactions/sendRawTransaction`;
-    const broadcastRes = await fetch(broadcastUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hexes: [rawTx] })
-    });
-
-    if (!broadcastRes.ok) {
-      const errText = await broadcastRes.text();
-      throw new Error(`Broadcast failed: ${errText}`);
-    }
-
-    const result = await broadcastRes.json() as any;
-    const txid = Array.isArray(result) ? result[0] : result;
-    if (typeof txid === "string" && txid.length === 64) {
-      console.log(`[bch] Sent ${amountSats} sats → ${params.to} txid=${txid}`);
-      return { txid };
-    }
-    throw new Error(`Broadcast returned unexpected result: ${JSON.stringify(result)}`);
+    // Broadcast via Fulcrum ElectrumX WebSocket
+    const txid = await this.broadcast(rawTx);
+    console.log(`[bch] Sent ${amountSats} sats → ${params.to} txid=${txid}`);
+    return { txid };
   }
 
-  /** Get transaction details */
+  /** Broadcast a raw transaction hex via Fulcrum */
+  async broadcast(rawTxHex: string): Promise<string> {
+    try {
+      return await fulcrumBroadcast(this.wssEndpoints, rawTxHex);
+    } catch (e) {
+      throw new Error(`Broadcast failed: ${(e as Error).message}`);
+    }
+  }
+
+  /** Get transaction details via Fulcrum */
   async getTransaction(txid: string): Promise<any> {
     try {
-      const url = `${this.restUrl}/rawtransactions/getRawTransaction/${txid}?verbose=true`;
-      const res = await fetch(url);
-      if (!res.ok) return null;
-      return await res.json();
+      return await fulcrumCall(
+        this.wssEndpoints,
+        "blockchain.transaction.get",
+        [txid, true], // verbose=true
+      );
     } catch {
       return null;
     }
@@ -160,24 +171,28 @@ export class BchClient {
     return `https://chipnet.chaingraph.cash/tx/${txid}`;
   }
 
-  /** Get token UTXOs for a BCH address (CashTokens) */
+  /** Get token UTXOs for a BCH address (CashTokens) via Fulcrum */
   async getTokenUtxos(address: string): Promise<BchTokenUtxo[]> {
     try {
-      const url = `${this.restUrl}/electrumx/utxos/${address}`;
-      const res = await fetch(url);
-      if (!res.ok) return [];
-      const data = await res.json() as any;
-      const utxos = data?.utxos ?? [];
+      const scriptHash = addressToElectrumScriptHash(address);
+      // Fulcrum supports blockchain.scripthash.listunspent which returns token_data on CashToken UTXOs
+      const utxos = await fulcrumCall<Array<{
+        tx_hash: string; tx_pos: number; value: number; height: number;
+        token_data?: { category: string; amount: string; nft?: { capability: string; commitment: string } };
+      }>>(
+        this.wssEndpoints,
+        "blockchain.scripthash.listunspent",
+        [scriptHash],
+      );
       const tokenUtxos: BchTokenUtxo[] = [];
-      for (const u of utxos) {
-        if (u.token_data || u.tokenData) {
-          const td = u.token_data ?? u.tokenData;
+      for (const u of utxos ?? []) {
+        if (u.token_data) {
           tokenUtxos.push({
             txid: u.tx_hash,
             vout: u.tx_pos,
             value: u.value,
-            tokenCategory: td.category ?? td.tokenId ?? "",
-            tokenAmount: BigInt(td.amount ?? td.fungibleAmount ?? "0")
+            tokenCategory: u.token_data.category ?? "",
+            tokenAmount: BigInt(u.token_data.amount ?? "0"),
           });
         }
       }
@@ -227,23 +242,9 @@ export class BchClient {
       tokenOutputs
     });
 
-    const broadcastUrl = `${this.restUrl}/rawtransactions/sendRawTransaction`;
-    const broadcastRes = await fetch(broadcastUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hexes: [rawTx] })
-    });
-    if (!broadcastRes.ok) {
-      const errText = await broadcastRes.text();
-      throw new Error(`Token issuance broadcast failed: ${errText}`);
-    }
-    const result = await broadcastRes.json() as any;
-    const txid = Array.isArray(result) ? result[0] : result;
-    if (typeof txid === "string" && txid.length === 64) {
-      console.log(`[bch] Token issued: category=${tokenCategory} supply=${params.supply} txid=${txid}`);
-      return { txid, tokenCategory };
-    }
-    throw new Error(`Token issuance returned unexpected result: ${JSON.stringify(result)}`);
+    const txid = await this.broadcast(rawTx);
+    console.log(`[bch] Token issued: category=${tokenCategory} supply=${params.supply} txid=${txid}`);
+    return { txid, tokenCategory };
   }
 
   /** Send CashTokens to another address */
@@ -307,23 +308,24 @@ export class BchClient {
       tokenOutputs
     });
 
-    const broadcastUrl = `${this.restUrl}/rawtransactions/sendRawTransaction`;
-    const broadcastRes = await fetch(broadcastUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hexes: [rawTx] })
-    });
-    if (!broadcastRes.ok) {
-      const errText = await broadcastRes.text();
-      throw new Error(`Token transfer broadcast failed: ${errText}`);
+    const txid = await this.broadcast(rawTx);
+    console.log(`[bch] Token sent: ${params.tokenAmount} of ${params.tokenCategory.slice(0, 12)}… → ${params.to} txid=${txid}`);
+    return { txid };
+  }
+
+  /** Get transaction history for an address */
+  async getHistory(address: string): Promise<Array<{ tx_hash: string; height: number }>> {
+    try {
+      const scriptHash = addressToElectrumScriptHash(address);
+      return await fulcrumCall<Array<{ tx_hash: string; height: number }>>(
+        this.wssEndpoints,
+        "blockchain.scripthash.get_history",
+        [scriptHash],
+      ) ?? [];
+    } catch (e) {
+      console.error(`[bch] History fetch error:`, (e as Error).message);
+      return [];
     }
-    const result = await broadcastRes.json() as any;
-    const txid = Array.isArray(result) ? result[0] : result;
-    if (typeof txid === "string" && txid.length === 64) {
-      console.log(`[bch] Token sent: ${params.tokenAmount} of ${params.tokenCategory.slice(0, 12)}… → ${params.to} txid=${txid}`);
-      return { txid };
-    }
-    throw new Error(`Token transfer returned unexpected result: ${JSON.stringify(result)}`);
   }
 }
 
@@ -345,8 +347,7 @@ export interface CashTokenOutput {
 
 // ── Raw Transaction Builder (P2PKH) ──
 
-import { createHash } from "node:crypto";
-import { secp256k1 } from "@noble/curves/secp256k1";
+const createHash = ch; // re-alias from top-level import
 
 function sha256d(data: Buffer): Buffer {
   return createHash("sha256").update(

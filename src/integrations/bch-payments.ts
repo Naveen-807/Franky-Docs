@@ -5,6 +5,12 @@
  * Supports payment requests, QR codes, and webhooks.
  */
 
+import {
+  fulcrumCall,
+  getWssEndpoints,
+  addressToElectrumScriptHash,
+} from "./fulcrum.js";
+
 export interface PaymentRequest {
     requestId: string;
     address: string;
@@ -71,11 +77,13 @@ function parsePaymentURI(uri: string): { address: string; amountSats?: number } 
 export class BchPaymentsClient {
     private restUrl: string;
     private network: string;
+    private wssEndpoints: string[];
     private requests: Map<string, PaymentRequest> = new Map();
 
     constructor(config: PaymentConfig) {
         this.restUrl = config.restUrl.replace(/\/+$/, "");
         this.network = config.network ?? "chipnet";
+        this.wssEndpoints = getWssEndpoints(this.network);
     }
 
     /**
@@ -129,19 +137,17 @@ export class BchPaymentsClient {
         }
 
         try {
-            // Check blockchain for incoming payments
-            const url = `${this.restUrl}/electrumx/balance/${request.address}`;
-            const res = await fetch(url);
+            // Check blockchain for incoming payments via Fulcrum ElectrumX
+            const sh = addressToElectrumScriptHash(request.address);
+            const result = await fulcrumCall<{ confirmed: number; unconfirmed: number }>(
+                this.wssEndpoints, "blockchain.scripthash.get_balance", [sh],
+            );
+            const confirmed = result?.confirmed ?? 0;
 
-            if (res.ok) {
-                const data = await res.json() as any;
-                const confirmed = data?.balance?.confirmed ?? 0;
-
-                if (confirmed >= request.amountSats) {
-                    request.status = "paid";
-                    request.paidAt = Date.now();
-                    request.paidTxid = `paid_${Date.now()}`; // Would fetch actual txid
-                }
+            if (confirmed >= request.amountSats) {
+                request.status = "paid";
+                request.paidAt = Date.now();
+                request.paidTxid = `paid_${Date.now()}`; // Would fetch actual txid
             }
         } catch (e) {
             console.error("[bch-payments] Check payment error:", (e as Error).message);

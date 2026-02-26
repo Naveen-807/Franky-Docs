@@ -53,6 +53,9 @@ export class Engine {
 
   constructor(private ctx: ExecutionContext) {}
 
+  /** Track consecutive poll failures per doc for auto-cleanup */
+  private pollFailures = new Map<string, number>();
+
   async discoveryTick() {
     if (this.discoveryRunning) return;
     this.discoveryRunning = true;
@@ -62,25 +65,47 @@ export class Engine {
         const d = await docs.documents.get({ documentId: config.DOCWALLET_DOC_ID });
         repo.upsertDoc({ docId: config.DOCWALLET_DOC_ID, name: d.data.title ?? config.DOCWALLET_DOC_ID });
         await loadDocWalletTables({ docs, docId: config.DOCWALLET_DOC_ID });
+        console.log(`[discovery] single-doc mode: ${d.data.title ?? config.DOCWALLET_DOC_ID}`);
         return;
       }
 
-      const files = await listAccessibleDocs({
-        drive,
-        namePrefix: config.DOCWALLET_DISCOVER_ALL ? undefined : config.DOCWALLET_NAME_PREFIX
-      });
+      const namePrefix = config.DOCWALLET_DISCOVER_ALL ? undefined : config.DOCWALLET_NAME_PREFIX;
+      const files = await listAccessibleDocs({ drive, namePrefix });
+
+      console.log(`[discovery] Drive returned ${files.length} doc(s)${namePrefix ? ` (prefix: "${namePrefix}")` : " (all docs)"}`);
+
+      // Prune stale DB entries — docs Drive no longer returns
+      const driveIds = new Set(files.map((f) => f.id));
+      const tracked = repo.listDocs();
+      let pruned = 0;
+      for (const d of tracked) {
+        if (!driveIds.has(d.doc_id)) {
+          console.log(`[discovery] removing stale doc ${d.doc_id.slice(0, 8)}… ("${d.name}") — no longer accessible via Drive`);
+          try { repo.removeDoc(d.doc_id); } catch { /* ignore */ }
+          pruned++;
+        }
+      }
+      if (pruned > 0) console.log(`[discovery] pruned ${pruned} stale doc(s) from DB`);
+
+      // Ensure template on each accessible doc
       for (const f of files) {
         try {
           repo.upsertDoc({ docId: f.id, name: f.name });
           await loadDocWalletTables({ docs, docId: f.id });
+          console.log(`[discovery] ✅ ${f.id.slice(0, 8)}… "${f.name}" — template OK`);
+          this.pollFailures.delete(f.id); // reset failures on success
         } catch (err) {
-          console.error(`[discovery] ${f.id.slice(0, 8)}… ${(err as Error).message}`);
-          try {
-            repo.removeDoc(f.id);
-          } catch {
-            // ignore
-          }
+          console.error(`[discovery] ❌ ${f.id.slice(0, 8)}… "${f.name}" — ${(err as Error).message}`);
+          try { repo.removeDoc(f.id); } catch { /* ignore */ }
         }
+      }
+
+      if (files.length === 0) {
+        console.warn(
+          `[discovery] no docs found! Make sure your Google Docs are shared with the service account as Editor.\n` +
+          `  Prefix filter: ${namePrefix ? `"${namePrefix}" (set DOCWALLET_DISCOVER_ALL=1 to disable)` : "none (discovering all docs)"}\n` +
+          `  Tip: Share your doc → Add people → paste the service account email → choose "Editor" role`
+        );
       }
     } finally {
       this.discoveryRunning = false;
@@ -102,8 +127,21 @@ export class Engine {
         try {
           tables = await loadDocWalletTables({ docs, docId });
           configMap = readConfig(tables.config.table);
+          this.pollFailures.delete(docId); // reset on success
         } catch (err) {
-          console.error(`[poll] ${docId.slice(0, 8)}… ${(err as Error).message}`);
+          const fails = (this.pollFailures.get(docId) ?? 0) + 1;
+          this.pollFailures.set(docId, fails);
+          if (fails <= 2) {
+            console.error(`[poll] ${docId.slice(0, 8)}… ${(err as Error).message}`);
+          } else if (fails === 3) {
+            console.error(`[poll] ${docId.slice(0, 8)}… failed ${fails}x — suppressing future logs (will retry on next discovery)`);
+          }
+          // After 10 consecutive failures, auto-remove from DB
+          if (fails >= 10) {
+            console.warn(`[poll] removing ${docId.slice(0, 8)}… after ${fails} consecutive failures`);
+            try { repo.removeDoc(docId); } catch { /* ignore */ }
+            this.pollFailures.delete(docId);
+          }
           continue;
         }
 
